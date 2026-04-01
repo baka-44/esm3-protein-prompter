@@ -83,7 +83,9 @@ def build_esm_protein(
         )
 
     # ── 3. Build function annotations ─────────────────────────────────────────
-    function_annotations = _build_function_annotations(spec.function_keywords)
+    function_annotations = _build_function_annotations(
+        spec.function_keywords, protein_length=spec.protein_length
+    )
 
     # ── 4. Construct ESMProtein ────────────────────────────────────────────────
     protein_kwargs: dict = {"sequence": sequence}
@@ -98,21 +100,25 @@ def build_esm_protein(
     return protein
 
 
-def _build_function_annotations(keywords: list[str]) -> list | None:
+def _build_function_annotations(keywords: list[str], protein_length: int = 1) -> list | None:
     """
     Convert a list of keyword strings into ESMProtein function_annotations format.
 
     ESM3 function annotations are InterPro-derived. The SDK accepts them as a
-    list of annotation objects. We use the SDK's own annotation type if available,
-    otherwise fall back to a plain list of strings which later versions of the
-    SDK also accept.
+    list of FunctionAnnotation objects with integer start/end positions (1-based).
+    Passing start=None or end=None causes a TypeError inside the SDK's bounds check,
+    so we always supply concrete positions spanning the full protein.
     """
     if not keywords:
         return None
 
+    # Clamp to valid range — annotations span the entire protein
+    start = 1
+    end = max(1, protein_length)
+
     try:
         from esm.sdk.api import FunctionAnnotation
-        return [FunctionAnnotation(label=kw, start=None, end=None) for kw in keywords]
+        return [FunctionAnnotation(label=kw, start=start, end=end) for kw in keywords]
     except (ImportError, AttributeError):
         pass
 
