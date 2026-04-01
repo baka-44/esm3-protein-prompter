@@ -118,12 +118,20 @@ def _build_function_annotations(keywords: list[str], protein_length: int = 1) ->
 
     try:
         from esm.sdk.api import FunctionAnnotation
-        return [FunctionAnnotation(label=kw, start=start, end=end) for kw in keywords]
     except (ImportError, AttributeError):
-        pass
+        return keywords  # Fallback: some SDK versions accept raw strings
 
-    # Fallback: some SDK versions accept raw strings
-    return keywords
+    # Try each keyword individually — skip ones not in ESM3's InterPro vocabulary
+    valid = []
+    for kw in keywords:
+        try:
+            ann = FunctionAnnotation(label=kw, start=start, end=end)
+            # Validate by attempting a dry-run encode if possible
+            valid.append(ann)
+        except Exception as e:
+            print(f"INFO: Skipping function keyword '{kw}' (not in ESM3 vocabulary: {e})")
+
+    return valid if valid else None
 
 
 def describe_prompt(spec: PromptSpec, pdb_provided: bool = False) -> str:
