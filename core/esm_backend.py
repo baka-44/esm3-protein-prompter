@@ -72,9 +72,21 @@ def generate_candidates(
             generated = client.generate(esm_protein, gen_config)
             results.append(GenerationResult(esm_protein=generated, index=i))
         except Exception as e:
-            # Log and continue — one failed candidate should not abort the run
-            print(f"WARNING: Candidate {i + 1} failed: {e}")
-            continue
+            # If the error is due to invalid FunctionAnnotation labels,
+            # retry without function annotations — sequence/structure constraints
+            # are preserved, only keyword guidance is dropped.
+            if "FunctionAnnotation" in str(e) or "Unknown label" in str(e):
+                print(f"INFO: Retrying candidate {i + 1} without function annotations...")
+                try:
+                    import copy
+                    ep_no_func = copy.copy(esm_protein)
+                    ep_no_func.function_annotations = None
+                    generated = client.generate(ep_no_func, gen_config)
+                    results.append(GenerationResult(esm_protein=generated, index=i))
+                except Exception as e2:
+                    print(f"WARNING: Candidate {i + 1} failed on retry: {e2}")
+            else:
+                print(f"WARNING: Candidate {i + 1} failed: {e}")
 
     if progress_callback:
         progress_callback(spec.num_candidates, spec.num_candidates)
