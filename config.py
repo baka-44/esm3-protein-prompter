@@ -48,20 +48,26 @@ def get_gpu_name() -> str | None:
     return None
 
 
-def get_esm_client():
+def get_esm_client(model_name: str | None = None):
     """
     Return the appropriate ESM3 inference client based on env config.
 
     - If FORGE_API_TOKEN is set and USE_LOCAL_ESM3 is false → Forge API client
     - Otherwise → local ESM3-open model (loaded onto GPU if available)
 
+    Args:
+        model_name: Optional Forge model override. If not provided, uses FORGE_MODEL
+                    env var (default "esm3-medium-2024-08").
+                    Valid: "esm3-small-2024-08" | "esm3-medium-2024-08" | "esm3-large-2024-08"
+
     Raises RuntimeError if neither backend can be initialised.
     """
     if BACKEND_MODE == "forge":
+        resolved_model = model_name or FORGE_MODEL
         try:
             from esm.sdk.forge import ESM3ForgeInferenceClient
             return ESM3ForgeInferenceClient(
-                model=FORGE_MODEL,
+                model=resolved_model,
                 url=FORGE_URL,
                 token=FORGE_API_TOKEN,
             )

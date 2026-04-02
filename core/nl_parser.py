@@ -63,6 +63,15 @@ class PromptSpec:
     num_steps: int = 8
     """Number of iterative unmasking steps for ESM3 generation."""
 
+    recommended_model: str = "esm3-medium-2024-08"
+    """
+    ESM3 Forge model recommended for this task:
+      - esm3-small-2024-08:  Simple tasks, fast iteration, exploratory runs.
+      - esm3-medium-2024-08: Standard engineering tasks. Best quality/speed tradeoff.
+      - esm3-large-2024-08:  Complex multi-constraint design, de novo novel folds,
+                              structure motif + sequence + function combined.
+    """
+
     notes_to_user: str = ""
     """Claude's explanation of how it interpreted the request."""
 
@@ -115,6 +124,7 @@ Respond ONLY with a valid JSON object matching this schema:
   "num_candidates": <integer 1-10>,
   "generation_temperature": <float 0.3-1.0>,
   "num_steps": <integer 4-20>,
+  "recommended_model": "<esm3-small-2024-08 | esm3-medium-2024-08 | esm3-large-2024-08>",
   "notes_to_user": "<friendly explanation of what you inferred and any assumptions you made>"
 }
 ```
@@ -137,7 +147,16 @@ Respond ONLY with a valid JSON object matching this schema:
 
 8. notes_to_user should be friendly and explain: what constraints you applied, any assumptions, and what the scientist should look out for.
 
-9. Return ONLY the JSON — no markdown fences, no extra text before or after.
+9. recommended_model: Choose the Forge API model based on task complexity:
+   - "esm3-small-2024-08":  Simple tasks — few fixed positions, sequence-only masking,
+     quick exploratory runs, short proteins (<100 aa), iterative refinement rounds.
+   - "esm3-medium-2024-08": Standard tasks — moderate fixed positions, function keywords,
+     proteins 100–400 aa. Default for most engineering campaigns. (DEFAULT)
+   - "esm3-large-2024-08":  Complex tasks — structure motif + sequence + function combined,
+     de novo design of novel folds, >400 aa proteins, catalytic triad reconstruction,
+     multi-domain proteins, when the scientist specifically asks for highest quality.
+
+10. Return ONLY the JSON — no markdown fences, no extra text before or after.
 
 ## Examples
 
@@ -354,6 +373,15 @@ class NLParser:
 
         notes_to_user = str(data.get("notes_to_user", ""))
 
+        _valid_models = {
+            "esm3-small-2024-08",
+            "esm3-medium-2024-08",
+            "esm3-large-2024-08",
+        }
+        recommended_model = str(data.get("recommended_model", "esm3-medium-2024-08"))
+        if recommended_model not in _valid_models:
+            recommended_model = "esm3-medium-2024-08"
+
         return PromptSpec(
             protein_length=protein_length,
             sequence_template=sequence_template,
@@ -365,5 +393,6 @@ class NLParser:
             num_candidates=num_candidates,
             generation_temperature=generation_temperature,
             num_steps=num_steps,
+            recommended_model=recommended_model,
             notes_to_user=notes_to_user,
         )

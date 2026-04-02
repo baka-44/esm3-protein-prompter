@@ -1,5 +1,8 @@
 """
 ui/sidebar.py — Streamlit sidebar: settings, API keys, and backend controls.
+
+In production (Railway), API keys are set via environment variables and shown
+as read-only status badges. In local/Colab mode, editable input fields are shown.
 """
 
 from __future__ import annotations
@@ -7,6 +10,17 @@ from __future__ import annotations
 import os
 
 import streamlit as st
+
+_MODEL_OPTIONS = [
+    "esm3-small-2024-08",
+    "esm3-medium-2024-08",
+    "esm3-large-2024-08",
+]
+_MODEL_LABELS = {
+    "esm3-small-2024-08":  "Small  — fast, exploratory runs",
+    "esm3-medium-2024-08": "Medium — standard engineering (default)",
+    "esm3-large-2024-08":  "Large  — complex / de novo design",
+}
 
 
 def render_sidebar() -> dict:
@@ -29,12 +43,18 @@ def render_sidebar() -> dict:
         # ── API Keys ───────────────────────────────────────────────────────────
         st.subheader("API Keys")
 
-        anthropic_key = st.text_input(
-            "Anthropic API Key",
-            value=st.session_state.get("anthropic_key", os.getenv("ANTHROPIC_API_KEY", "")),
-            type="password",
-            help="Required for natural language parsing. Get yours at console.anthropic.com",
-        )
+        # In production (env var set), show badge. In local/Colab, show input.
+        env_anthropic = os.getenv("ANTHROPIC_API_KEY", "")
+        if env_anthropic:
+            st.success("Anthropic: connected via environment ✅", icon="🔑")
+            anthropic_key = env_anthropic
+        else:
+            anthropic_key = st.text_input(
+                "Anthropic API Key",
+                value=st.session_state.get("anthropic_key", ""),
+                type="password",
+                help="Required for NL parsing. Get yours at console.anthropic.com",
+            )
 
         st.divider()
         st.subheader("ESM3 Backend")
@@ -48,26 +68,44 @@ def render_sidebar() -> dict:
             ),
         )
 
-        forge_token = st.text_input(
-            "Forge API Token",
-            value=st.session_state.get("forge_token", os.getenv("FORGE_API_TOKEN", "")),
-            type="password",
-            disabled=use_local,
-            help="Get yours at forge.evolutionaryscale.ai",
-        )
+        env_forge = os.getenv("FORGE_API_TOKEN", "")
+        if env_forge and not use_local:
+            st.success("Forge API: connected via environment ✅", icon="🔑")
+            forge_token = env_forge
+        else:
+            forge_token = st.text_input(
+                "Forge API Token",
+                value=st.session_state.get("forge_token", ""),
+                type="password",
+                disabled=use_local,
+                help="Get yours at forge.evolutionaryscale.ai",
+            )
 
+        # ── Model selector (Forge only) ────────────────────────────────────────
         forge_model = "esm3-medium-2024-08"
         if not use_local and forge_token:
+            # Default to Claude's recommendation from the last parsed prompt (if any)
+            recommended = st.session_state.get("recommended_model", "esm3-medium-2024-08")
+            default_idx = _MODEL_OPTIONS.index(recommended) if recommended in _MODEL_OPTIONS else 1
+
             forge_model = st.selectbox(
                 "Forge Model",
-                options=[
-                    "esm3-small-2024-08",
-                    "esm3-medium-2024-08",
-                    "esm3-large-2024-08",
-                ],
-                index=1,
-                help="Larger models produce better designs but cost more and are slower.",
+                options=_MODEL_OPTIONS,
+                format_func=lambda m: _MODEL_LABELS.get(m, m),
+                index=default_idx,
+                key="forge_model_selector",
+                help=(
+                    "Claude auto-selects based on prompt complexity. "
+                    "Override here to force a specific model. "
+                    "Larger = better quality, slower, higher cost."
+                ),
             )
+
+            # Nudge if Claude recommended a different model than current selection
+            if recommended and recommended != forge_model:
+                st.caption(
+                    f"💡 Claude recommends: **{_MODEL_LABELS.get(recommended, recommended)}**"
+                )
 
         # ── Backend status ─────────────────────────────────────────────────────
         _render_backend_status(use_local, forge_token, anthropic_key)
