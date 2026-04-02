@@ -22,6 +22,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+from auth import check_auth, render_user_badge
+
+# ── Auth gate — must be first thing after page config ──────────────────────────
+check_auth()
+
 from ui.sidebar import render_sidebar
 from ui.chat import (
     render_chat_history,
@@ -43,6 +48,7 @@ st.caption(
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 settings = render_sidebar()
+render_user_badge()   # shows signed-in email + sign-out button at bottom of sidebar
 
 if settings["anthropic_key"]:
     os.environ["ANTHROPIC_API_KEY"] = settings["anthropic_key"]

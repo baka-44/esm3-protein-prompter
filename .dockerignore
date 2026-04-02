@@ -1,0 +1,40 @@
+# Secrets — never bake into image
+.env
+.env.*
+
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+colab_launcher.ipynb
+
+# Local outputs — large, not source code
+outputs/
+results/
+*.fasta
+*.pdb
+
+# Model weights — never in image (Forge API is used in production)
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Plans / docs
+.claude/
