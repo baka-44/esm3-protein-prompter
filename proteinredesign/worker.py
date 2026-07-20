@@ -324,7 +324,11 @@ def run_esmfold(sequence: str) -> tuple[str, float]:
 
 
 def _mean_ca_bfactor(pdb_text: str) -> float:
-    """Mean CA B-factor = mean pLDDT (ESMFold writes pLDDT into B-factors, 0–100) [ESM-1]."""
+    """
+    Mean CA B-factor = mean pLDDT. transformers ESMFold writes pLDDT into the B-factor
+    column on a **0–1 scale**; normalise to the conventional 0–100 scale so the QC gate
+    and UI read correctly [ESM-1 verified against a real run].
+    """
     vals = []
     for line in pdb_text.splitlines():
         if line.startswith("ATOM") and line[12:16].strip() == "CA":
@@ -332,7 +336,10 @@ def _mean_ca_bfactor(pdb_text: str) -> float:
                 vals.append(float(line[60:66]))
             except ValueError:
                 pass
-    return sum(vals) / len(vals) if vals else 0.0
+    if not vals:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    return mean * 100.0 if mean <= 1.5 else mean  # 0–1 → 0–100
 
 
 def compute_ca_rmsd(pred_pdb: str, ref_pdb_source, chain_id: str | None) -> float:
@@ -466,19 +473,29 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    manifest = JobManifest.from_json(storage.read_manifest(manifest_uri))
-    with tempfile.TemporaryDirectory() as workdir:
-        try:
+    # Best-effort job id from the URI so we can mark FAILED even if manifest load fails.
+    job_id = _job_id_from_uri(manifest_uri)
+    try:
+        manifest = JobManifest.from_json(storage.read_manifest(manifest_uri))
+        job_id = manifest.job_id
+        with tempfile.TemporaryDirectory() as workdir:
             run_pipeline(manifest, workdir)
-            return 0
-        except Exception as exc:  # noqa: BLE001 — surface any failure to the dashboard
-            traceback.print_exc()
+        return 0
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the dashboard
+        traceback.print_exc()
+        if job_id:
             try:
-                jobstore.update_job(manifest.job_id, status=JobStatus.FAILED.value,
+                jobstore.update_job(job_id, status=JobStatus.FAILED.value,
                                     error=f"{type(exc).__name__}: {exc}")
             except Exception:
                 pass
-            return 1
+        return 1
+
+
+def _job_id_from_uri(uri: str) -> str:
+    """Extract <job_id> from gs://bucket/jobs/<job_id>/manifest.json (best effort)."""
+    parts = uri.rstrip("/").split("/")
+    return parts[-2] if len(parts) >= 2 else ""
 
 
 if __name__ == "__main__":
