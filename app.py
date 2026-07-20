@@ -98,6 +98,13 @@ st.markdown(
     [data-testid="stSidebar"] p {{
         color: #444444 !important;
     }}
+    /* Button label text sits in a <p> too — the sidebar rule above would otherwise
+       override it. Force sidebar button text back to white (matches the primary
+       black-button style used elsewhere, e.g. "Use ESM3"). */
+    [data-testid="stSidebar"] .stButton > button,
+    [data-testid="stSidebar"] .stButton > button p {{
+        color: #ffffff !important;
+    }}
 
     /* ── Body text & markdown ── */
     .stMarkdown p, .stMarkdown li, .stMarkdown td, .stMarkdown th {{ color: #333333 !important; }}
