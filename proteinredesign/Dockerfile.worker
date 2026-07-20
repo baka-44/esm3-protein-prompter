@@ -13,10 +13,13 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
+# Use the base image's default python3 (Ubuntu 22.04 → 3.10) so `pip` (python3-pip)
+# and `python` target the SAME interpreter. Installing python3.11 while pip targets
+# 3.10 caused "No module named transformers" at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3-pip python3.11-dev git gcc g++ \
+        python3 python3-pip python3-dev git gcc g++ \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python
+    && ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
@@ -45,7 +48,13 @@ RUN pip install --no-cache-dir \
         "google-cloud-storage>=2.14" "google-cloud-firestore>=2.14"
 
 # ProteinMPNN / SolubleMPNN / LigandMPNN — unified LigandMPNN repo (MIT).
+# Its run.py imports prody + ml_collections; install those explicitly (NOT its full
+# requirements.txt, which would clobber the CUDA torch we installed above).
 RUN git clone --depth 1 https://github.com/dauparas/LigandMPNN.git /opt/ligandmpnn
+# LigandMPNN + its vendored openfold need these pure-Python deps. We deliberately do
+# NOT install its requirements.txt wholesale (it pins torch/torchvision/nvidia-* and an
+# older numpy that would clobber our CUDA torch + ESMFold stack).
+RUN pip install --no-cache-dir prody ml_collections dm-tree scipy pyparsing
 ENV LIGANDMPNN_DIR=/opt/ligandmpnn
 
 # App code: config.py, utils/, core/esm2_scorer.py, proteinredesign/

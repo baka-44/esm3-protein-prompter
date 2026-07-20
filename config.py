@@ -11,9 +11,13 @@ Reads from environment variables (or a .env file) and provides:
 import os
 from typing import Literal
 
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv is a local-dev convenience (.env loading); not needed in the
+    # container, where config comes from real env vars.
+    pass
 
 # ── Raw env values ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")

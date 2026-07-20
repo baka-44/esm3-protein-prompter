@@ -12,14 +12,15 @@ import streamlit as st
 
 from ui.job_dashboard import render_job_dashboard
 
-# MVP presets (D6). Only #1 is enabled in increment 1.
+# MVP presets (D6). Only the first (fixed-backbone redesign) is enabled in increment 1.
+# User-facing labels carry no internal preset numbers.
 _PRESETS = [
-    ("#1 Fixed-backbone redesign", True,
+    ("Fixed-backbone redesign", True,
      "Keep the input backbone; redesign the sequence while pinning chosen residues."),
-    ("#2 Ligand-aware redesign", False, "Redesign around a bound ligand (LigandMPNN). Coming soon."),
-    ("#3 Motif scaffolding", False, "Build a new protein around a fixed motif (RFdiffusion3). Coming soon."),
-    ("#6 Enzyme active-site scaffolding", False, "Scaffold an enzyme around a catalytic site (RF3 all-atom). Coming soon."),
-    ("#8 Scaffold diversification", False, "Generate variants of a structure (partial diffusion). Coming soon."),
+    ("Ligand-aware redesign", False, "Redesign around a bound ligand (LigandMPNN). Coming soon."),
+    ("Motif scaffolding", False, "Build a new protein around a fixed motif (RFdiffusion3). Coming soon."),
+    ("Enzyme active-site scaffolding", False, "Scaffold an enzyme around a catalytic site (RF3 all-atom). Coming soon."),
+    ("Scaffold diversification", False, "Generate variants of a structure (partial diffusion). Coming soon."),
 ]
 
 

@@ -1,0 +1,17 @@
+# Cloud Build config for the proteinredesign GPU worker image.
+# Build:  gcloud builds submit --config cloudbuild.worker.yaml --project=phyx44-proteinredesign-v1 .
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'proteinredesign/Dockerfile.worker'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/phyx44-proteinredesign-v1/proteinredesign/worker:latest'
+      - '.'
+timeout: 3600s
+images:
+  - 'us-central1-docker.pkg.dev/phyx44-proteinredesign-v1/proteinredesign/worker:latest'
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 100

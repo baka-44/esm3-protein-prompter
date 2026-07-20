@@ -66,10 +66,10 @@ st.markdown(
 
     /* ── Two font sizes only ── */
     h1, h2, h3 {{
-        font-size: 1.1rem !important;
-        font-weight: 600 !important;
+        font-size: 1.15rem !important;
+        font-weight: 400 !important;
         letter-spacing: -0.01em;
-        color: #111111 !important;
+        color: #141414 !important;
     }}
     h4, h5, h6, p, label, input, textarea,
     .stMarkdown p, .stMarkdown li,
@@ -105,17 +105,17 @@ st.markdown(
 
     /* ── Buttons ── */
     .stButton > button {{
-        background-color: #00d4aa !important;
-        color: #000000 !important;
+        background-color: #1a1a1a !important;
+        color: #ffffff !important;
         border: none !important;
-        border-radius: 6px !important;
+        border-radius: 4px !important;
         font-weight: 600 !important;
         letter-spacing: 0.02em !important;
         padding: 0.45rem 1.1rem !important;
         transition: background-color 0.2s ease !important;
     }}
-    .stButton > button:hover {{ background-color: #00b894 !important; }}
-    .stButton > button:active {{ background-color: #009d80 !important; }}
+    .stButton > button:hover {{ background-color: #000000 !important; }}
+    .stButton > button:active {{ background-color: #000000 !important; }}
     .stButton > button[disabled] {{
         background-color: #e5e5e5 !important;
         color: #999999 !important;
@@ -123,27 +123,27 @@ st.markdown(
     /* Download buttons — ghost style */
     .stDownloadButton > button {{
         background-color: transparent !important;
-        color: #00d4aa !important;
-        border: 1px solid #00d4aa !important;
-        border-radius: 6px !important;
+        color: #1a1a1a !important;
+        border: 1px solid #1a1a1a !important;
+        border-radius: 4px !important;
         font-weight: 500 !important;
     }}
     .stDownloadButton > button:hover {{
-        background-color: rgba(0,212,170,0.08) !important;
+        background-color: rgba(0,0,0,0.05) !important;
     }}
 
     /* ── Expanders ── */
     [data-testid="stExpander"] {{
         background-color: #fafafa !important;
         border: 1px solid #eeeeee !important;
-        border-radius: 8px !important;
+        border-radius: 4px !important;
         margin-bottom: 6px !important;
     }}
     [data-testid="stExpander"] summary {{
         color: #333333 !important;
         font-weight: 500 !important;
     }}
-    [data-testid="stExpander"] summary:hover {{ color: #00d4aa !important; }}
+    [data-testid="stExpander"] summary:hover {{ color: #1a1a1a !important; }}
     [data-testid="stExpander"] > div:last-child {{
         background-color: #fafafa !important;
     }}
@@ -153,12 +153,12 @@ st.markdown(
         background-color: #ffffff !important;
         border: 1px solid #dddddd !important;
         color: #111111 !important;
-        border-radius: 6px !important;
+        border-radius: 4px !important;
         line-height: 1.45 !important;
     }}
     .stTextInput input:focus, .stTextArea textarea:focus {{
-        border-color: #00d4aa !important;
-        box-shadow: 0 0 0 2px rgba(0,212,170,0.12) !important;
+        border-color: #1a1a1a !important;
+        box-shadow: 0 0 0 2px rgba(0,0,0,0.06) !important;
     }}
     .stTextInput label, .stTextArea label {{ color: #555555 !important; }}
 
@@ -166,7 +166,7 @@ st.markdown(
     .stSelectbox > div > div, .stMultiSelect > div > div {{
         background-color: #ffffff !important;
         border: 1px solid #dddddd !important;
-        border-radius: 6px !important;
+        border-radius: 4px !important;
         color: #111111 !important;
     }}
     .stSelectbox label, .stMultiSelect label {{ color: #555555 !important; }}
@@ -174,36 +174,36 @@ st.markdown(
     /* ── Sliders ── */
     [data-testid="stSlider"] label {{ color: #555555 !important; }}
     [data-testid="stSlider"] [role="slider"] {{
-        background-color: #00d4aa !important;
-        border: 2px solid #00d4aa !important;
+        background-color: #1a1a1a !important;
+        border: 2px solid #1a1a1a !important;
     }}
-    .stSlider [data-baseweb="slider"] [data-testid="stThumbValue"] {{ color: #00d4aa !important; }}
+    .stSlider [data-baseweb="slider"] [data-testid="stThumbValue"] {{ color: #1a1a1a !important; }}
 
     /* ── Checkboxes / toggles ── */
     .stCheckbox label, .stToggle label {{ color: #444444 !important; }}
-    [data-testid="stCheckbox"] svg, [data-testid="stToggle"] svg {{ color: #00d4aa !important; }}
+    [data-testid="stCheckbox"] svg, [data-testid="stToggle"] svg {{ color: #1a1a1a !important; }}
 
     /* ── Alerts ── */
     [data-testid="stAlert"] {{
-        border-radius: 8px !important;
+        border-radius: 4px !important;
         background-color: #f9fafb !important;
-        border-left: 3px solid #00d4aa !important;
+        border-left: 3px solid #1a1a1a !important;
     }}
 
     /* ── Dataframe / tables ── */
-    [data-testid="stDataFrame"] {{ border-radius: 8px !important; overflow: hidden; }}
+    [data-testid="stDataFrame"] {{ border-radius: 4px !important; overflow: hidden; }}
     [data-testid="stDataFrame"] > div {{ background-color: #fafafa !important; }}
 
     /* ── Chat messages ── */
     [data-testid="stChatMessage"] {{
         background-color: #f9fafb !important;
         border: 1px solid #eeeeee !important;
-        border-radius: 10px !important;
+        border-radius: 4px !important;
     }}
     [data-testid="stChatInput"] > div {{
         background-color: #ffffff !important;
         border: 1px solid #dddddd !important;
-        border-radius: 8px !important;
+        border-radius: 4px !important;
     }}
     [data-testid="stChatInput"] textarea {{
         color: #111111 !important;
@@ -217,9 +217,9 @@ st.markdown(
     .stCode, [data-testid="stCodeBlock"] {{
         background-color: #f5f5f5 !important;
         border: 1px solid #e5e5e5 !important;
-        border-radius: 6px !important;
+        border-radius: 4px !important;
     }}
-    code {{ color: #007a6b !important; }}
+    code {{ color: #444444 !important; }}
 
     /* ── Spinner ── */
     [data-testid="stSpinner"] p {{ color: #666666 !important; }}
@@ -227,13 +227,13 @@ st.markdown(
     /* ── Tabs ── */
     .stTabs [data-baseweb="tab-list"] {{ background-color: #f5f5f5 !important; border-bottom: 1px solid #eeeeee !important; }}
     .stTabs [data-baseweb="tab"] {{ color: #666666 !important; }}
-    .stTabs [aria-selected="true"] {{ color: #00d4aa !important; border-bottom-color: #00d4aa !important; }}
+    .stTabs [aria-selected="true"] {{ color: #1a1a1a !important; border-bottom-color: #1a1a1a !important; }}
 
     /* ── Metric tiles ── */
     [data-testid="stMetric"] {{
         background-color: #fafafa !important;
         border: 1px solid #eeeeee !important;
-        border-radius: 8px !important;
+        border-radius: 4px !important;
         padding: 12px 16px !important;
     }}
     [data-testid="stMetricLabel"] p {{ color: #888888 !important; text-transform: uppercase; letter-spacing: 0.05em; }}
@@ -298,8 +298,8 @@ st.markdown(
         <div class="phyx-text">
             <div class="phyx-title">Guided Protein Design Tool</div>
             <div class="phyx-desc">
-                Natural language → ESM3 prompt → candidate generation → fitness scoring.
-                Upload a PDB for structure-conditioned design or scaffold condensation.
+                Design novel proteins — conversational sequence generation, or structure-based
+                backbone design with folding-based quality control.
             </div>
         </div>
     </div>
@@ -307,32 +307,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-settings = render_sidebar()
-
-# ── Engine selector (D3: engine-select first) ─────────────────────────────────
-with st.sidebar:
-    st.divider()
-    _engine = st.radio(
-        "🧪 Engine",
-        options=["ESM3 (chat)", "RFdiffusion / MPNN"],
-        key="_engine_choice",
-        help=(
-            "ESM3: conversational sequence generation (Forge API). "
-            "RFdiffusion / MPNN: backbone-based design run as async GPU jobs."
-        ),
-    )
-
-render_user_badge()   # shows signed-in email + sign-out button at bottom of sidebar
-
-if settings["anthropic_key"]:
-    os.environ["ANTHROPIC_API_KEY"] = settings["anthropic_key"]
-if settings["forge_token"]:
-    os.environ["FORGE_API_TOKEN"] = settings["forge_token"]
-os.environ["USE_LOCAL_ESM3"] = "true" if settings["use_local"] else "false"
-os.environ["FORGE_MODEL"] = settings["forge_model"]
-
-# ── Session state init ─────────────────────────────────────────────────────────
+# ── Session state init (runs before engine routing below) ─────────────────────
 def _init_session():
     import time as _time
     defaults = {
@@ -390,12 +365,39 @@ if st.session_state.get("_show_new_design_dialog"):
     _confirm_new_design_dialog()
 
 
-# ── RFdiffusion / MPNN engine (D3) — separate page; skips the ESM3 chat flow ──
-if _engine == "RFdiffusion / MPNN":
+# ── Engine routing (engine-select first, D3) ──────────────────────────────────
+from ui.engine_select import render_engine_chooser, render_engine_switch
+
+_engine = st.session_state.get("_engine")
+
+# No engine chosen yet → clean full-page selection screen.
+if not _engine:
+    render_engine_chooser()
+    st.stop()
+
+# RFdiffusion / MPNN — clean interface with a minimal sidebar (no ESM3 params/status).
+if _engine == "rfd":
+    with st.sidebar:
+        render_engine_switch()
+    render_user_badge()
     from ui.rfd_panel import render_rfd_engine
     _user_email = st.session_state.get("_auth_email") or "local@dev"
     render_rfd_engine(_user_email)
     st.stop()
+
+# ESM3 — conversational interface with the full generation-parameters sidebar.
+settings = render_sidebar()
+with st.sidebar:
+    st.divider()
+    render_engine_switch()
+render_user_badge()
+
+if settings["anthropic_key"]:
+    os.environ["ANTHROPIC_API_KEY"] = settings["anthropic_key"]
+if settings["forge_token"]:
+    os.environ["FORGE_API_TOKEN"] = settings["forge_token"]
+os.environ["USE_LOCAL_ESM3"] = "true" if settings["use_local"] else "false"
+os.environ["FORGE_MODEL"] = settings["forge_model"]
 
 
 # ── Welcome message ────────────────────────────────────────────────────────────

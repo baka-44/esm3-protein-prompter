@@ -43,7 +43,15 @@ def parse_pdb(pdb_source: str | bytes | Path) -> "Structure":
 
     parser = PDBParser(QUIET=True)
 
-    if isinstance(pdb_source, (str, Path)) and Path(pdb_source).exists():
+    def _is_existing_file(src) -> bool:
+        # A multi-line PDB-content string makes Path(src).exists() raise ENAMETOOLONG;
+        # treat any such error as "not a path" so we parse it as raw content instead.
+        try:
+            return Path(src).exists()
+        except (OSError, ValueError):
+            return False
+
+    if isinstance(pdb_source, (str, Path)) and _is_existing_file(pdb_source):
         structure = parser.get_structure("protein", str(pdb_source))
     else:
         # Treat as raw content
