@@ -1,5 +1,5 @@
 """
-cofold/config_builders/preset1.py — Preset #1 (fixed-backbone redesign).
+proteinredesign/config_builders/preset1.py — Preset #1 (fixed-backbone redesign).
 
 Turns scientist-level inputs — an uploaded PDB plus a list of residues to keep
 fixed, given in the PDB's own (author) numbering, e.g. "K67, R82" or "67, 82" —

@@ -332,7 +332,7 @@ Firestore state → GCS I/O → Cloud Run Job worker → MPNN + ESMFold → resu
 4. Create **GCS buckets** (weights / inputs / outputs; no lifecycle deletion — D4); upload
    ProteinMPNN + SolubleMPNN + ESMFold weights.
 5. Provision **Firestore** (job store) + **Artifact Registry** repo.
-6. Repo: add `cofold/` package skeleton on a feature branch. ESM3 code untouched.
+6. Repo: add `proteinredesign/` package skeleton on a feature branch. ESM3 code untouched.
 
 ### M1 — First vertical: preset #1 (fixed-backbone redesign) end-to-end
 **Backend**
@@ -397,14 +397,14 @@ Firestore state → GCS I/O → Cloud Run Job worker → MPNN + ESMFold → resu
 ## Implementation status
 
 **Increment 1 (M0 + M1) — code landed** on branch `feat/rfdiffusion-mpnn-backend`:
-- `cofold/` package: `manifest.py`, `config_builders/preset1.py` (author→sequential mapping +
+- `proteinredesign/` package: `manifest.py`, `config_builders/preset1.py` (author→sequential mapping +
   residue#↔AA validation), `storage.py` (GCS), `jobstore.py` (Firestore), `worker.py` (pipeline
   + pure `select_top_candidates` QC-gate/ranking), `submit.py` (job trigger), `Dockerfile.worker`.
 - `config.py`: GCS + Firestore client getters.
 - Frontend: engine selector in `app.py` (D3); `ui/rfd_panel.py` (#1 panel + live validation);
   `ui/job_dashboard.py` (persistent history + results).
 - `terraform/`: buckets (no lifecycle delete), Firestore, Artifact Registry, GPU Cloud Run Job, IAM.
-- Tests: `tests/test_cofold_preset1.py`, `tests/test_cofold_worker.py` — **21 passing** (config
+- Tests: `tests/test_proteinredesign_preset1.py`, `tests/test_proteinredesign_worker.py` — **21 passing** (config
   builder + manifest + QC-gate/ranking).
 
 **Pending (needs GPU/GCP, done at deploy):** the ML adapters in `worker.py`

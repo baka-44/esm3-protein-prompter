@@ -1,12 +1,12 @@
-# cofold GPU worker — runs the generation pipeline as a Cloud Run Job (NVIDIA L4).
+# proteinredesign GPU worker — runs the generation pipeline as a Cloud Run Job (NVIDIA L4).
 # Increment 1 (preset #1): ProteinMPNN + ESMFold + ESM2. RFdiffusion3 added in M3.
 #
-# Build:  docker build -f cofold/Dockerfile.worker -t <region>-docker.pkg.dev/<proj>/cofold/worker .
-# Run:    the Cloud Run Job sets COFOLD_MANIFEST_URI and the COFOLD_* bucket/project env vars.
+# Build:  docker build -f proteinredesign/Dockerfile.worker -t <region>-docker.pkg.dev/<proj>/proteinredesign/worker .
+# Run:    the Cloud Run Job sets PROTEINREDESIGN_MANIFEST_URI and the PROTEINREDESIGN_* bucket/project env vars.
 #
 # Model weights (MPNN checkpoints, ESMFold) are NOT baked in — they are mounted from
-# GCS at runtime (A6) via COFOLD_WEIGHTS_MOUNT (gcsfuse) or downloaded by
-# cofold.storage.ensure_weights(). Only the tiny ESM2 scoring model is pre-baked.
+# GCS at runtime (A6) via PROTEINREDESIGN_WEIGHTS_MOUNT (gcsfuse) or downloaded by
+# proteinredesign.storage.ensure_weights(). Only the tiny ESM2 scoring model is pre-baked.
 
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
@@ -37,7 +37,7 @@ RUN python -c "from transformers import AutoTokenizer, EsmForMaskedLM; \
     print('ESM2 baked')"
 
 # ESMFold (via transformers EsmForProteinFolding — avoids the fair-esm/openfold build),
-# Biopython, and the GCP clients used by cofold.storage / cofold.jobstore.
+# Biopython, and the GCP clients used by proteinredesign.storage / proteinredesign.jobstore.
 # NOTE: ESMFold is the main build risk to validate; esmfold_v1 weights (~2.8 GB) are
 #       mounted/downloaded from GCS, not baked.
 RUN pip install --no-cache-dir \
@@ -48,7 +48,7 @@ RUN pip install --no-cache-dir \
 RUN git clone --depth 1 https://github.com/dauparas/LigandMPNN.git /opt/ligandmpnn
 ENV LIGANDMPNN_DIR=/opt/ligandmpnn
 
-# App code: config.py, utils/, core/esm2_scorer.py, cofold/
+# App code: config.py, utils/, core/esm2_scorer.py, proteinredesign/
 COPY . /app
 
-ENTRYPOINT ["python", "-m", "cofold.worker"]
+ENTRYPOINT ["python", "-m", "proteinredesign.worker"]

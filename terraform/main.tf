@@ -1,4 +1,4 @@
-# cofold backend infra (M0). Provisions everything WITHIN an already-created
+# proteinredesign backend infra (M0). Provisions everything WITHIN an already-created
 # dedicated project (var.project_id) that lives in its own folder with billing
 # attached (D4 — done out-of-band so this applies without org-admin rights).
 #
@@ -58,7 +58,7 @@ resource "google_firestore_database" "jobs" {
 }
 
 # ── Artifact Registry — worker image ──────────────────────────────────────────
-resource "google_artifact_registry_repository" "cofold" {
+resource "google_artifact_registry_repository" "proteinredesign" {
   repository_id = var.artifact_repo
   location      = var.region
   format        = "DOCKER"
@@ -67,8 +67,8 @@ resource "google_artifact_registry_repository" "cofold" {
 
 # ── Service account for the worker job ────────────────────────────────────────
 resource "google_service_account" "worker" {
-  account_id   = "cofold-worker"
-  display_name = "cofold generation worker"
+  account_id   = "proteinredesign-worker"
+  display_name = "proteinredesign generation worker"
 }
 
 # Worker: read/write buckets + Firestore.
@@ -162,15 +162,15 @@ resource "google_cloud_run_v2_job" "worker" {
           value = var.region
         }
         env {
-          name  = "COFOLD_INPUTS_BUCKET"
+          name  = "PROTEINREDESIGN_INPUTS_BUCKET"
           value = google_storage_bucket.inputs.name
         }
         env {
-          name  = "COFOLD_OUTPUTS_BUCKET"
+          name  = "PROTEINREDESIGN_OUTPUTS_BUCKET"
           value = google_storage_bucket.outputs.name
         }
         env {
-          name  = "COFOLD_WEIGHTS_BUCKET"
+          name  = "PROTEINREDESIGN_WEIGHTS_BUCKET"
           value = google_storage_bucket.weights.name
         }
       }

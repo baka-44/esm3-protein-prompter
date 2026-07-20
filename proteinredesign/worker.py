@@ -1,5 +1,5 @@
 """
-cofold/worker.py — generation pipeline entrypoint (runs on the GPU Cloud Run Job).
+proteinredesign/worker.py — generation pipeline entrypoint (runs on the GPU Cloud Run Job).
 
 Flow (increment 1, preset #1 fixed-backbone redesign — MPNN-only):
     manifest (GCS) → download PDB
@@ -14,23 +14,30 @@ The ML tool calls (ProteinMPNN, ESMFold) are isolated in adapter functions that
 run inside the worker container (weights from GCS — A6). The QC-gate + ranking
 logic (`select_top_candidates`) is pure and unit-tested.
 
-Entrypoint: `python -m cofold.worker` with env COFOLD_MANIFEST_URI set by the job.
+Entrypoint: `python -m proteinredesign.worker` with env PROTEINREDESIGN_MANIFEST_URI set by the job.
 """
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import traceback
 from dataclasses import dataclass, field
 
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
 # ── Tunable gates / budget (D2, B4) ───────────────────────────────────────────
-PLDDT_GATE = float(os.getenv("COFOLD_PLDDT_GATE", "70.0"))     # hard structural gate
-RMSD_GATE = float(os.getenv("COFOLD_RMSD_GATE", "2.0"))         # Å, self-consistency
-ESM2_DROP_FRACTION = float(os.getenv("COFOLD_ESM2_DROP", "0.10"))  # soft floor: drop bottom 10%
-OVERGEN_FACTOR = int(os.getenv("COFOLD_OVERGEN_FACTOR", "3"))  # generate 3× to survive QC
+PLDDT_GATE = float(os.getenv("PROTEINREDESIGN_PLDDT_GATE", "70.0"))     # hard structural gate
+RMSD_GATE = float(os.getenv("PROTEINREDESIGN_RMSD_GATE", "2.0"))         # Å, self-consistency
+ESM2_DROP_FRACTION = float(os.getenv("PROTEINREDESIGN_ESM2_DROP", "0.10"))  # soft floor: drop bottom 10%
+OVERGEN_FACTOR = int(os.getenv("PROTEINREDESIGN_OVERGEN_FACTOR", "3"))  # generate 3× to survive QC
 
 
 @dataclass
@@ -133,49 +140,199 @@ def select_top_candidates(
 # above stay pure and testable.
 
 def _mpnn_weights_dir() -> str:
-    from cofold.storage import ensure_weights
+    from proteinredesign.storage import ensure_weights
     return ensure_weights("mpnn")
 
 
 def _esmfold_weights_dir() -> str:
-    from cofold.storage import ensure_weights
+    from proteinredesign.storage import ensure_weights
     return ensure_weights("esmfold")
+
+
+# NOTE — these adapters are a first draft to be validated at container-build time.
+# Interface assumptions to VERIFY against the pinned tool versions:
+#   [MPNN-1] LigandMPNN `run.py` flags + weight filenames under mpnn/<checkpoint>.pt
+#   [MPNN-2] --fixed_residues token format is "<chain><author_resnum>" (PDB numbering)
+#   [MPNN-3] output FASTA path (out/seqs/*.fa), first record = native (skipped),
+#            and the header score field name/direction ("score" = neg-LL, lower better)
+#   [ESM-1]  transformers EsmForProteinFolding: output_to_pdb() + pLDDT in B-factors (0–100)
+
+_LIGANDMPNN_DIR = os.getenv("LIGANDMPNN_DIR", "/opt/ligandmpnn")
+
+# checkpoint id -> (run.py --model_type, weight-flag)
+_CHECKPOINT_FLAG = {
+    "proteinmpnn": ("protein_mpnn", "--checkpoint_protein_mpnn"),
+    "soluble_mpnn": ("soluble_mpnn", "--checkpoint_soluble_mpnn"),
+    "ligand_mpnn": ("ligand_mpnn", "--checkpoint_ligand_mpnn"),
+}
+
+_HEADER_SCORE = re.compile(r"(?:^|,\s*)(?:score|overall_confidence|global_score)=([-\d.]+)")
+
+
+def _fixed_residue_tokens(params: dict) -> str:
+    """Author-numbered residue ids for LigandMPNN --fixed_residues, e.g. 'A67 A82' [MPNN-2]."""
+    return " ".join(f"{r['chain_id']}{r['author_num']}" for r in params.get("fixed_residues", []))
+
+
+def _mpnn_checkpoint_path(checkpoint: str) -> str:
+    return os.path.join(_mpnn_weights_dir(), f"{checkpoint}.pt")
+
+
+def _run_ligandmpnn(pdb_path, out_folder, checkpoint, fixed_tokens,
+                    n_batches, batch_size, temperature, extra=None):
+    model_type, ckpt_flag = _CHECKPOINT_FLAG[checkpoint]
+    cmd = [
+        "python", os.path.join(_LIGANDMPNN_DIR, "run.py"),
+        "--model_type", model_type,
+        ckpt_flag, _mpnn_checkpoint_path(checkpoint),
+        "--pdb_path", pdb_path,
+        "--out_folder", out_folder,
+        "--number_of_batches", str(n_batches),
+        "--batch_size", str(batch_size),
+        "--temperature", str(temperature),
+        "--save_stats", "1",
+    ]
+    if fixed_tokens:
+        cmd += ["--fixed_residues", fixed_tokens]
+    if extra:
+        cmd += extra
+    subprocess.run(cmd, check=True, cwd=_LIGANDMPNN_DIR)
+
+
+def _parse_seqs_fasta(out_folder: str) -> list[tuple[str, float]]:
+    """Parse LigandMPNN's seqs/*.fa: drop the native (first) record, return (seq, score) [MPNN-3]."""
+    files = sorted(glob.glob(os.path.join(out_folder, "seqs", "*.fa")) +
+                   glob.glob(os.path.join(out_folder, "seqs", "*.fasta")))
+    if not files:
+        return []
+    records: list[tuple[str, str]] = []
+    header, chunks = None, []
+    with open(files[0]) as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                if header is not None:
+                    records.append((header, "".join(chunks)))
+                header, chunks = line, []
+            elif line:
+                chunks.append(line)
+    if header is not None:
+        records.append((header, "".join(chunks)))
+    designs = records[1:] if len(records) > 1 else records  # first = native input
+    out = []
+    for h, seq in designs:
+        m = _HEADER_SCORE.search(h)
+        score = float(m.group(1)) if m else float("nan")
+        out.append((seq.replace("/", ""), score))  # strip multi-chain separators
+    return out
 
 
 def run_proteinmpnn(
     pdb_path: str,
-    fixed_positions: dict[str, list[int]],
+    fixed_residue_tokens: str,
     n_seqs: int,
     checkpoint: str = "proteinmpnn",
     temperature: float = 0.1,
 ) -> list[tuple[str, float]]:
     """
-    Design `n_seqs` sequences for the fixed backbone, keeping `fixed_positions`
-    unchanged. Returns [(sequence, mpnn_score), ...].
-
-    Invocation (container): LigandMPNN repo `run.py --model_type <checkpoint>
-    --pdb_path <pdb> --fixed_residues <...> --number_of_batches ... --out_folder ...`,
-    with weights from `_mpnn_weights_dir()`. Parsed from the output FASTA (score in
-    the header) + sequences.
+    Design ~`n_seqs` sequences on the fixed backbone (keeping the fixed residues).
+    Returns [(sequence, mpnn_score), ...] (score = mean neg-LL, lower = better [MPNN-3]).
     """
-    raise NotImplementedError(
-        "run_proteinmpnn is wired to the MPNN CLI inside the worker container; "
-        "not runnable in this environment."
-    )
+    out_folder = tempfile.mkdtemp(prefix="mpnn_")
+    batch_size = min(max(1, n_seqs), 8)
+    n_batches = max(1, -(-n_seqs // batch_size))  # ceil
+    _run_ligandmpnn(pdb_path, out_folder, checkpoint, fixed_residue_tokens,
+                    n_batches, batch_size, temperature)
+    return _parse_seqs_fasta(out_folder)[:n_seqs]
 
 
 def score_with_checkpoint(sequences: list[str], pdb_path: str, checkpoint: str) -> list[float]:
-    """Score existing sequences on the fixed backbone under a given MPNN checkpoint (D1)."""
-    raise NotImplementedError("MPNN scoring runs in the worker container.")
+    """
+    Score existing sequences on the fixed backbone under `checkpoint` (D1 metadata).
+    Best-effort: on any failure returns NaN per sequence so the pipeline still ranks
+    on the remaining signals. Uses LigandMPNN score.py [MPNN-1]; VERIFY its flags/output.
+    """
+    model_type, ckpt_flag = _CHECKPOINT_FLAG[checkpoint]
+    workdir = tempfile.mkdtemp(prefix="mpnnscore_")
+    fasta = os.path.join(workdir, "seqs.fa")
+    with open(fasta, "w") as fh:
+        for i, s in enumerate(sequences):
+            fh.write(f">seq_{i}\n{s}\n")
+    out = os.path.join(workdir, "out")
+    try:
+        subprocess.run(
+            ["python", os.path.join(_LIGANDMPNN_DIR, "score.py"),
+             "--model_type", model_type, ckpt_flag, _mpnn_checkpoint_path(checkpoint),
+             "--pdb_path", pdb_path, "--fasta_path", fasta, "--out_folder", out,
+             "--use_sequence", "1"],
+            check=True, cwd=_LIGANDMPNN_DIR,
+        )
+        return _parse_score_stats(out, len(sequences))
+    except Exception as exc:  # noqa: BLE001 — metadata scoring is non-critical
+        _log(f"WARN score_with_checkpoint({checkpoint}) failed: {exc}")
+        return [float("nan")] * len(sequences)
+
+
+def _parse_score_stats(out_folder: str, n: int) -> list[float]:
+    """Read LigandMPNN score.py stats (.pt) → per-sequence scores [MPNN-1]. NaN if unreadable."""
+    files = sorted(glob.glob(os.path.join(out_folder, "**", "*.pt"), recursive=True))
+    if not files:
+        return [float("nan")] * n
+    try:
+        import torch
+        stats = torch.load(files[0], map_location="cpu")
+        # score.py stores a per-sequence score tensor/array under a "score"-like key.
+        for key in ("score", "scores", "global_score", "overall_confidence"):
+            if key in stats:
+                vals = stats[key]
+                vals = vals.tolist() if hasattr(vals, "tolist") else list(vals)
+                flat = [float(v) for v in (vals if isinstance(vals, list) else [vals])]
+                return (flat + [float("nan")] * n)[:n]
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN _parse_score_stats: {exc}")
+    return [float("nan")] * n
+
+
+_esmfold_model = None
 
 
 def run_esmfold(sequence: str) -> tuple[str, float]:
     """
-    Fold a sequence with ESMFold. Returns (pdb_text, mean_pLDDT).
-    Invocation (container): `esm.pretrained.esmfold_v1()` with weights from
-    `_esmfold_weights_dir()`.
+    Fold `sequence` with ESMFold (transformers EsmForProteinFolding). Returns
+    (pdb_text, mean_pLDDT). Weights: local esmfold dir if present, else HF id [ESM-1].
     """
-    raise NotImplementedError("ESMFold runs in the worker container.")
+    global _esmfold_model
+    import torch
+    if _esmfold_model is None:
+        from transformers import AutoTokenizer, EsmForProteinFolding
+        local = _esmfold_weights_dir()
+        src = local if (os.path.isdir(local) and os.listdir(local)) else "facebook/esmfold_v1"
+        tok = AutoTokenizer.from_pretrained(src)
+        model = EsmForProteinFolding.from_pretrained(src).eval()
+        if torch.cuda.is_available():
+            model = model.cuda()
+        _esmfold_model = (tok, model)
+
+    tok, model = _esmfold_model
+    with torch.no_grad():
+        ids = tok([sequence], return_tensors="pt", add_special_tokens=False)["input_ids"]
+        if torch.cuda.is_available():
+            ids = ids.cuda()
+        outputs = model(ids)
+        pdb_text = model.output_to_pdb(outputs)[0]
+    return pdb_text, _mean_ca_bfactor(pdb_text)
+
+
+def _mean_ca_bfactor(pdb_text: str) -> float:
+    """Mean CA B-factor = mean pLDDT (ESMFold writes pLDDT into B-factors, 0–100) [ESM-1]."""
+    vals = []
+    for line in pdb_text.splitlines():
+        if line.startswith("ATOM") and line[12:16].strip() == "CA":
+            try:
+                vals.append(float(line[60:66]))
+            except ValueError:
+                pass
+    return sum(vals) / len(vals) if vals else 0.0
 
 
 def compute_ca_rmsd(pred_pdb: str, ref_pdb_source, chain_id: str | None) -> float:
@@ -213,12 +370,12 @@ def run_pipeline(manifest, workdir: str) -> dict:
     """
     Execute preset #1 end-to-end and return a results dict (also written to GCS).
 
-    `manifest` is a cofold.manifest.JobManifest. Firestore status is updated at
+    `manifest` is a proteinredesign.manifest.JobManifest. Firestore status is updated at
     each stage so the dashboard can show live progress (B7/B8).
     """
-    from cofold import jobstore
-    from cofold import storage
-    from cofold.manifest import JobStatus, Preset
+    from proteinredesign import jobstore
+    from proteinredesign import storage
+    from proteinredesign.manifest import JobStatus, Preset
 
     if manifest.preset is not Preset.FIXED_BACKBONE_REDESIGN:
         raise NotImplementedError(
@@ -228,7 +385,7 @@ def run_pipeline(manifest, workdir: str) -> dict:
     job_id = manifest.job_id
     params = manifest.params
     chain_id = params.get("chain_id")
-    fixed_positions = params.get("fixed_positions", {})
+    fixed_tokens = _fixed_residue_tokens(params)
     n_target = manifest.num_outputs
     n_generate = max(n_target * OVERGEN_FACTOR, n_target)
 
@@ -239,7 +396,7 @@ def run_pipeline(manifest, workdir: str) -> dict:
 
     # 1. ProteinMPNN design (over-generate).
     jobstore.update_job(job_id, stage="ProteinMPNN design", progress=0.2)
-    designed = run_proteinmpnn(pdb_path, fixed_positions, n_seqs=n_generate, checkpoint="proteinmpnn")
+    designed = run_proteinmpnn(pdb_path, fixed_tokens, n_seqs=n_generate, checkpoint="proteinmpnn")
     candidates = [Candidate(sequence=seq, mpnn_scores={"proteinmpnn": score})
                   for seq, score in designed]
 
@@ -300,12 +457,12 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
 
 
 def main() -> int:
-    from cofold import jobstore, storage
-    from cofold.manifest import JobManifest, JobStatus
+    from proteinredesign import jobstore, storage
+    from proteinredesign.manifest import JobManifest, JobStatus
 
-    manifest_uri = os.getenv("COFOLD_MANIFEST_URI") or (sys.argv[1] if len(sys.argv) > 1 else "")
+    manifest_uri = os.getenv("PROTEINREDESIGN_MANIFEST_URI") or (sys.argv[1] if len(sys.argv) > 1 else "")
     if not manifest_uri:
-        print("ERROR: set COFOLD_MANIFEST_URI (or pass the manifest gs:// URI as argv[1]).",
+        print("ERROR: set PROTEINREDESIGN_MANIFEST_URI (or pass the manifest gs:// URI as argv[1]).",
               file=sys.stderr)
         return 2
 

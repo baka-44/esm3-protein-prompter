@@ -1,5 +1,5 @@
 """
-cofold.config_builders — deterministic, per-preset config builders.
+proteinredesign.config_builders — deterministic, per-preset config builders.
 
 These translate scientist-level structured inputs (PDB + residue# + AA name +
 intent) into the exact config each engine needs (MPNN fixed_positions, RFdiffusion

@@ -1,12 +1,12 @@
 """
-cofold/jobstore.py — Firestore-backed job store.
+proteinredesign/jobstore.py — Firestore-backed job store.
 
 Job records are durable (survive frontend refresh / re-login — B7) and
 **user-linked** (tagged by owner email — A7; no per-user quotas). The frontend
 job dashboard lists a user's own jobs and polls their status; the worker updates
 status through the lifecycle queued → running → done/failed.
 
-Firestore collection name from config.COFOLD_JOBS_COLLECTION (default "cofold_jobs").
+Firestore collection name from config.PROTEINREDESIGN_JOBS_COLLECTION (default "proteinredesign_jobs").
 Document id = job_id.
 """
 
@@ -16,8 +16,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from config import COFOLD_JOBS_COLLECTION, get_firestore_client
-from cofold.manifest import JobManifest, JobStatus, Preset
+from config import PROTEINREDESIGN_JOBS_COLLECTION, get_firestore_client
+from proteinredesign.manifest import JobManifest, JobStatus, Preset
 
 
 @dataclass
@@ -51,7 +51,7 @@ class JobRecord:
 
 
 def _collection():
-    return get_firestore_client().collection(COFOLD_JOBS_COLLECTION)
+    return get_firestore_client().collection(PROTEINREDESIGN_JOBS_COLLECTION)
 
 
 def create_job(manifest: JobManifest, manifest_uri: str = "", title: str = "") -> JobRecord:

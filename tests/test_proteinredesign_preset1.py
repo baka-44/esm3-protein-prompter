@@ -1,8 +1,8 @@
 """
-Unit tests for cofold.manifest and cofold.config_builders.preset1.
+Unit tests for proteinredesign.manifest and proteinredesign.config_builders.preset1.
 
-Runnable via `python -m pytest tests/test_cofold_preset1.py` or directly
-(`python tests/test_cofold_preset1.py`).
+Runnable via `python -m pytest tests/test_proteinredesign_preset1.py` or directly
+(`python tests/test_proteinredesign_preset1.py`).
 """
 
 import os
@@ -13,12 +13,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-from cofold.config_builders.preset1 import (  # noqa: E402
+from proteinredesign.config_builders.preset1 import (  # noqa: E402
     ConfigError,
     build_preset1_config,
     parse_fixed_residue_tokens,
 )
-from cofold.manifest import JobManifest, Preset  # noqa: E402
+from proteinredesign.manifest import JobManifest, Preset  # noqa: E402
 
 
 # ── PDB fixture helpers ───────────────────────────────────────────────────────

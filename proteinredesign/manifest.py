@@ -1,5 +1,5 @@
 """
-cofold/manifest.py — Job manifest schema for the RFdiffusion/MPNN backend.
+proteinredesign/manifest.py — Job manifest schema for the RFdiffusion/MPNN backend.
 
 A JobManifest is the self-contained input spec for one generation job. It is
 written to GCS and referenced by a Firestore job record (see jobstore.py). The

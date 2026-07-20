@@ -1,14 +1,17 @@
-# cofold backend — Terraform (M0)
+# proteinredesign backend — Terraform (M0)
 
 Provisions the RFdiffusion/MPNN backend inside a **dedicated project** (D4).
 
 ## Done out-of-band first (needs org/billing rights)
-1. Create a **folder** and a **project** inside it; attach billing (D4 — single audit line).
+1. Create a dedicated **project** under the org (no folders in this org); attach billing
+   (D4 — single audit line). E.g.
+   `gcloud projects create phyx44-proteinredesign-v1 --organization=626836951011`
+   then `gcloud billing projects link phyx44-proteinredesign-v1 --billing-account=01EF81-EA4098-55A36D`.
 2. Request **NVIDIA L4 GPU quota** in the region (lead time).
 3. Build & push the worker image:
    ```bash
-   gcloud builds submit --tag <region>-docker.pkg.dev/<project>/cofold/worker \
-     -f cofold/Dockerfile.worker .
+   gcloud builds submit --tag <region>-docker.pkg.dev/<project>/proteinredesign/worker \
+     -f proteinredesign/Dockerfile.worker .
    ```
    (Or build locally and `docker push`. The Artifact Registry repo is created by Terraform,
    so push after the first apply — or create the repo first.)
@@ -18,10 +21,10 @@ Provisions the RFdiffusion/MPNN backend inside a **dedicated project** (D4).
 ```bash
 cd terraform
 cat > terraform.tfvars <<'EOF'
-project_id               = "phyx44-cofold"
+project_id               = "phyx44-proteinredesign-v1"
 region                   = "us-central1"
-bucket_prefix            = "phyx44-cofold"
-worker_image             = "us-central1-docker.pkg.dev/phyx44-cofold/cofold/worker:latest"
+bucket_prefix            = "phyx44-proteinredesign"
+worker_image             = "us-central1-docker.pkg.dev/phyx44-proteinredesign-v1/proteinredesign/worker:latest"
 frontend_service_account = "<prot-prompt runtime SA email>"
 EOF
 
