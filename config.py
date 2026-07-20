@@ -107,17 +107,55 @@ def get_esm_client(model_name: str | None = None):
 
 def get_anthropic_client():
     """Return an Anthropic client. Raises if ANTHROPIC_API_KEY is not set."""
-    if not ANTHROPIC_API_KEY:
+    # Read at call time (not module import time) so Secret Manager updates are picked up
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Add it to your .env file or environment."
         )
     try:
         import anthropic
-        return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        return anthropic.Anthropic(api_key=api_key)
     except ImportError as e:
         raise RuntimeError(
             "Could not import anthropic SDK. Run: pip install anthropic"
         ) from e
+
+
+# ── RFdiffusion/MPNN backend (cofold) — GCP clients ───────────────────────────
+# These power the async generation backend (see docs/plans/rfdiffusion_mpnn_backend.md).
+# Read at call time so Cloud Run / Secret Manager updates are picked up.
+
+GCP_PROJECT: str | None = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+COFOLD_INPUTS_BUCKET: str | None = os.getenv("COFOLD_INPUTS_BUCKET")
+COFOLD_OUTPUTS_BUCKET: str | None = os.getenv("COFOLD_OUTPUTS_BUCKET")
+COFOLD_WEIGHTS_BUCKET: str | None = os.getenv("COFOLD_WEIGHTS_BUCKET")
+COFOLD_WEIGHTS_MOUNT: str | None = os.getenv("COFOLD_WEIGHTS_MOUNT")  # e.g. gcsfuse mount path
+COFOLD_JOBS_COLLECTION: str = os.getenv("COFOLD_JOBS_COLLECTION", "cofold_jobs")
+
+
+def get_gcs_client():
+    """Return a Google Cloud Storage client. Lazy import so the dep is optional."""
+    try:
+        from google.cloud import storage
+    except ImportError as e:
+        raise RuntimeError(
+            "google-cloud-storage is required for the cofold backend. "
+            "Run: pip install google-cloud-storage"
+        ) from e
+    return storage.Client(project=GCP_PROJECT) if GCP_PROJECT else storage.Client()
+
+
+def get_firestore_client():
+    """Return a Firestore client. Lazy import so the dep is optional."""
+    try:
+        from google.cloud import firestore
+    except ImportError as e:
+        raise RuntimeError(
+            "google-cloud-firestore is required for the cofold backend. "
+            "Run: pip install google-cloud-firestore"
+        ) from e
+    return firestore.Client(project=GCP_PROJECT) if GCP_PROJECT else firestore.Client()
 
 
 def validate_config() -> list[str]:

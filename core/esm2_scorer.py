@@ -43,6 +43,15 @@ def _load_model(model_name: str = DEFAULT_ESM2_MODEL):
     if model_name in _model_cache:
         return _model_cache[model_name]
 
+    # The EvolutionaryScale `esm` SDK installs a top-level `esm` module that
+    # shadows `transformers.models.esm.modeling_esm`. Temporarily remove it
+    # from sys.modules so transformers can resolve its own internal imports.
+    import sys
+    _esm_backup = sys.modules.pop("esm", None)
+    _esm_sub_backups = {
+        k: sys.modules.pop(k, None)
+        for k in list(sys.modules) if k.startswith("esm.")
+    }
     try:
         from transformers import AutoTokenizer, EsmForMaskedLM
     except ImportError as e:
@@ -50,6 +59,13 @@ def _load_model(model_name: str = DEFAULT_ESM2_MODEL):
             "transformers is required for ESM2 scoring. "
             "Install with: pip install transformers"
         ) from e
+    finally:
+        # Restore the ESM3 SDK modules
+        if _esm_backup is not None:
+            sys.modules["esm"] = _esm_backup
+        for k, v in _esm_sub_backups.items():
+            if v is not None:
+                sys.modules[k] = v
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model_name)

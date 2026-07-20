@@ -17,7 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import sys
+
 import numpy as np
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
 from core.esm_backend import GenerationResult
 from utils.sequence_utils import novelty_percent, mean_pairwise_diversity, to_fasta
@@ -67,6 +73,19 @@ class CandidateResult:
     index: int = 0
     """Original generation index (0-based)."""
 
+    has_structure_scores: bool = False
+    """
+    True when pTM and pLDDT are populated (i.e. structure track was run).
+    False for sequence-only generation — fold the candidate to get real scores.
+    """
+
+    has_novelty_ref: bool = False
+    """
+    True when novelty_pct was computed against a valid reference sequence.
+    False when no reference was available (e.g. de novo generation or masked template).
+    When False, novelty_pct is 0.0 and should be displayed as '—'.
+    """
+
     def fasta_header(self) -> str:
         return (
             f"candidate_{self.rank} "
@@ -102,14 +121,55 @@ def process_results(
     if not raw_results:
         return []
 
+    # Determine the original input sequence for dedup filtering
+    original_input = ""
+    if spec and hasattr(spec, "original_sequence") and spec.original_sequence:
+        original_input = spec.original_sequence
+
     if not reference_sequence and spec and spec.sequence_template:
-        reference_sequence = spec.sequence_template.replace("_", "")
+        # Only use the template as a novelty reference when it contains no mask
+        # characters — stripping '_' would produce a shorter string than the
+        # generated sequence, causing a positional offset that inflates novelty
+        # for sequences that are actually very similar to the template.
+        template = spec.sequence_template
+        if "_" not in template:
+            reference_sequence = template
+
+    # Use original_input as novelty reference if we still don't have one
+    if not reference_sequence and original_input:
+        reference_sequence = original_input
 
     # ── Extract raw metrics from ESMProtein objects ────────────────────────────
     candidates: list[CandidateResult] = []
     for result in raw_results:
         candidate = _extract_candidate(result.esm_protein, result.index, reference_sequence)
         candidates.append(candidate)
+
+    # ── Deduplicate: keep only unique sequences ──────────────────────────────
+    seen_seqs: set[str] = set()
+    unique_candidates: list[CandidateResult] = []
+    for c in candidates:
+        if c.sequence not in seen_seqs:
+            seen_seqs.add(c.sequence)
+            unique_candidates.append(c)
+        else:
+            _log(f"INFO: dropping duplicate candidate (index={c.index})")
+    if len(unique_candidates) < len(candidates):
+        _log(f"INFO: dedup reduced {len(candidates)} → {len(unique_candidates)} candidates")
+    candidates = unique_candidates
+
+    # ── Filter out candidates identical to the input sequence ─────────────────
+    if original_input:
+        before_count = len(candidates)
+        candidates = [c for c in candidates if c.sequence != original_input]
+        dropped = before_count - len(candidates)
+        if dropped:
+            _log(f"INFO: filtered {dropped} candidate(s) identical to input sequence")
+
+    if not candidates:
+        _log("WARNING: all candidates were duplicates or identical to input — "
+             "returning empty list")
+        return []
 
     # ── ESM2 log-likelihood scoring ────────────────────────────────────────────
     if run_esm2_scoring:
@@ -122,11 +182,16 @@ def process_results(
 
     # ── Compute composite score and sort ──────────────────────────────────────
     for c in candidates:
-        c.composite_score = (
-            0.5 * c.ptm
-            + 0.3 * (c.mean_plddt / 100.0)
-            + 0.2 * c.esm2_score_norm
-        )
+        if c.has_structure_scores:
+            # Full composite when structure scores are available
+            c.composite_score = (
+                0.5 * c.ptm
+                + 0.3 * (c.mean_plddt / 100.0)
+                + 0.2 * c.esm2_score_norm
+            )
+        else:
+            # Sequence-only: composite is purely ESM2 fitness proxy
+            c.composite_score = c.esm2_score_norm
 
     candidates.sort(key=lambda c: c.composite_score, reverse=True)
     for rank, c in enumerate(candidates, start=1):
@@ -151,8 +216,9 @@ def _add_esm2_scores(
             progress_callback=progress_callback,
         )
     except Exception as e:
-        # ESM2 scoring is best-effort — don't abort the whole pipeline
-        print(f"WARNING: ESM2 scoring failed ({e}). Using neutral scores.")
+        import traceback
+        _log(f"WARNING: ESM2 scoring failed ({type(e).__name__}: {e}). Using neutral scores.")
+        _log(traceback.format_exc())
         raw_scores = [0.0] * len(candidates)
 
     normalised = normalise_scores(raw_scores)
@@ -179,9 +245,17 @@ def _extract_candidate(
         mean_plddt *= 100.0
         plddt_per_residue = [v * 100.0 for v in plddt_per_residue]
 
+    # Structure scores are available only when the ESMProtein has a real ptm value
+    # (sequence-only generation returns ptm=None → 0.0, which we can detect here
+    # by checking the raw attribute before our 0.0 fallback was applied).
+    raw_ptm = getattr(protein, "ptm", None)
+    has_structure_scores = raw_ptm is not None and float(raw_ptm) > 0.0
+
     novelty_pct = 0.0
+    has_novelty_ref = False
     if reference_sequence and sequence:
         novelty_pct = novelty_percent(sequence, reference_sequence)
+        has_novelty_ref = True
 
     # ESM2 scores filled in later by _add_esm2_scores
     return CandidateResult(
@@ -196,14 +270,26 @@ def _extract_candidate(
         pdb_string=pdb_string,
         plddt_per_residue=plddt_per_residue,
         index=index,
+        has_structure_scores=has_structure_scores,
+        has_novelty_ref=has_novelty_ref,
     )
 
 
 def _get_sequence(protein: object) -> str:
     seq = getattr(protein, "sequence", None)
+    _log(f"DEBUG _get_sequence: type={type(seq).__name__}, "
+          f"repr={repr(str(seq)[:80]) if seq is not None else None}")
     if seq is None:
         return ""
-    return str(seq).replace("_", "")
+    seq_str = str(seq)
+    # Replace mask token '_' with nothing — keep valid amino acids
+    cleaned = seq_str.replace("_", "")
+    if not cleaned and seq_str:
+        # Sequence exists but is all mask tokens — generation may have failed silently.
+        # Log and return empty so the candidate is flagged as invalid.
+        _log(f"WARNING _get_sequence: sequence is entirely mask tokens "
+              f"(len={len(seq_str)}) — generation produced no amino acids.")
+    return cleaned
 
 
 def _get_plddt(protein: object) -> list[float]:
@@ -237,18 +323,8 @@ def _get_pdb_string(protein: object) -> str | None:
             return None
     except Exception:
         pass
-    try:
-        return protein.to_pdb()
-    except AttributeError:
-        pass
-    for method_name in ("to_pdb_string", "pdb_string"):
-        method = getattr(protein, method_name, None)
-        if callable(method):
-            try:
-                return method()
-            except Exception:
-                pass
-    return None
+    from core.esm_backend import protein_to_pdb_string
+    return protein_to_pdb_string(protein)
 
 
 def candidates_to_fasta(candidates: list[CandidateResult]) -> str:

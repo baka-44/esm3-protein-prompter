@@ -1,0 +1,54 @@
+# cofold GPU worker — runs the generation pipeline as a Cloud Run Job (NVIDIA L4).
+# Increment 1 (preset #1): ProteinMPNN + ESMFold + ESM2. RFdiffusion3 added in M3.
+#
+# Build:  docker build -f cofold/Dockerfile.worker -t <region>-docker.pkg.dev/<proj>/cofold/worker .
+# Run:    the Cloud Run Job sets COFOLD_MANIFEST_URI and the COFOLD_* bucket/project env vars.
+#
+# Model weights (MPNN checkpoints, ESMFold) are NOT baked in — they are mounted from
+# GCS at runtime (A6) via COFOLD_WEIGHTS_MOUNT (gcsfuse) or downloaded by
+# cofold.storage.ensure_weights(). Only the tiny ESM2 scoring model is pre-baked.
+
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3-pip python3.11-dev git gcc g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+WORKDIR /app
+
+# torch + torchvision from the SAME CUDA wheel index — keep them consistent to avoid
+# the "torchvision::nms does not exist" mismatch (same lesson as the ESM3 app Dockerfile).
+RUN pip install --no-cache-dir \
+        torch torchvision \
+        --index-url https://download.pytorch.org/whl/cu124
+
+# Install transformers BEFORE the esm SDK so transformers.models.esm resolves
+# (the esm SDK installs a top-level `esm` module that shadows it — see esm2_scorer.py).
+RUN pip install --no-cache-dir "transformers>=4.40.0"
+
+# Pre-bake the tiny ESM2 scoring model (~30 MB) so QC scoring needs no HF network at runtime.
+RUN python -c "from transformers import AutoTokenizer, EsmForMaskedLM; \
+    AutoTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D'); \
+    EsmForMaskedLM.from_pretrained('facebook/esm2_t6_8M_UR50D'); \
+    print('ESM2 baked')"
+
+# ESMFold (via transformers EsmForProteinFolding — avoids the fair-esm/openfold build),
+# Biopython, and the GCP clients used by cofold.storage / cofold.jobstore.
+# NOTE: ESMFold is the main build risk to validate; esmfold_v1 weights (~2.8 GB) are
+#       mounted/downloaded from GCS, not baked.
+RUN pip install --no-cache-dir \
+        "biopython>=1.83" "numpy>=1.24" \
+        "google-cloud-storage>=2.14" "google-cloud-firestore>=2.14"
+
+# ProteinMPNN / SolubleMPNN / LigandMPNN — unified LigandMPNN repo (MIT).
+RUN git clone --depth 1 https://github.com/dauparas/LigandMPNN.git /opt/ligandmpnn
+ENV LIGANDMPNN_DIR=/opt/ligandmpnn
+
+# App code: config.py, utils/, core/esm2_scorer.py, cofold/
+COPY . /app
+
+ENTRYPOINT ["python", "-m", "cofold.worker"]

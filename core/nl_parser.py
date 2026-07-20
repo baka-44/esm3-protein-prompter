@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def _log(msg: str) -> None:
+    """Log to stderr so it appears in Cloud Run logs (Streamlit swallows stdout)."""
+    print(msg, file=sys.stderr, flush=True)
 
 # ── PromptSpec dataclass ───────────────────────────────────────────────────────
 
@@ -72,15 +78,180 @@ class PromptSpec:
                               structure motif + sequence + function combined.
     """
 
+    mask_regions: list[dict] = field(default_factory=list)
+    """
+    List of {start, end} dicts (0-based, both inclusive) specifying regions to mask.
+    Preferred over writing sequence_template manually when an original sequence is available.
+    E.g. [{"start": 18, "end": 25}, {"start": 29, "end": 34}]
+    Applied programmatically to the original sequence to produce sequence_template.
+    """
+
+    original_sequence: str = ""
+    """
+    The original input sequence extracted from the user's message (if any).
+    Used for deduplication (filtering out candidates identical to input) and
+    novelty calculation. Set automatically by the parser, not by Haiku.
+    """
+
+    motif_source_indices: list[int] = field(default_factory=list)
+    """
+    0-based residue indices in the ORIGINAL PDB to extract backbone coordinates from.
+    When non-empty (alongside motif_residue_indices), source[i] is read from the PDB
+    at position source[i] and placed at motif_residue_indices[i] in the new protein.
+    Used exclusively for scaffold condensation (source pos ≠ target pos).
+    """
+
     notes_to_user: str = ""
     """Claude's explanation of how it interpreted the request."""
 
 
+# ── Structured input template builder ────────────────────────────────────────
+
+def build_template_from_structured(
+    sequence: str,
+    fixed_residues_str: str = "",
+    mask_regions_str: str = "",
+) -> tuple[str, dict[int, str], list[dict]]:
+    """
+    Build sequence_template, fixed_positions, and mask_regions deterministically
+    from structured user inputs. No Haiku / LLM involved.
+
+    Logic:
+      If fixed_residues_str provided:
+        Start from all-masked ("_" * L). Pin each listed residue from the
+        input sequence. Everything else remains masked (open to redesign).
+        mask_regions_str is redundant in this mode but harmlessly accepted.
+
+      If only mask_regions_str provided (no fixed_residues_str):
+        Start from the full input sequence (everything fixed). Apply "_" at
+        the specified ranges only.
+
+    Args:
+        sequence:           Full reference AA sequence (single-letter, no gaps).
+        fixed_residues_str: Comma/space-separated residue specs, 1-based.
+                            Accepts "K67" (letter+number) or "67" (number only).
+                            Letter form validates against sequence; number form
+                            takes the AA from the sequence at that position.
+        mask_regions_str:   Comma/space-separated ranges, 1-based inclusive.
+                            Accepts "18-25, 29-34" or single positions "67".
+
+    Returns:
+        (sequence_template, fixed_positions, mask_regions)
+        fixed_positions: {0-based index: AA char}
+        mask_regions:    [{start: 0-based, end: 0-based}, ...]
+    """
+    import re as _re
+
+    sequence = sequence.upper().strip()
+    L = len(sequence)
+    if L == 0:
+        return "", {}, []
+
+    parsed_fixed: dict[int, str] = {}
+    parsed_mask: list[dict] = []
+
+    # ── Parse fixed residues ─────────────────────────────────────────────────
+    if fixed_residues_str.strip():
+        # Tokenise on commas and/or whitespace
+        tokens = _re.split(r"[,\s]+", fixed_residues_str.strip())
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            # Accept: K67 (letter+number), 67 (number only), 1M or 67K (number+letter)
+            m = _re.fullmatch(r"([A-Za-z]?)(\d+)([A-Za-z]?)", token)
+            if not m:
+                _log(f"WARN build_template_from_structured: skipping unrecognised token '{token}'")
+                continue
+            letter = (m.group(1) or m.group(3)).upper()
+            pos_1based = int(m.group(2))
+            idx = pos_1based - 1  # convert to 0-based
+            if idx < 0 or idx >= L:
+                _log(f"WARN build_template_from_structured: position {pos_1based} out of range "
+                     f"(sequence length {L}) — skipping")
+                continue
+            if letter:
+                if letter != sequence[idx]:
+                    _log(f"WARN build_template_from_structured: residue spec '{token}' says "
+                         f"{letter} but sequence has {sequence[idx]} at 1-based pos {pos_1based} "
+                         f"— using sequence AA ({sequence[idx]})")
+                parsed_fixed[idx] = sequence[idx]
+            else:
+                parsed_fixed[idx] = sequence[idx]
+
+    # ── Parse mask regions ────────────────────────────────────────────────────
+    if mask_regions_str.strip():
+        tokens = _re.split(r"[,\s]+", mask_regions_str.strip())
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            # Range: "18-25" or "18–25"
+            m_range = _re.fullmatch(r"(\d+)[-\u2013](\d+)", token)
+            if m_range:
+                start_1 = int(m_range.group(1))
+                end_1 = int(m_range.group(2))
+                parsed_mask.append({"start": start_1 - 1, "end": end_1 - 1})
+                continue
+            # Single position: "67"
+            m_single = _re.fullmatch(r"(\d+)", token)
+            if m_single:
+                pos = int(m_single.group(1)) - 1
+                parsed_mask.append({"start": pos, "end": pos})
+                continue
+            _log(f"WARN build_template_from_structured: skipping unrecognised mask token '{token}'")
+
+    # ── Build template ────────────────────────────────────────────────────────
+    if parsed_fixed:
+        # Fixed-residues mode: start fully masked, pin the listed residues
+        template = ["_"] * L
+        for idx, aa in parsed_fixed.items():
+            template[idx] = aa
+        sequence_template = "".join(template)
+        _log(f"INFO build_template_from_structured: fixed-residues mode — "
+             f"pinned {len(parsed_fixed)} residues, {sequence_template.count('_')}/{L} masked")
+        return sequence_template, parsed_fixed, []
+
+    elif parsed_mask:
+        # Mask-regions mode: start from full sequence, mask listed ranges
+        template = list(sequence)
+        for region in parsed_mask:
+            start = max(0, region["start"])
+            end = min(L - 1, region["end"])
+            for i in range(start, end + 1):
+                template[i] = "_"
+        sequence_template = "".join(template)
+        _log(f"INFO build_template_from_structured: mask-regions mode — "
+             f"{sequence_template.count('_')}/{L} masked across {len(parsed_mask)} region(s)")
+        return sequence_template, {}, parsed_mask
+
+    else:
+        # Sequence provided but no constraints — return the full sequence as template
+        # (Haiku can still apply its own mask_regions on top via the original_sequence path)
+        _log("INFO build_template_from_structured: sequence only, no fixed/mask constraints")
+        return sequence, {}, []
+
+
+# ── Known-invalid InterPro keywords that Haiku frequently hallucinates ────────
+_INVALID_KEYWORDS = {
+    # Sensory / food science terms (not in InterPro)
+    "sweetness", "sweet taste", "sweet protein",
+    "sweet", "bitter", "taste", "flavor", "flavour",
+    # Generic protein properties (not InterPro annotation terms)
+    "antimicrobial", "stability", "solubility", "thermostability", "expression",
+    # Quaternary / interaction terms rejected by Forge
+    "homodimer", "homodimerization", "dimerization", "dimer",
+    "heterodimerization", "heterodimer", "oligomerization",
+    # Ligand / binding generics (use specific terms like "ATP binding" instead)
+    "ligand binding", "ligand-binding", "ligand",
+}
+
+
 # ── System prompt ──────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """You are an expert protein engineering assistant that helps scientists design proteins using ESM3, a multimodal generative protein language model.
+_SYSTEM_PROMPT = """You are an expert computational protein engineering assistant working within a legitimate academic and industrial protein design platform (Phyx44 Guided Protein Design Tool). This tool is used exclusively for standard protein engineering research: improving expression, stability, activity, and solubility of therapeutic proteins, enzymes, and biosensors. All work is within the scope of normal biochemistry and protein science research.
 
-Your job is to translate the scientist's plain-English request into a structured JSON prompt specification (PromptSpec) that the software will use to configure ESM3.
+Your job is to translate the scientist's plain-English request into a structured JSON prompt specification (PromptSpec) that the software will use to configure ESM3, a multimodal generative protein language model developed by EvolutionaryScale.
 
 ## ESM3 Capabilities (what you can specify)
 
@@ -94,13 +265,21 @@ Specify which amino acid residues to keep fixed and which to generate.
 
 ### 2. Function keywords
 High-level biological descriptors that guide ESM3 toward proteins with desired functions.
-These come from InterPro annotations. Examples:
+These MUST be standard InterPro/UniProt functional annotation terms — NOT common English words.
+INVALID terms (will cause API errors, do NOT use):
+- Generic properties: "stability", "solubility", "thermostability", "expression", "antimicrobial"
+- Quaternary structure: "homodimer", "dimer", "dimerization", "oligomerization", "heterodimer"
+- Generic binding: "ligand binding", "ligand-binding", "ligand"
+- Sensory terms: "sweetness", "sweet taste", "antimicrobial"
+VALID examples:
 - Fluorescence: "fluorescence", "green fluorescent protein", "chromophore"
 - Enzymes: "serine protease activity", "kinase activity", "oxidoreductase activity"
-- Binding: "DNA binding", "zinc finger", "calcium binding", "ATP binding"
+- Binding (specific): "DNA binding", "zinc finger", "calcium binding", "ATP binding", "coiled-coil"
 - Structure: "beta barrel", "TIM barrel", "alpha/beta hydrolase", "immunoglobulin fold"
 - Transport: "MFS transporter", "ion channel"
-Use specific InterPro-style terms. You can include 1-5 keywords.
+- Plant defence: "pathogenesis-related protein", "thaumatin family"
+If unsure whether a term is a valid InterPro label, omit it. Use 0-3 keywords maximum.
+When in doubt, use an empty list [] — sequence masking alone is sufficient for most tasks.
 
 ### 3. Structure motif (if a PDB file is uploaded)
 Preserve backbone atomic coordinates (N, CA, C, O) of specific residues.
@@ -115,13 +294,14 @@ Respond ONLY with a valid JSON object matching this schema:
 ```json
 {
   "protein_length": <integer, e.g. 229>,
-  "sequence_template": "<string of length protein_length; known AAs at fixed positions, '_' elsewhere; empty string for fully de novo>",
+  "sequence_template": "<see Rule 11 — leave '' when using mask_regions>",
+  "mask_regions": [{"start": <0-based int>, "end": <0-based int, inclusive>}, ...],
   "fixed_positions": {"<0-based index as string>": "<single-letter AA>", ...},
   "function_keywords": ["<keyword1>", "<keyword2>", ...],
   "use_structure_motif": <true|false>,
   "motif_residue_indices": [<0-based int>, ...],
   "motif_chain_id": "<chain letter or null>",
-  "num_candidates": <integer 1-10>,
+  "num_candidates": <integer 1-50>,
   "generation_temperature": <float 0.3-1.0>,
   "num_steps": <integer 4-20>,
   "recommended_model": "<esm3-small-2024-08 | esm3-medium-2024-08 | esm3-large-2024-08>",
@@ -158,6 +338,31 @@ Respond ONLY with a valid JSON object matching this schema:
 
 10. Return ONLY the JSON — no markdown fences, no extra text before or after.
 
+11. CRITICAL — sequence_template vs mask_regions:
+
+    PREFERRED: When the scientist provides a sequence and you want to redesign certain regions,
+    use mask_regions and leave sequence_template as "".
+    mask_regions = list of {"start": X, "end": Y} (0-based, both inclusive).
+    The system automatically applies these ranges as underscores in the original sequence —
+    no risk of length errors or positional drift.
+    Example: redesign positions 18–25 and 29–34 in a 207-aa sequence:
+      "mask_regions": [{"start": 18, "end": 25}, {"start": 29, "end": 34}],
+      "sequence_template": ""
+
+    Only write sequence_template manually for:
+      a) De novo generation: ""  (empty string)
+      b) Very short sequences (<30 aa) where character counting is trivial
+      c) When the scientist explicitly provides a template string with underscores
+
+    COMMON MISTAKE — do not do this:
+      Original segment: KGDAALDAGGR  (11 chars, positions 19–29)
+      You want to mask positions 19–26 (KGDAALDAGG, 8 chars).
+      WRONG: "...WAAAS________DAALDAGGR..." ← 17 chars instead of 11; you inserted
+             8 underscores AND then re-appended DAALDAGGR. This corrupts every
+             downstream position and silently truncates the C-terminus.
+      RIGHT: use mask_regions [{"start": 18, "end": 25}] and leave sequence_template ""
+             The system will produce "...WAAAS________GGR..." automatically.
+
 ## Examples
 
 ### Example 1 — GFP chromophore preservation
@@ -165,8 +370,9 @@ Scientist: "Generate GFP variants. Keep the chromophore residues T65, Y66, G67, 
 
 ```json
 {
-  "protein_length": 229,
-  "sequence_template": "________________________________________________________XXXXXXXXXX__TYG________________________________R______________________________________________E___________",
+  "protein_length": 239,
+  "sequence_template": "",
+  "mask_regions": [],
   "fixed_positions": {"64": "T", "65": "Y", "66": "G", "95": "R", "221": "E"},
   "function_keywords": ["fluorescence", "beta barrel", "chromophore"],
   "use_structure_motif": true,
@@ -175,7 +381,7 @@ Scientist: "Generate GFP variants. Keep the chromophore residues T65, Y66, G67, 
   "num_candidates": 8,
   "generation_temperature": 0.8,
   "num_steps": 10,
-  "notes_to_user": "I'm fixing chromophore residues T65, Y66, G67 (0-indexed: 64,65,66), R96→95, E222→221. Structure motif applied to residues 58-71 (0-indexed 57-70) to preserve the beta barrel scaffold. High temperature (0.8) for diversity. Note: the full sequence_template will need your reference sequence at fixed positions."
+  "notes_to_user": "Fixing chromophore residues T65/Y66/G67 (0-indexed 64/65/66), R96→95, E222→221. Structure motif covers beta-barrel residues 58-71 (0-indexed 57-70). High temperature for diversity. No full reference sequence provided so using fixed_positions only — all other positions will be generated by ESM3."
 }
 ```
 
@@ -216,7 +422,119 @@ Scientist: "Take this zinc finger sequence YKCEECGKSFSQKSDLVRHQRTHTG and redesig
   "notes_to_user": "Fixing four Cys residues at 0-based positions 2, 5, 19, 22 (1-based: 3, 6, 20, 23). All other positions masked for redesign. Lower temperature (0.6) for conservative scaffold while keeping zinc coordination geometry from the PDB."
 }
 ```
+
+### Example 4 — Redesign two loop regions in a known protein
+Scientist: "Here is thaumatin (207 aa): ATFEIVNRCSYTVWAAASKGDAALDAGGRQLNSGESWTINVEPGTNGGKIWARTDCYFDDSGSGICKT... (full sequence). Diversify the loops between WAAAS and AALDAGGR, and between DAGGR and GESWT. Keep everything else fixed."
+
+```json
+{
+  "protein_length": 207,
+  "sequence_template": "",
+  "mask_regions": [{"start": 18, "end": 21}, {"start": 29, "end": 32}],
+  "fixed_positions": {},
+  "function_keywords": ["thaumatin family"],
+  "use_structure_motif": false,
+  "motif_residue_indices": [],
+  "motif_chain_id": null,
+  "num_candidates": 8,
+  "generation_temperature": 0.7,
+  "num_steps": 8,
+  "recommended_model": "esm3-medium-2024-08",
+  "notes_to_user": "I identified the two loop regions you described and encoded them as mask_regions. The system will apply these as underscores on your sequence automatically — every non-loop residue stays fixed. Mask region 1: positions 18–21 (KGDA, just after WAAAS). Mask region 2: positions 29–32 (QLNS, between DAGGR and GESWT)."
+}
+```
 """
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+_AA_CHARS = set("ACDEFGHIKLMNPQRSTVWY")
+
+def _extract_sequence_from_text(text: str) -> str | None:
+    """
+    Try to extract an amino acid sequence from a user message.
+
+    Handles:
+      - FASTA format (> header line followed by sequence lines)
+      - Plain sequence pasted inline (contiguous run of single-letter AA codes ≥ 20 chars)
+
+    Returns the longest match found, uppercased, or None if no sequence detected.
+    """
+    upper = text.upper()
+
+    # FASTA: ">identifier\\nSEQUENCE..." (possibly multi-line sequence block)
+    fasta_match = re.search(r">[\w|. -]*\n([ACDEFGHIKLMNPQRSTVWY\n\s]+)", upper)
+    if fasta_match:
+        seq = re.sub(r"\s+", "", fasta_match.group(1))
+        if len(seq) >= 20:
+            return seq
+
+    # Plain inline sequence: longest contiguous run of amino acid single-letter codes
+    candidates = re.findall(r"[ACDEFGHIKLMNPQRSTVWY]{20,}", upper)
+    if candidates:
+        return max(candidates, key=len)
+
+    return None
+
+
+def _apply_mask_regions(sequence: str, mask_regions: list[dict]) -> str:
+    """
+    Apply mask_regions (list of {start, end} dicts, 0-based, inclusive) to a
+    sequence by replacing those positions with '_'.
+    Positions outside [0, len(sequence)-1] are silently ignored.
+    """
+    seq = list(sequence)
+    for region in mask_regions:
+        try:
+            start = int(region.get("start", 0))
+            end = int(region.get("end", start))
+            for i in range(start, min(end + 1, len(seq))):
+                seq[i] = "_"
+        except (TypeError, ValueError):
+            continue
+    return "".join(seq)
+
+
+def _escape_json_control_chars(s: str) -> str:
+    """
+    Escape literal control characters that appear INSIDE JSON string values only.
+
+    JSON does not allow raw newline/CR/tab inside quoted strings, but they ARE
+    valid as structural whitespace outside strings. A naïve replace-all would
+    corrupt the structural newlines between fields. This scanner tracks whether
+    we are inside a quoted string and only escapes there.
+    """
+    result: list[str] = []
+    in_string = False
+    skip_next = False  # True after a backslash inside a string
+
+    for ch in s:
+        if skip_next:
+            result.append(ch)
+            skip_next = False
+            continue
+
+        if in_string:
+            if ch == "\\":
+                result.append(ch)
+                skip_next = True
+            elif ch == '"':
+                result.append(ch)
+                in_string = False
+            elif ch == "\n":
+                result.append("\\n")
+            elif ch == "\r":
+                result.append("\\r")
+            elif ch == "\t":
+                result.append("\\t")
+            else:
+                result.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+            result.append(ch)
+
+    return "".join(result)
+
 
 # ── Parser class ───────────────────────────────────────────────────────────────
 
@@ -225,8 +543,8 @@ class NLParser:
     Translates plain-English scientist prompts into PromptSpec objects via Claude.
     """
 
-    MODEL = "claude-sonnet-4-6"
-    MAX_TOKENS = 1024
+    MODEL = "claude-haiku-4-5"
+    MAX_TOKENS = 2048
 
     def __init__(self, anthropic_client=None):
         if anthropic_client is None:
@@ -240,6 +558,9 @@ class NLParser:
         conversation_history: list[dict[str, str]] | None = None,
         pdb_uploaded: bool = False,
         pdb_filename: str | None = None,
+        pdb_bytes: bytes | None = None,
+        structured_inputs: dict | None = None,
+        override_keywords: list[str] | None = None,
     ) -> PromptSpec:
         """
         Parse a scientist's message into a PromptSpec.
@@ -257,8 +578,143 @@ class NLParser:
         Raises:
             ValueError: If Claude returns malformed JSON that cannot be parsed.
         """
+        # Determine if structured inputs should override Haiku's masking output
+        _si = structured_inputs or {}
+        _si_sequence = _si.get("sequence", "").strip()
+        _si_fixed = _si.get("fixed_residues", "").strip()
+        _si_mask = _si.get("mask_regions", "").strip()
+        _has_structured = bool(_si_sequence or _si_fixed or _si_mask)
+
+        # ── Condensation fast-path (bypasses Haiku entirely) ──────────────────
+        _condense = _si.get("condense_enabled", False)
+        _condense_key_res = _si.get("condense_key_residues", "").strip()
+        _condense_target_len = int(_si.get("condense_target_length", 0) or 0)
+
+        if _condense and _condense_target_len > 0:
+            # Extract PDB sequence (required for condensation)
+            _pdb_seq_for_condense: str = ""
+            if pdb_bytes:
+                try:
+                    from utils.pdb_utils import get_sequence_from_pdb
+                    _pdb_seq_for_condense = get_sequence_from_pdb(pdb_bytes)
+                except Exception as e:
+                    _log(f"WARN parse: condensation — cannot extract PDB sequence ({e})")
+
+            _ref_seq = _si_sequence or _pdb_seq_for_condense
+            if not _ref_seq:
+                _log("WARN parse: condensation enabled but no reference sequence available — falling through to Haiku")
+            else:
+                orig_len = len(_ref_seq)
+                target_len = max(5, min(_condense_target_len, orig_len - 1))
+
+                # Parse key residues → 0-based source positions in original PDB
+                source_positions: dict[int, str] = {}
+                if _condense_key_res:
+                    tokens = re.split(r"[,\s]+", _condense_key_res.strip())
+                    for token in tokens:
+                        token = token.strip()
+                        if not token:
+                            continue
+                        m = re.fullmatch(r"([A-Za-z]?)(\d+)", token)
+                        if not m:
+                            # range like 65-72 → expand to individual positions
+                            m_range = re.fullmatch(r"(\d+)[-\u2013](\d+)", token)
+                            if m_range:
+                                s, e = int(m_range.group(1)) - 1, int(m_range.group(2)) - 1
+                                for p in range(max(0, s), min(orig_len - 1, e) + 1):
+                                    source_positions[p] = _ref_seq[p]
+                            continue
+                        letter = m.group(1).upper()
+                        pos_1based = int(m.group(2))
+                        idx = pos_1based - 1
+                        if 0 <= idx < orig_len:
+                            source_positions[idx] = _ref_seq[idx]
+                            if letter and letter != _ref_seq[idx]:
+                                _log(f"WARN parse: condensation key residue '{token}' says "
+                                     f"{letter} but sequence has {_ref_seq[idx]} at pos {pos_1based}")
+
+                # Proportional remap: old_pos → new_pos in target_len space
+                def _remap(old: int) -> int:
+                    if orig_len <= 1:
+                        return 0
+                    return round(old * (target_len - 1) / (orig_len - 1))
+
+                sorted_src = sorted(source_positions.keys())
+                target_positions = [_remap(p) for p in sorted_src]
+
+                # Deduplicate remapped positions (two source residues may map to same target)
+                seen_tgt: set[int] = set()
+                deduped_src, deduped_tgt = [], []
+                for sp, tp in zip(sorted_src, target_positions):
+                    if tp not in seen_tgt:
+                        deduped_src.append(sp)
+                        deduped_tgt.append(tp)
+                        seen_tgt.add(tp)
+
+                # Build template: fully masked, pin key AAs at remapped positions
+                template_list = ["_"] * target_len
+                fixed_pos: dict[int, str] = {}
+                for sp, tp in zip(deduped_src, deduped_tgt):
+                    aa = source_positions[sp]
+                    template_list[tp] = aa
+                    fixed_pos[tp] = aa
+                template = "".join(template_list)
+
+                key_res_summary = ", ".join(
+                    f"{source_positions[sp]}{sp+1}→pos{tp+1}"
+                    for sp, tp in zip(deduped_src, deduped_tgt)
+                )
+                notes = (
+                    f"Scaffold condensation: {orig_len} → {target_len} residues "
+                    f"({target_len/orig_len*100:.0f}% of original). "
+                    f"Preserved {len(deduped_src)} key residue(s) at remapped positions: {key_res_summary}. "
+                    f"ESM3 designs the connecting scaffold around the anchored backbone geometry."
+                )
+                _log(f"INFO parse: condensation mode — {orig_len}→{target_len} aa, "
+                     f"{len(deduped_src)} key residues, source={deduped_src}, target={deduped_tgt}")
+
+                return PromptSpec(
+                    protein_length=target_len,
+                    sequence_template=template,
+                    fixed_positions=fixed_pos,
+                    function_keywords=override_keywords or [],
+                    use_structure_motif=True,
+                    motif_residue_indices=deduped_tgt,
+                    motif_source_indices=deduped_src,
+                    motif_chain_id=None,
+                    num_candidates=8,  # overridden by app.py settings
+                    generation_temperature=0.7,  # overridden by app.py settings
+                    num_steps=8,  # overridden by app.py settings
+                    original_sequence=_ref_seq,
+                    notes_to_user=notes,
+                )
+
+        # Extract sequence from uploaded PDB (when structured inputs don't already
+        # provide one) so Haiku has the actual sequence for mask_region calculations.
+        _pdb_sequence: str = ""
+        if pdb_bytes and not _si_sequence:
+            try:
+                from utils.pdb_utils import get_sequence_from_pdb
+                _pdb_sequence = get_sequence_from_pdb(pdb_bytes)
+                if _pdb_sequence and len(_pdb_sequence) >= 20:
+                    _log(f"INFO parse: extracted PDB sequence (len={len(_pdb_sequence)}) "
+                         "to inject into Haiku context")
+                else:
+                    _pdb_sequence = ""
+            except Exception as e:
+                _log(f"INFO parse: could not extract sequence from PDB ({e})")
+                _pdb_sequence = ""
+
+        # Best known protein length for the Haiku instruction
+        _known_length = (len(_si_sequence) if _si_sequence else
+                         len(_pdb_sequence) if _pdb_sequence else 0)
+
         messages = self._build_messages(
-            user_message, conversation_history, pdb_uploaded, pdb_filename
+            user_message, conversation_history, pdb_uploaded, pdb_filename,
+            structured_override=_has_structured,
+            pdb_sequence=_pdb_sequence,
+            known_protein_length=_known_length,
+            override_keywords=override_keywords,
         )
 
         response = self._client.messages.create(
@@ -268,8 +724,77 @@ class NLParser:
             messages=messages,
         )
 
+        if not response.content:
+            raise ValueError(
+                f"Claude returned an empty response "
+                f"(stop_reason={response.stop_reason!r}). "
+                "Try rephrasing your prompt."
+            )
         raw_text = response.content[0].text.strip()
-        return self._parse_response(raw_text)
+
+        # Determine original_sequence — priority order:
+        #   1. Structured input sequence (explicit, most reliable)
+        #   2. PDB-extracted sequence (reliable, avoids regex errors)
+        #   3. Regex extraction from user message / history (fallback)
+        if _si_sequence:
+            original_sequence = _si_sequence
+            _log(f"INFO parse: using structured input sequence "
+                 f"(len={len(original_sequence)}) as original_sequence")
+        elif _pdb_sequence:
+            original_sequence = _pdb_sequence
+            _log(f"INFO parse: using PDB-extracted sequence "
+                 f"(len={len(original_sequence)}) as original_sequence")
+        else:
+            original_sequence = _extract_sequence_from_text(user_message)
+            seq_source = "current message"
+            if not original_sequence and conversation_history:
+                for msg in reversed(conversation_history):
+                    content = msg.get("content", "")
+                    if content:
+                        original_sequence = _extract_sequence_from_text(content)
+                        if original_sequence:
+                            seq_source = "conversation history"
+                            break
+            if original_sequence:
+                _log(f"INFO parse: extracted original sequence (len={len(original_sequence)}) "
+                     f"from {seq_source}")
+            else:
+                _log("INFO parse: no original sequence found in message or history")
+
+        spec = self._parse_response(raw_text, original_sequence=original_sequence)
+
+        # ── Apply structured input overrides ──────────────────────────────────
+        # When the user provided structured inputs, build the sequence template
+        # deterministically and overwrite whatever Haiku produced. This completely
+        # bypasses Haiku's masking logic (which has been observed to invert
+        # fixed/masked distinctions).
+        # Reference sequence priority: explicit form input > PDB-extracted > text-extracted
+        _ref_for_override = _si_sequence or _pdb_sequence or original_sequence or ""
+        if _has_structured and _ref_for_override:
+            tmpl, fixed_pos, mask_rgns = build_template_from_structured(
+                _ref_for_override, _si_fixed, _si_mask
+            )
+            spec.sequence_template = tmpl
+            spec.fixed_positions = fixed_pos
+            spec.mask_regions = mask_rgns
+            spec.protein_length = len(_ref_for_override)
+            spec.original_sequence = _ref_for_override
+            _ref_src = ("form" if _si_sequence else
+                        "PDB" if _pdb_sequence else "chat text")
+            _log(f"INFO parse: structured inputs applied using {_ref_src} sequence "
+                 f"(len={len(_ref_for_override)}) — template built deterministically")
+        elif _has_structured and not _ref_for_override:
+            _log("INFO parse: structured fixed/mask inputs provided but no sequence available "
+                 "anywhere — cannot build deterministic template. Haiku output kept.")
+
+        # ── Apply keyword override ────────────────────────────────────────────
+        # When override_keywords is not None (including empty list), the caller
+        # explicitly controls keywords — do not use Haiku's inferred choices.
+        if override_keywords is not None:
+            spec.function_keywords = override_keywords
+            _log(f"INFO parse: keyword override applied — {override_keywords}")
+
+        return spec
 
     def _build_messages(
         self,
@@ -277,6 +802,10 @@ class NLParser:
         history: list[dict] | None,
         pdb_uploaded: bool,
         pdb_filename: str | None,
+        structured_override: bool = False,
+        pdb_sequence: str = "",
+        known_protein_length: int = 0,
+        override_keywords: list[str] | None = None,
     ) -> list[dict]:
         messages = []
 
@@ -290,19 +819,74 @@ class NLParser:
         content = user_message
         if pdb_uploaded:
             fname = f" ({pdb_filename})" if pdb_filename else ""
+            if pdb_sequence:
+                content = (
+                    f"[A PDB file{fname} has been uploaded. "
+                    f"Sequence extracted ({len(pdb_sequence)} aa):\n"
+                    f"{pdb_sequence}\n"
+                    f"Use mask_regions to specify which regions to redesign. "
+                    f"Full backbone coordinates will be passed to ESM3 automatically — "
+                    f"set use_structure_motif: false unless pinning a specific active-site "
+                    f"motif by index.]\n\n"
+                    + content
+                )
+            else:
+                content = (
+                    f"[A PDB file{fname} has been uploaded and is available for structural motif extraction.]\n\n"
+                    + content
+                )
+
+        # When structured inputs are active, tell Haiku to skip masking AND structure logic
+        if structured_override:
+            length_instruction = (
+                f" \"protein_length\": {known_protein_length},"
+                if known_protein_length > 0 else ""
+            )
             content = (
-                f"[A PDB file{fname} has been uploaded and is available for structural motif extraction.]\n\n"
+                "[STRUCTURED INPUTS PROVIDED: The sequence template, fixed_positions, "
+                "mask_regions, and structure motif have already been determined from "
+                "explicit user inputs and will be applied after your response. "
+                f"You MUST output these exact values in your JSON:{length_instruction} "
+                "\"fixed_positions\": {}, \"sequence_template\": \"\", "
+                "\"mask_regions\": [], \"use_structure_motif\": false, "
+                "\"motif_residue_indices\": []. "
+                "Only vary: function_keywords, num_candidates, generation_temperature, "
+                "num_steps, recommended_model, notes_to_user.]\n\n"
+                + content
+            )
+
+        # When the caller explicitly controls keywords (including empty = no keywords),
+        # tell Haiku what to output so its notes_to_user is also accurate.
+        if override_keywords is not None:
+            kw_json = json.dumps(override_keywords)
+            content = (
+                f"[KEYWORD OVERRIDE: The user has explicitly set function_keywords. "
+                f"You MUST output exactly this in your JSON: \"function_keywords\": {kw_json}. "
+                f"Do not suggest other keywords. Reflect these (or their absence) in notes_to_user.]\n\n"
                 + content
             )
 
         messages.append({"role": "user", "content": content})
         return messages
 
-    def _parse_response(self, raw_text: str) -> PromptSpec:
+    def _parse_response(
+        self, raw_text: str, original_sequence: str | None = None
+    ) -> PromptSpec:
         """Parse Claude's JSON response into a PromptSpec, with validation."""
-        # Strip any accidental markdown fences
+        # Strip markdown fences
         cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.MULTILINE)
         cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE).strip()
+
+        # If the model wrapped the JSON in prose, extract the first {...} block
+        if not cleaned.startswith("{"):
+            match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if match:
+                cleaned = match.group(0)
+
+        # Haiku sometimes writes literal newlines/tabs inside JSON string values
+        # (e.g. in notes_to_user), which is invalid JSON. Escape them so the
+        # parser can handle multi-line string values gracefully.
+        cleaned = _escape_json_control_chars(cleaned)
 
         try:
             data: dict[str, Any] = json.loads(cleaned)
@@ -311,24 +895,98 @@ class NLParser:
                 f"Claude returned invalid JSON. Raw response:\n{raw_text}\n\nError: {e}"
             )
 
-        return self._dict_to_spec(data)
+        return self._dict_to_spec(data, original_sequence=original_sequence)
 
-    def _dict_to_spec(self, data: dict[str, Any]) -> PromptSpec:
+    def _dict_to_spec(
+        self, data: dict[str, Any], original_sequence: str | None = None
+    ) -> PromptSpec:
         """Convert a parsed JSON dict into a validated PromptSpec."""
 
         protein_length = int(data.get("protein_length", 100))
         protein_length = max(10, min(protein_length, 2048))  # sanity bounds
 
+        # If an original sequence is available and Haiku's protein_length doesn't match,
+        # correct it. Haiku frequently defaults to 100 when it's been told to skip
+        # template logic (structured override), or when it mis-estimates the length.
+        if original_sequence and len(original_sequence) >= 20:
+            actual_len = len(original_sequence)
+            if protein_length != actual_len:
+                _log(f"WARN _dict_to_spec: correcting protein_length from {protein_length} "
+                     f"to {actual_len} (matched original_sequence length)")
+                protein_length = actual_len
+
+        # ── mask_regions: preferred path when original sequence is available ──────
+        raw_mask_regions = data.get("mask_regions", [])
+        mask_regions: list[dict] = []
+        if isinstance(raw_mask_regions, list):
+            for r in raw_mask_regions:
+                if isinstance(r, dict) and "start" in r and "end" in r:
+                    try:
+                        mask_regions.append({"start": int(r["start"]), "end": int(r["end"])})
+                    except (TypeError, ValueError):
+                        pass
+
+        # ── sequence_template ─────────────────────────────────────────────────────
         sequence_template = str(data.get("sequence_template", ""))
-        # If template provided, ensure it matches protein_length
+
+        if mask_regions and original_sequence:
+            # Reconstruct template programmatically — avoids Haiku's concatenation bug
+            ref = original_sequence[:protein_length] if len(original_sequence) >= protein_length else (
+                original_sequence + "_" * (protein_length - len(original_sequence))
+            )
+            sequence_template = _apply_mask_regions(ref, mask_regions)
+            _log(f"INFO _dict_to_spec: reconstructed template from mask_regions "
+                  f"({len(mask_regions)} regions) + extracted original sequence "
+                  f"(len={len(original_sequence)}). Template length={len(sequence_template)}")
+        elif sequence_template and original_sequence:
+            # Haiku wrote the template manually. Validate it against the original.
+            # Check 1: length must match protein_length (or original length)
+            expected_len = protein_length
+            if len(sequence_template) != expected_len:
+                # Check whether it looks like a concatenation error:
+                # non-underscore chars don't match original at the same positions
+                _log(f"WARN _dict_to_spec: template length {len(sequence_template)} ≠ "
+                      f"protein_length {expected_len}. Attempting validation against original.")
+                mismatches = 0
+                for i, (tc, oc) in enumerate(zip(sequence_template, original_sequence)):
+                    if tc != "_" and tc != oc:
+                        mismatches += 1
+                mismatch_rate = mismatches / max(len(sequence_template), 1)
+                if mismatch_rate > 0.05:
+                    # Too many mismatches — template is corrupt; fall back to full mask
+                    _log(f"WARN _dict_to_spec: template has {mismatch_rate:.0%} mismatch "
+                          f"vs original — discarding and using full mask")
+                    sequence_template = "_" * protein_length
+                else:
+                    # Just a length issue — trim or pad
+                    if len(sequence_template) < protein_length:
+                        sequence_template += "_" * (protein_length - len(sequence_template))
+                    else:
+                        sequence_template = sequence_template[:protein_length]
+            else:
+                # Same length — check non-underscore positions match original
+                mismatches = sum(
+                    1 for tc, oc in zip(sequence_template, original_sequence)
+                    if tc != "_" and tc != oc
+                )
+                if mismatches > max(5, int(0.05 * protein_length)):
+                    _log(f"WARN _dict_to_spec: template has {mismatches} positional "
+                          f"mismatches vs original — discarding and using full mask")
+                    sequence_template = "_" * protein_length
+
+        elif mask_regions and not original_sequence:
+            _log("WARN _dict_to_spec: mask_regions provided but no original sequence "
+                 "available — cannot reconstruct template. Haiku's manual template "
+                 f"will be used (or fully masked if empty). mask_regions={mask_regions}")
+
         if sequence_template and len(sequence_template) != protein_length:
-            # Pad or trim to match
+            # Fix the length silently
             if len(sequence_template) < protein_length:
-                sequence_template = sequence_template + "_" * (protein_length - len(sequence_template))
+                sequence_template += "_" * (protein_length - len(sequence_template))
             else:
                 sequence_template = sequence_template[:protein_length]
 
-        # fixed_positions: keys may be strings (JSON) or ints
+        # ── fixed_positions: keys may be strings (JSON) or ints ──────────────────
         raw_fixed = data.get("fixed_positions", {})
         fixed_positions: dict[int, str] = {}
         for k, v in raw_fixed.items():
@@ -349,12 +1007,28 @@ class NLParser:
 
         function_keywords = [str(kw) for kw in data.get("function_keywords", [])][:5]
 
+        # Strip known-invalid keywords that Haiku frequently hallucinates.
+        # These always cause "Unknown label in FunctionAnnotation" from Forge.
+        before_kw = len(function_keywords)
+        function_keywords = [kw for kw in function_keywords if kw.lower() not in _INVALID_KEYWORDS]
+        if len(function_keywords) < before_kw:
+            dropped = before_kw - len(function_keywords)
+            _log(f"INFO _dict_to_spec: stripped {dropped} invalid keyword(s) "
+                 f"(remaining: {function_keywords})")
+
         use_structure_motif = bool(data.get("use_structure_motif", False))
 
         motif_residue_indices = [
             int(i) for i in data.get("motif_residue_indices", [])
             if 0 <= int(i) < protein_length
         ]
+
+        # Guard: if motif covers every residue it's almost certainly a haiku
+        # hallucination (no specific site was requested). Disable structure motif
+        # so build_esm_protein doesn't try to extract backbone for all positions.
+        if use_structure_motif and len(motif_residue_indices) >= protein_length:
+            use_structure_motif = False
+            motif_residue_indices = []
 
         motif_chain_id = data.get("motif_chain_id") or None
         if isinstance(motif_chain_id, str) and motif_chain_id.strip():
@@ -363,7 +1037,7 @@ class NLParser:
             motif_chain_id = None
 
         num_candidates = int(data.get("num_candidates", 8))
-        num_candidates = max(1, min(num_candidates, 10))
+        num_candidates = max(1, min(num_candidates, 50))
 
         generation_temperature = float(data.get("generation_temperature", 0.7))
         generation_temperature = max(0.1, min(generation_temperature, 1.5))
@@ -382,9 +1056,19 @@ class NLParser:
         if recommended_model not in _valid_models:
             recommended_model = "esm3-medium-2024-08"
 
+        mask_count = sequence_template.count("_") if sequence_template else protein_length
+        _log(f"INFO _dict_to_spec: protein_length={protein_length}, "
+             f"mask_count={mask_count}/{protein_length}, "
+             f"mask_regions={len(mask_regions)}, "
+             f"fixed_positions={len(fixed_positions)}, "
+             f"keywords={function_keywords}, "
+             f"original_seq={'yes' if original_sequence else 'no'}, "
+             f"template_preview={sequence_template[:60]}{'…' if len(sequence_template) > 60 else ''}")
+
         return PromptSpec(
             protein_length=protein_length,
             sequence_template=sequence_template,
+            mask_regions=mask_regions,
             fixed_positions=fixed_positions,
             function_keywords=function_keywords,
             use_structure_motif=use_structure_motif,
@@ -394,5 +1078,6 @@ class NLParser:
             generation_temperature=generation_temperature,
             num_steps=num_steps,
             recommended_model=recommended_model,
+            original_sequence=original_sequence or "",
             notes_to_user=notes_to_user,
         )
