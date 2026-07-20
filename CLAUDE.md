@@ -111,8 +111,8 @@ never promote, prod is untouched (the "rollback" is just not promoting).
 - The tagged revision shares the service's **secrets/env**, including `OAUTH_REDIRECT_URI` (= the
   prod URL). Ideal for validating startup, UI, and generation behaviour. To test the **OAuth
   login flow** on the tagged URL, add that URL to the OAuth client's *Authorized redirect URIs*.
-- cofold jobs submitted from the tagged revision hit the **prod cofold backend** (same env) — so
-  avoid running heavy validation jobs from staging until a data-isolated staging cofold project
+- proteinredesign jobs submitted from the tagged revision hit the **prod proteinredesign backend** (same env) — so
+  avoid running heavy validation jobs from staging until a data-isolated staging proteinredesign project
   exists. For real data/secret isolation, graduate to **Option B** (separate staging project +
   build-once-promote CI/CD). See `docs/plans/` notes.
 

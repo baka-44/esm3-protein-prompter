@@ -2,7 +2,7 @@
 ui/rfd_panel.py — RFdiffusion/MPNN engine UI (engine-select first, D3).
 
 Increment 1 exposes preset #1 (fixed-backbone redesign) only; the other MVP
-presets appear disabled ("coming soon"). Submits async jobs to the cofold backend
+presets appear disabled ("coming soon"). Submits async jobs to the proteinredesign backend
 and shows the persistent job dashboard below.
 """
 
@@ -52,8 +52,8 @@ def render_rfd_engine(user_email: str) -> None:
 
 
 def _render_preset1_form(user_email: str) -> None:
-    from cofold.config_builders.preset1 import ConfigError, build_preset1_config
-    from cofold.submit import backend_configured, submit_preset1
+    from proteinredesign.config_builders.preset1 import ConfigError, build_preset1_config
+    from proteinredesign.submit import backend_configured, submit_preset1
 
     uploaded = st.file_uploader(
         "Input PDB", type=["pdb"],
@@ -93,7 +93,7 @@ def _render_preset1_form(user_email: str) -> None:
                  use_container_width=True, key="rfd_p1_submit"):
         if not backend_configured():
             st.error("The generation backend isn't configured (GCP project + buckets). "
-                     "Deploy the cofold backend first.")
+                     "Deploy the proteinredesign backend first.")
             return
         try:
             rec, cfg = submit_preset1(

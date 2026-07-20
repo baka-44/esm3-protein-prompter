@@ -1,6 +1,6 @@
 variable "project_id" {
   type        = string
-  description = "Dedicated GCP project for the cofold backend (created in its own folder — D4)."
+  description = "Dedicated GCP project for the proteinredesign backend (created in its own folder — D4)."
 }
 
 variable "region" {
@@ -10,23 +10,23 @@ variable "region" {
 
 variable "bucket_prefix" {
   type        = string
-  description = "Prefix for the (globally-unique) GCS bucket names, e.g. \"phyx44-cofold\"."
+  description = "Prefix for the (globally-unique) GCS bucket names, e.g. \"phyx44-proteinredesign\"."
 }
 
 variable "artifact_repo" {
   type    = string
-  default = "cofold"
+  default = "proteinredesign"
 }
 
 variable "job_name" {
   type    = string
-  default = "cofold-worker"
+  default = "proteinredesign-worker"
 }
 
 variable "worker_image" {
   type        = string
-  description = "Full Artifact Registry image ref for the worker (built from cofold/Dockerfile.worker)."
-  # e.g. us-central1-docker.pkg.dev/<project>/cofold/worker:latest
+  description = "Full Artifact Registry image ref for the worker (built from proteinredesign/Dockerfile.worker)."
+  # e.g. us-central1-docker.pkg.dev/<project>/proteinredesign/worker:latest
 }
 
 variable "frontend_service_account" {

@@ -1,5 +1,5 @@
 """
-Unit tests for cofold.worker.select_top_candidates — the pure QC-gate + ranking
+Unit tests for proteinredesign.worker.select_top_candidates — the pure QC-gate + ranking
 logic (D2 hard gate + ESM2 soft floor + B3 metadata ranking). No ML deps needed.
 """
 
@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cofold.worker import Candidate, select_top_candidates  # noqa: E402
+from proteinredesign.worker import Candidate, select_top_candidates  # noqa: E402
 
 
 def _c(seq, plddt=80.0, rmsd=1.0, esm2=-0.5, pmpnn=0.5, soluble=0.5):

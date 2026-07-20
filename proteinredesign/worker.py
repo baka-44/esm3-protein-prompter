@@ -1,5 +1,5 @@
 """
-cofold/worker.py — generation pipeline entrypoint (runs on the GPU Cloud Run Job).
+proteinredesign/worker.py — generation pipeline entrypoint (runs on the GPU Cloud Run Job).
 
 Flow (increment 1, preset #1 fixed-backbone redesign — MPNN-only):
     manifest (GCS) → download PDB
@@ -14,7 +14,7 @@ The ML tool calls (ProteinMPNN, ESMFold) are isolated in adapter functions that
 run inside the worker container (weights from GCS — A6). The QC-gate + ranking
 logic (`select_top_candidates`) is pure and unit-tested.
 
-Entrypoint: `python -m cofold.worker` with env COFOLD_MANIFEST_URI set by the job.
+Entrypoint: `python -m proteinredesign.worker` with env PROTEINREDESIGN_MANIFEST_URI set by the job.
 """
 
 from __future__ import annotations
@@ -34,10 +34,10 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 # ── Tunable gates / budget (D2, B4) ───────────────────────────────────────────
-PLDDT_GATE = float(os.getenv("COFOLD_PLDDT_GATE", "70.0"))     # hard structural gate
-RMSD_GATE = float(os.getenv("COFOLD_RMSD_GATE", "2.0"))         # Å, self-consistency
-ESM2_DROP_FRACTION = float(os.getenv("COFOLD_ESM2_DROP", "0.10"))  # soft floor: drop bottom 10%
-OVERGEN_FACTOR = int(os.getenv("COFOLD_OVERGEN_FACTOR", "3"))  # generate 3× to survive QC
+PLDDT_GATE = float(os.getenv("PROTEINREDESIGN_PLDDT_GATE", "70.0"))     # hard structural gate
+RMSD_GATE = float(os.getenv("PROTEINREDESIGN_RMSD_GATE", "2.0"))         # Å, self-consistency
+ESM2_DROP_FRACTION = float(os.getenv("PROTEINREDESIGN_ESM2_DROP", "0.10"))  # soft floor: drop bottom 10%
+OVERGEN_FACTOR = int(os.getenv("PROTEINREDESIGN_OVERGEN_FACTOR", "3"))  # generate 3× to survive QC
 
 
 @dataclass
@@ -140,12 +140,12 @@ def select_top_candidates(
 # above stay pure and testable.
 
 def _mpnn_weights_dir() -> str:
-    from cofold.storage import ensure_weights
+    from proteinredesign.storage import ensure_weights
     return ensure_weights("mpnn")
 
 
 def _esmfold_weights_dir() -> str:
-    from cofold.storage import ensure_weights
+    from proteinredesign.storage import ensure_weights
     return ensure_weights("esmfold")
 
 
@@ -370,12 +370,12 @@ def run_pipeline(manifest, workdir: str) -> dict:
     """
     Execute preset #1 end-to-end and return a results dict (also written to GCS).
 
-    `manifest` is a cofold.manifest.JobManifest. Firestore status is updated at
+    `manifest` is a proteinredesign.manifest.JobManifest. Firestore status is updated at
     each stage so the dashboard can show live progress (B7/B8).
     """
-    from cofold import jobstore
-    from cofold import storage
-    from cofold.manifest import JobStatus, Preset
+    from proteinredesign import jobstore
+    from proteinredesign import storage
+    from proteinredesign.manifest import JobStatus, Preset
 
     if manifest.preset is not Preset.FIXED_BACKBONE_REDESIGN:
         raise NotImplementedError(
@@ -457,12 +457,12 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
 
 
 def main() -> int:
-    from cofold import jobstore, storage
-    from cofold.manifest import JobManifest, JobStatus
+    from proteinredesign import jobstore, storage
+    from proteinredesign.manifest import JobManifest, JobStatus
 
-    manifest_uri = os.getenv("COFOLD_MANIFEST_URI") or (sys.argv[1] if len(sys.argv) > 1 else "")
+    manifest_uri = os.getenv("PROTEINREDESIGN_MANIFEST_URI") or (sys.argv[1] if len(sys.argv) > 1 else "")
     if not manifest_uri:
-        print("ERROR: set COFOLD_MANIFEST_URI (or pass the manifest gs:// URI as argv[1]).",
+        print("ERROR: set PROTEINREDESIGN_MANIFEST_URI (or pass the manifest gs:// URI as argv[1]).",
               file=sys.stderr)
         return 2
 

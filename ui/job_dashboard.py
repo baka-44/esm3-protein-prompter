@@ -24,7 +24,7 @@ _STATUS_BADGE = {
 def render_job_dashboard(user_email: str) -> None:
     st.subheader("🗂️ My jobs")
 
-    from cofold.submit import backend_configured
+    from proteinredesign.submit import backend_configured
     if not backend_configured():
         st.info(
             "The RFdiffusion/MPNN backend isn't configured in this environment "
@@ -38,7 +38,7 @@ def render_job_dashboard(user_email: str) -> None:
             st.rerun()
 
     try:
-        from cofold import jobstore
+        from proteinredesign import jobstore
         jobs = jobstore.list_jobs_for_user(user_email, limit=50)
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not load jobs: {exc}")
@@ -73,7 +73,7 @@ def _render_job_row(job) -> None:
 
 def _render_results(job) -> None:
     try:
-        from cofold import storage
+        from proteinredesign import storage
         results = storage.read_json(job.result_uri)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Results not available yet: {exc}")
@@ -100,7 +100,7 @@ def _render_results(job) -> None:
 
     # Bulk FASTA download (fetched from GCS).
     try:
-        from cofold import storage
+        from proteinredesign import storage
         fasta = storage.download_bytes(storage.output_uri(job.job_id, "candidates.fasta"))
         st.download_button(
             "⬇️ Download all as FASTA", data=fasta,

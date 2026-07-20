@@ -122,16 +122,16 @@ def get_anthropic_client():
         ) from e
 
 
-# ── RFdiffusion/MPNN backend (cofold) — GCP clients ───────────────────────────
+# ── RFdiffusion/MPNN backend (proteinredesign) — GCP clients ───────────────────────────
 # These power the async generation backend (see docs/plans/rfdiffusion_mpnn_backend.md).
 # Read at call time so Cloud Run / Secret Manager updates are picked up.
 
 GCP_PROJECT: str | None = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
-COFOLD_INPUTS_BUCKET: str | None = os.getenv("COFOLD_INPUTS_BUCKET")
-COFOLD_OUTPUTS_BUCKET: str | None = os.getenv("COFOLD_OUTPUTS_BUCKET")
-COFOLD_WEIGHTS_BUCKET: str | None = os.getenv("COFOLD_WEIGHTS_BUCKET")
-COFOLD_WEIGHTS_MOUNT: str | None = os.getenv("COFOLD_WEIGHTS_MOUNT")  # e.g. gcsfuse mount path
-COFOLD_JOBS_COLLECTION: str = os.getenv("COFOLD_JOBS_COLLECTION", "cofold_jobs")
+PROTEINREDESIGN_INPUTS_BUCKET: str | None = os.getenv("PROTEINREDESIGN_INPUTS_BUCKET")
+PROTEINREDESIGN_OUTPUTS_BUCKET: str | None = os.getenv("PROTEINREDESIGN_OUTPUTS_BUCKET")
+PROTEINREDESIGN_WEIGHTS_BUCKET: str | None = os.getenv("PROTEINREDESIGN_WEIGHTS_BUCKET")
+PROTEINREDESIGN_WEIGHTS_MOUNT: str | None = os.getenv("PROTEINREDESIGN_WEIGHTS_MOUNT")  # e.g. gcsfuse mount path
+PROTEINREDESIGN_JOBS_COLLECTION: str = os.getenv("PROTEINREDESIGN_JOBS_COLLECTION", "proteinredesign_jobs")
 
 
 def get_gcs_client():
@@ -140,7 +140,7 @@ def get_gcs_client():
         from google.cloud import storage
     except ImportError as e:
         raise RuntimeError(
-            "google-cloud-storage is required for the cofold backend. "
+            "google-cloud-storage is required for the proteinredesign backend. "
             "Run: pip install google-cloud-storage"
         ) from e
     return storage.Client(project=GCP_PROJECT) if GCP_PROJECT else storage.Client()
@@ -152,7 +152,7 @@ def get_firestore_client():
         from google.cloud import firestore
     except ImportError as e:
         raise RuntimeError(
-            "google-cloud-firestore is required for the cofold backend. "
+            "google-cloud-firestore is required for the proteinredesign backend. "
             "Run: pip install google-cloud-firestore"
         ) from e
     return firestore.Client(project=GCP_PROJECT) if GCP_PROJECT else firestore.Client()

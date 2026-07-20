@@ -1,5 +1,5 @@
 """
-cofold/submit.py — job submission orchestration (frontend side).
+proteinredesign/submit.py — job submission orchestration (frontend side).
 
 Ties together: config builder (validate) → upload PDB + manifest to GCS →
 create Firestore job record → trigger the Cloud Run Job. Keeps the Streamlit
@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import os
 
-from cofold.config_builders.preset1 import Preset1Config, build_preset1_config
-from cofold.manifest import JobManifest, Preset
+from proteinredesign.config_builders.preset1 import Preset1Config, build_preset1_config
+from proteinredesign.manifest import JobManifest, Preset
 
 
 def backend_configured() -> bool:
-    """True only when the cofold GCP backend env is present (buckets + project)."""
-    from config import COFOLD_INPUTS_BUCKET, COFOLD_OUTPUTS_BUCKET, GCP_PROJECT
-    return bool(COFOLD_INPUTS_BUCKET and COFOLD_OUTPUTS_BUCKET and GCP_PROJECT)
+    """True only when the proteinredesign GCP backend env is present (buckets + project)."""
+    from config import PROTEINREDESIGN_INPUTS_BUCKET, PROTEINREDESIGN_OUTPUTS_BUCKET, GCP_PROJECT
+    return bool(PROTEINREDESIGN_INPUTS_BUCKET and PROTEINREDESIGN_OUTPUTS_BUCKET and GCP_PROJECT)
 
 
 def submit_preset1(
@@ -48,7 +48,7 @@ def submit_preset1(
         num_outputs=num_outputs,
     )
 
-    from cofold import jobstore, storage
+    from proteinredesign import jobstore, storage
 
     manifest.pdb_uri = storage.put_input_pdb(
         manifest.job_id, pdb_bytes, filename=pdb_filename or "input.pdb"
@@ -66,11 +66,11 @@ def submit_preset1(
 
 
 def _trigger_job(manifest_uri: str) -> None:
-    """Launch the Cloud Run Job with a per-execution COFOLD_MANIFEST_URI override."""
+    """Launch the Cloud Run Job with a per-execution PROTEINREDESIGN_MANIFEST_URI override."""
     from config import GCP_PROJECT
 
     region = os.getenv("GCP_REGION", "us-central1")
-    job_name = os.getenv("COFOLD_JOB_NAME", "cofold-worker")
+    job_name = os.getenv("PROTEINREDESIGN_JOB_NAME", "proteinredesign-worker")
 
     from google.cloud import run_v2
 
@@ -79,7 +79,7 @@ def _trigger_job(manifest_uri: str) -> None:
     overrides = run_v2.RunJobRequest.Overrides(
         container_overrides=[
             run_v2.RunJobRequest.Overrides.ContainerOverride(
-                env=[run_v2.EnvVar(name="COFOLD_MANIFEST_URI", value=manifest_uri)]
+                env=[run_v2.EnvVar(name="PROTEINREDESIGN_MANIFEST_URI", value=manifest_uri)]
             )
         ]
     )

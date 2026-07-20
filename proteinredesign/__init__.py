@@ -1,5 +1,5 @@
 """
-cofold — RFdiffusion + MPNN generation backend.
+proteinredesign — RFdiffusion + MPNN generation backend.
 
 A self-hosted, commercially-clean (BSD/MIT/CC-BY-4.0) generation pipeline that
 runs as async GPU jobs (Cloud Run Jobs), decoupled from the Streamlit frontend.
