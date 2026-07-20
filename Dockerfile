@@ -10,10 +10,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 
-# Install CPU-only torch FIRST to avoid pulling in the 2.5 GB CUDA wheel
+# Install CPU-only torch + torchvision FIRST to avoid pulling in the 2.5 GB CUDA wheel.
+# torchvision must use the same CPU index as torch; otherwise the ESM SDK installs
+# the default (CUDA) torchvision which causes "torchvision::nms does not exist" errors.
 RUN pip install --no-cache-dir \
     torch \
+    torchvision \
     --index-url https://download.pytorch.org/whl/cpu
+
+# Install transformers BEFORE the esm SDK to ensure transformers.models.esm
+# internal imports resolve correctly (esm SDK installs a top-level `esm`
+# module that can shadow transformers' built-in ESM support)
+RUN pip install --no-cache-dir transformers>=4.40.0
+
+# Pre-download ESM2 scoring model so Cloud Run cold starts don't need
+# network access to HuggingFace. ~30 MB baked into the image layer.
+RUN python -c "\
+from transformers import AutoTokenizer, EsmForMaskedLM; \
+AutoTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D'); \
+EsmForMaskedLM.from_pretrained('facebook/esm2_t6_8M_UR50D'); \
+print('ESM2 model pre-download complete')"
 
 # Install the rest of the dependencies
 RUN pip install --no-cache-dir -r requirements.txt

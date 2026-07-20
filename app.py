@@ -16,7 +16,7 @@ import os
 import streamlit as st
 
 st.set_page_config(
-    page_title="ESM3 Protein Engineering Prompter",
+    page_title="Phyx44 Guided Protein Design Tool",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -26,6 +26,11 @@ from auth import check_auth, render_user_badge
 
 # ── Auth gate — must be first thing after page config ──────────────────────────
 check_auth()
+
+# ── Audit: log session start on first render after OAuth ──────────────────────
+if st.session_state.pop("_log_session_start", False):
+    from utils.audit_log import log_session_start
+    log_session_start()
 
 from ui.sidebar import render_sidebar
 from ui.chat import (
@@ -39,15 +44,285 @@ from ui.chat import (
 from ui.results_panel import render_results
 
 # ── Header ─────────────────────────────────────────────────────────────────────
-st.title("🧬 ESM3 Protein Engineering Prompter")
-st.caption(
-    "Describe what you want in plain English. "
-    "Claude interprets your request → ESM3 generates candidates → "
-    "ESM2 scores fitness → refine iteratively with chain-of-thought."
+# ── Top banner ─────────────────────────────────────────────────────────────────
+import base64 as _b64
+_logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "phyx44_logo.png")
+with open(_logo_path, "rb") as _lf:
+    _logo_b64 = _b64.b64encode(_lf.read()).decode()
+
+st.markdown(
+    f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700&display=swap');
+
+    /* ── Global font — text-bearing elements only (keeps Material Icons intact) ── */
+    html, body, .stApp,
+    .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown td, .stMarkdown th,
+    h1, h2, h3, h4, h5, h6, p, label,
+    button, input, textarea, select,
+    .stButton > button, .stDownloadButton > button {{
+        font-family: 'Montserrat', system-ui, -apple-system, sans-serif !important;
+    }}
+
+    /* ── Two font sizes only ── */
+    h1, h2, h3 {{
+        font-size: 1.1rem !important;
+        font-weight: 600 !important;
+        letter-spacing: -0.01em;
+        color: #111111 !important;
+    }}
+    h4, h5, h6, p, label, input, textarea,
+    .stMarkdown p, .stMarkdown li,
+    .stButton > button, .stDownloadButton > button,
+    .stCaption, [data-testid="stCaptionContainer"] p,
+    .stTextInput label, .stTextArea label,
+    .stSelectbox label, .stMultiSelect label,
+    [data-testid="stSlider"] label,
+    .stCheckbox label, .stToggle label {{
+        font-size: 0.82rem !important;
+    }}
+
+    /* ── White background ── */
+    .stApp {{ background-color: #ffffff !important; }}
+    .main .block-container {{ background-color: #ffffff !important; padding-top: 1.5rem; }}
+    [data-testid="stHeader"] {{ background-color: #ffffff !important; border-bottom: 1px solid #eeeeee; }}
+    [data-testid="stToolbar"] {{ background-color: #ffffff !important; }}
+
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {{
+        background-color: #fafafa !important;
+        border-right: 1px solid #eeeeee !important;
+    }}
+    [data-testid="stSidebar"] .stMarkdown,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] p {{
+        color: #444444 !important;
+    }}
+
+    /* ── Body text & markdown ── */
+    .stMarkdown p, .stMarkdown li, .stMarkdown td, .stMarkdown th {{ color: #333333 !important; }}
+    .stCaption, [data-testid="stCaptionContainer"] p {{ color: #888888 !important; }}
+
+    /* ── Buttons ── */
+    .stButton > button {{
+        background-color: #00d4aa !important;
+        color: #000000 !important;
+        border: none !important;
+        border-radius: 6px !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.02em !important;
+        padding: 0.45rem 1.1rem !important;
+        transition: background-color 0.2s ease !important;
+    }}
+    .stButton > button:hover {{ background-color: #00b894 !important; }}
+    .stButton > button:active {{ background-color: #009d80 !important; }}
+    .stButton > button[disabled] {{
+        background-color: #e5e5e5 !important;
+        color: #999999 !important;
+    }}
+    /* Download buttons — ghost style */
+    .stDownloadButton > button {{
+        background-color: transparent !important;
+        color: #00d4aa !important;
+        border: 1px solid #00d4aa !important;
+        border-radius: 6px !important;
+        font-weight: 500 !important;
+    }}
+    .stDownloadButton > button:hover {{
+        background-color: rgba(0,212,170,0.08) !important;
+    }}
+
+    /* ── Expanders ── */
+    [data-testid="stExpander"] {{
+        background-color: #fafafa !important;
+        border: 1px solid #eeeeee !important;
+        border-radius: 8px !important;
+        margin-bottom: 6px !important;
+    }}
+    [data-testid="stExpander"] summary {{
+        color: #333333 !important;
+        font-weight: 500 !important;
+    }}
+    [data-testid="stExpander"] summary:hover {{ color: #00d4aa !important; }}
+    [data-testid="stExpander"] > div:last-child {{
+        background-color: #fafafa !important;
+    }}
+
+    /* ── Text inputs / textareas ── */
+    .stTextInput input, .stTextArea textarea {{
+        background-color: #ffffff !important;
+        border: 1px solid #dddddd !important;
+        color: #111111 !important;
+        border-radius: 6px !important;
+        line-height: 1.45 !important;
+    }}
+    .stTextInput input:focus, .stTextArea textarea:focus {{
+        border-color: #00d4aa !important;
+        box-shadow: 0 0 0 2px rgba(0,212,170,0.12) !important;
+    }}
+    .stTextInput label, .stTextArea label {{ color: #555555 !important; }}
+
+    /* ── Selectbox / multiselect ── */
+    .stSelectbox > div > div, .stMultiSelect > div > div {{
+        background-color: #ffffff !important;
+        border: 1px solid #dddddd !important;
+        border-radius: 6px !important;
+        color: #111111 !important;
+    }}
+    .stSelectbox label, .stMultiSelect label {{ color: #555555 !important; }}
+
+    /* ── Sliders ── */
+    [data-testid="stSlider"] label {{ color: #555555 !important; }}
+    [data-testid="stSlider"] [role="slider"] {{
+        background-color: #00d4aa !important;
+        border: 2px solid #00d4aa !important;
+    }}
+    .stSlider [data-baseweb="slider"] [data-testid="stThumbValue"] {{ color: #00d4aa !important; }}
+
+    /* ── Checkboxes / toggles ── */
+    .stCheckbox label, .stToggle label {{ color: #444444 !important; }}
+    [data-testid="stCheckbox"] svg, [data-testid="stToggle"] svg {{ color: #00d4aa !important; }}
+
+    /* ── Alerts ── */
+    [data-testid="stAlert"] {{
+        border-radius: 8px !important;
+        background-color: #f9fafb !important;
+        border-left: 3px solid #00d4aa !important;
+    }}
+
+    /* ── Dataframe / tables ── */
+    [data-testid="stDataFrame"] {{ border-radius: 8px !important; overflow: hidden; }}
+    [data-testid="stDataFrame"] > div {{ background-color: #fafafa !important; }}
+
+    /* ── Chat messages ── */
+    [data-testid="stChatMessage"] {{
+        background-color: #f9fafb !important;
+        border: 1px solid #eeeeee !important;
+        border-radius: 10px !important;
+    }}
+    [data-testid="stChatInput"] > div {{
+        background-color: #ffffff !important;
+        border: 1px solid #dddddd !important;
+        border-radius: 8px !important;
+    }}
+    [data-testid="stChatInput"] textarea {{
+        color: #111111 !important;
+        background-color: #ffffff !important;
+    }}
+
+    /* ── Dividers ── */
+    hr {{ border-color: #eeeeee !important; }}
+
+    /* ── Code blocks ── */
+    .stCode, [data-testid="stCodeBlock"] {{
+        background-color: #f5f5f5 !important;
+        border: 1px solid #e5e5e5 !important;
+        border-radius: 6px !important;
+    }}
+    code {{ color: #007a6b !important; }}
+
+    /* ── Spinner ── */
+    [data-testid="stSpinner"] p {{ color: #666666 !important; }}
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab-list"] {{ background-color: #f5f5f5 !important; border-bottom: 1px solid #eeeeee !important; }}
+    .stTabs [data-baseweb="tab"] {{ color: #666666 !important; }}
+    .stTabs [aria-selected="true"] {{ color: #00d4aa !important; border-bottom-color: #00d4aa !important; }}
+
+    /* ── Metric tiles ── */
+    [data-testid="stMetric"] {{
+        background-color: #fafafa !important;
+        border: 1px solid #eeeeee !important;
+        border-radius: 8px !important;
+        padding: 12px 16px !important;
+    }}
+    [data-testid="stMetricLabel"] p {{ color: #888888 !important; text-transform: uppercase; letter-spacing: 0.05em; }}
+    [data-testid="stMetricValue"] {{ color: #111111 !important; }}
+
+    /* ── Scrollbars ── */
+    ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+    ::-webkit-scrollbar-track {{ background: #f5f5f5; }}
+    ::-webkit-scrollbar-thumb {{ background: #cccccc; border-radius: 3px; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: #aaaaaa; }}
+
+    /* ══════════════ PHYX44 BANNER ══════════════ */
+    .phyx-banner {{
+        display: flex;
+        align-items: center;
+        background: #ffffff;
+        border-radius: 0;
+        padding: 12px 0 18px 0;
+        margin-bottom: 24px;
+        border-bottom: 1px solid #eeeeee;
+        gap: 20px;
+        flex-wrap: wrap;
+    }}
+    .phyx-logo {{
+        height: 44px;
+        width: auto;
+        max-width: 200px;
+        flex-shrink: 0;
+    }}
+    .phyx-divider {{
+        width: 1px;
+        height: 44px;
+        background: #eeeeee;
+        flex-shrink: 0;
+    }}
+    .phyx-text {{ flex: 1; min-width: 200px; }}
+    .phyx-title {{
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #111111;
+        letter-spacing: -0.01em;
+        line-height: 1.3;
+        margin-bottom: 3px;
+        font-family: 'Montserrat', system-ui, sans-serif;
+    }}
+    .phyx-desc {{
+        font-size: 0.76rem;
+        color: #888888;
+        line-height: 1.5;
+        font-family: 'Montserrat', system-ui, sans-serif;
+    }}
+    @media (max-width: 768px) {{
+        .phyx-divider {{ display: none; }}
+        .phyx-logo {{ height: 32px; max-width: 140px; }}
+    }}
+    </style>
+    <div class="phyx-banner">
+        <img class="phyx-logo"
+             src="data:image/png;base64,{_logo_b64}"
+             alt="PHYX44" />
+        <div class="phyx-divider"></div>
+        <div class="phyx-text">
+            <div class="phyx-title">Guided Protein Design Tool</div>
+            <div class="phyx-desc">
+                Natural language → ESM3 prompt → candidate generation → fitness scoring.
+                Upload a PDB for structure-conditioned design or scaffold condensation.
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 settings = render_sidebar()
+
+# ── Engine selector (D3: engine-select first) ─────────────────────────────────
+with st.sidebar:
+    st.divider()
+    _engine = st.radio(
+        "🧪 Engine",
+        options=["ESM3 (chat)", "RFdiffusion / MPNN"],
+        key="_engine_choice",
+        help=(
+            "ESM3: conversational sequence generation (Forge API). "
+            "RFdiffusion / MPNN: backbone-based design run as async GPU jobs."
+        ),
+    )
+
 render_user_badge()   # shows signed-in email + sign-out button at bottom of sidebar
 
 if settings["anthropic_key"]:
@@ -59,6 +334,7 @@ os.environ["FORGE_MODEL"] = settings["forge_model"]
 
 # ── Session state init ─────────────────────────────────────────────────────────
 def _init_session():
+    import time as _time
     defaults = {
         "messages": [],
         "generation_history": [],   # list of round dicts
@@ -66,6 +342,8 @@ def _init_session():
         "refine_request": None,     # set by results_panel when user clicks Refine
         "pdb_bytes": None,
         "pdb_filename": None,
+        # Unique prefix for all downloaded files in this session (YYMMDD_HHMMSS)
+        "_session_file_prefix": _time.strftime("%y%m%d_%H%M%S"),
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -74,18 +352,59 @@ def _init_session():
 _init_session()
 
 
+# ── New Design: reset helper + confirmation dialog ─────────────────────────────
+
+def _reset_session():
+    """Clear all generation state, inputs and uploads. Preserve sidebar settings."""
+    keep = {
+        "_auth_email", "_auth_name", "_audit_session_id",
+        "n_candidates", "temperature", "num_steps",
+        "anthropic_key", "forge_token", "use_local",
+        "forge_model_selector",
+    }
+    for key in list(st.session_state.keys()):
+        if key not in keep:
+            del st.session_state[key]
+    # Increment uploader key so Streamlit resets the file_uploader widget
+    st.session_state["pdb_uploader_key"] = st.session_state.get("pdb_uploader_key", 0) + 1
+    st.rerun()
+
+
+@st.dialog("Start a new design?")
+def _confirm_new_design_dialog():
+    st.write(
+        "This will clear all generated candidates, uploaded files, and structured inputs. "
+        "Sidebar settings (candidates, temperature, steps) will be preserved."
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Clear & start fresh", type="primary", use_container_width=True):
+            _reset_session()
+    with col2:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.pop("_show_new_design_dialog", None)
+            st.rerun()
+
+
+if st.session_state.get("_show_new_design_dialog"):
+    _confirm_new_design_dialog()
+
+
+# ── RFdiffusion / MPNN engine (D3) — separate page; skips the ESM3 chat flow ──
+if _engine == "RFdiffusion / MPNN":
+    from ui.rfd_panel import render_rfd_engine
+    _user_email = st.session_state.get("_auth_email") or "local@dev"
+    render_rfd_engine(_user_email)
+    st.stop()
+
+
 # ── Welcome message ────────────────────────────────────────────────────────────
 if not st.session_state["messages"]:
     with st.chat_message("assistant", avatar="🧬"):
         st.markdown(
-            "**Welcome!** Describe the protein you want to engineer. For example:\n\n"
-            "- *\"Generate 6 GFP variants keeping T65, Y66, G67, R96, E222 fixed. "
-            "Aim for high fluorescence.\"*\n"
-            "- *\"Design a compact serine protease (~150 residues) with a catalytic triad.\"*\n"
-            "- *\"Redesign this zinc finger sequence keeping cysteines at positions 3, 6, 20, 23.\"*\n\n"
-            "After generation, click **🔬 Refine** on any top-5 candidate to iterate "
-            "with chain-of-thought refinement — add improvement keywords, SS8/SASA hints, "
-            "or condense the scaffold."
+            "**Welcome.** Describe the protein you want to engineer. "
+            "Upload a PDB for structure-conditioned design, or use **🔩 Condense scaffold** "
+            "to generate a shorter protein that preserves your key residues' backbone geometry."
         )
 
 
@@ -99,11 +418,25 @@ def _parse_prompt(
     pdb_bytes: bytes | None,
     pdb_filename: str | None,
     settings: dict,
+    selected_keywords: list[str] | None = None,
+    structured_inputs: dict | None = None,
+    ai_infer_keywords: bool = True,
 ):
     """Parse user text → PromptSpec via Claude. Returns None on error."""
     try:
         from core.nl_parser import NLParser
         from config import get_anthropic_client
+
+        # Determine what to pass to parser as the keyword override:
+        # - AI inference ON + no selections: None → Haiku infers freely
+        # - AI inference ON + selections: pass selections → Haiku is told to use them
+        # - AI inference OFF: always pass selections (may be empty list) → no inference
+        if not ai_infer_keywords:
+            override_keywords: list[str] | None = selected_keywords or []
+        elif selected_keywords:
+            override_keywords = selected_keywords
+        else:
+            override_keywords = None
 
         parser = NLParser(anthropic_client=get_anthropic_client())
         spec = parser.parse(
@@ -111,12 +444,16 @@ def _parse_prompt(
             conversation_history=history,
             pdb_uploaded=(pdb_bytes is not None),
             pdb_filename=pdb_filename,
+            pdb_bytes=pdb_bytes,
+            structured_inputs=structured_inputs,
+            override_keywords=override_keywords,
         )
         spec.num_candidates = settings["n_candidates"]
         spec.generation_temperature = settings["temperature"]
         spec.num_steps = settings["num_steps"]
         # Propagate Claude's model recommendation to the sidebar
         st.session_state["recommended_model"] = spec.recommended_model
+
         return spec
 
     except Exception as e:
@@ -130,6 +467,9 @@ def _build_and_generate(spec, pdb_bytes: bytes | None, settings: dict):
     """
     Build ESMProtein → run ESM3 generation → run ESM2 scoring → process results.
     Returns list[CandidateResult] or None on error.
+
+    Over-generates 2× the requested candidates to compensate for deduplication
+    and input-sequence filtering, then trims to the original N requested.
     """
     # Build ESMProtein prompt
     with st.spinner("Building ESM3 prompt…"):
@@ -142,6 +482,10 @@ def _build_and_generate(spec, pdb_bytes: bytes | None, settings: dict):
             add_assistant_message(msg)
             return None
 
+    # Over-generate: request 2× candidates so we have enough after dedup
+    requested_n = spec.num_candidates
+    spec.num_candidates = min(requested_n * 2, 50)  # cap over-generation within Cloud Run timeout
+
     # ESM3 generation
     progress_bar = st.empty()
 
@@ -149,7 +493,7 @@ def _build_and_generate(spec, pdb_bytes: bytes | None, settings: dict):
         if total > 0:
             progress_bar.progress(
                 current / total,
-                text=f"ESM3 generating candidate {current + 1} of {total}…",
+                text=f"ESM3 generating candidate {current + 1} of {total} (→ top {requested_n} kept)…",
             )
 
     try:
@@ -159,7 +503,8 @@ def _build_and_generate(spec, pdb_bytes: bytes | None, settings: dict):
         generate_fn = choose_generation_strategy(spec)
         with st.spinner(
             f"ESM3 generating {spec.num_candidates} candidates "
-            f"({spec.num_steps} steps, T={spec.generation_temperature:.2f})…"
+            f"(→ top {requested_n} after dedup) · "
+            f"{spec.num_steps} steps · T={spec.generation_temperature:.2f}…"
         ):
             raw_results = generate_fn(
                 esm_protein=esm_protein,
@@ -175,6 +520,9 @@ def _build_and_generate(spec, pdb_bytes: bytes | None, settings: dict):
         st.error(msg)
         add_assistant_message(msg)
         return None
+    finally:
+        # Restore the original requested count
+        spec.num_candidates = requested_n
 
     # ESM2 scoring
     esm2_progress = st.empty()
@@ -204,6 +552,13 @@ def _build_and_generate(spec, pdb_bytes: bytes | None, settings: dict):
         st.error(msg)
         add_assistant_message(msg)
         return None
+
+    # Trim to the originally requested number of candidates
+    if len(candidates) > requested_n:
+        candidates = candidates[:requested_n]
+        # Re-assign ranks after trim
+        for rank, c in enumerate(candidates, start=1):
+            c.rank = rank
 
     return candidates
 
@@ -236,12 +591,16 @@ def _show_generation_summary(candidates, round_num: int):
         return
 
     best = candidates[0]
+    struct_part = (
+        f"pTM={best.ptm:.3f} · pLDDT={best.mean_plddt:.1f} · "
+        if best.has_structure_scores else ""
+    )
     msg = (
         f"✅ **Round {round_num}** — {len(candidates)} candidates generated. "
         f"Best: Score={best.composite_score:.3f} · "
-        f"pTM={best.ptm:.3f} · pLDDT={best.mean_plddt:.1f} · "
+        f"{struct_part}"
         f"ESM2={best.esm2_score:.3f}. "
-        f"Results on the right →"
+        f"Results below ↓"
     )
     st.success(msg)
     add_assistant_message(msg)
@@ -252,26 +611,52 @@ def _run_generation_round(
     settings: dict,
     pdb_bytes: bytes | None,
     pdb_filename: str | None,
+    selected_keywords: list[str] | None = None,
+    structured_inputs: dict | None = None,
+    ai_infer_keywords: bool = True,
 ):
     """Run a full fresh generation round from a user prompt."""
+    from utils.audit_log import log_generation_request, log_generation_result
+
     with st.chat_message("assistant", avatar="🧬"):
 
         # Step 1 — NL parsing
-        with st.spinner("Interpreting your request with Claude…"):
+        with st.spinner("Interpreting your request…"):
             spec = _parse_prompt(
                 user_text=user_text,
                 history=get_conversation_history()[:-1],
                 pdb_bytes=pdb_bytes,
                 pdb_filename=pdb_filename,
                 settings=settings,
+                selected_keywords=selected_keywords,
+                structured_inputs=structured_inputs,
+                ai_infer_keywords=ai_infer_keywords,
             )
             if spec is None:
                 return
+
+        # Audit log — record what is being sent to ESM Forge
+        request_id = log_generation_request(
+            user_prompt=user_text,
+            spec=spec,
+            pdb_filename=pdb_filename,
+            forge_model=settings.get("forge_model", ""),
+            selected_keywords=selected_keywords,
+            ai_infer_keywords=ai_infer_keywords,
+        )
 
         show_prompt_summary(spec, pdb_provided=(pdb_bytes is not None))
 
         # Step 2 → 4 — Build, generate, score
         candidates = _build_and_generate(spec, pdb_bytes, settings)
+
+        # Audit log — record the outcome
+        log_generation_result(
+            request_id=request_id,
+            candidates=candidates,
+            error=None if candidates is not None else "generation failed",
+        )
+
         if candidates is None:
             return
 
@@ -287,122 +672,66 @@ def _run_generation_round(
         _show_generation_summary(candidates, round_num)
 
 
-def _run_refinement_round(req: dict, settings: dict, pdb_bytes: bytes | None):
-    """Run a refinement generation round from a previous candidate."""
-    candidate = req["candidate"]
-    options = req["options"]
-    from_round = req["from_round"]
-    from_rank = req["from_rank"]
-
-    # Get the PromptSpec from the round we're refining
-    history = st.session_state["generation_history"]
-    source_entry = next((e for e in history if e["round"] == from_round), None)
-    if source_entry is None:
-        st.error("Could not find the source generation round. Please try again.")
-        return
-
-    original_spec = source_entry["spec"]
-
-    with st.chat_message("assistant", avatar="🔬"):
-        from core.refiner import build_refinement_spec, describe_refinement
-
-        round_num = len(history) + 1
-        refine_summary = describe_refinement(options, round_num)
-
-        with st.spinner(f"Building refinement spec for Round {round_num}…"):
-            try:
-                refined_spec = build_refinement_spec(
-                    candidate=candidate,
-                    original_spec=original_spec,
-                    options=options,
-                )
-                # Override generation settings from sidebar
-                refined_spec.num_candidates = settings["n_candidates"]
-                # Temperature is already decreased by refiner; clamp to sidebar max
-                refined_spec.generation_temperature = min(
-                    settings["temperature"],
-                    refined_spec.generation_temperature,
-                )
-                refined_spec.num_steps = settings["num_steps"]
-            except Exception as e:
-                st.error(f"**Refinement spec error:** {e}")
-                add_assistant_message(f"Refinement failed: {e}")
-                return
-
-        st.markdown(refine_summary)
-        show_prompt_summary(refined_spec, pdb_provided=(pdb_bytes is not None))
-
-        add_assistant_message(
-            f"Starting Round {round_num} — refining from candidate #{from_rank} "
-            f"(Round {from_round}). {refine_summary}"
-        )
-
-        # Generate
-        candidates = _build_and_generate(refined_spec, pdb_bytes, settings)
-        if candidates is None:
-            return
-
-        _store_round(
-            candidates=candidates,
-            spec=refined_spec,
-            round_num=round_num,
-            user_prompt=f"[Refinement from Round {from_round} candidate #{from_rank}]",
-            refined_from=from_rank,
-        )
-        _show_generation_summary(candidates, round_num)
-
-
-# ── Two-column layout ──────────────────────────────────────────────────────────
-chat_col, results_col = st.columns([1, 1], gap="large")
-
-# ════════════════════════════════════════════════════════════════════════════════
-# LEFT COLUMN: Chat interface
-# ════════════════════════════════════════════════════════════════════════════════
-with chat_col:
-    render_chat_history()
-    user_text, pdb_bytes, pdb_filename = render_input_area()
-
-    # ── Check for refinement request from the results panel ───────────────────
-    # This fires when the user clicks "Generate refined candidates" in results_panel
-    if st.session_state.get("refine_request") is not None:
-        req = st.session_state.pop("refine_request")
-        _run_refinement_round(req, settings, pdb_bytes)
-
-    # ── Handle fresh user prompt ───────────────────────────────────────────────
-    if user_text:
-        add_user_message(user_text)
-        with st.chat_message("user"):
-            st.markdown(user_text)
-
-        _run_generation_round(
-            user_text=user_text,
-            settings=settings,
-            pdb_bytes=pdb_bytes,
-            pdb_filename=pdb_filename,
-        )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# RIGHT COLUMN: Results
+# TOP: Chat interface (inputs)
 # ════════════════════════════════════════════════════════════════════════════════
-with results_col:
-    history = st.session_state["generation_history"]
-    viewing_idx = st.session_state.get("viewing_round", len(history) - 1)
-    viewing_idx = max(0, min(viewing_idx, len(history) - 1))
+render_chat_history()
+user_text, pdb_bytes, pdb_filename, selected_keywords, structured_inputs, ai_infer_keywords = render_input_area()
 
-    if history:
-        entry = history[viewing_idx]
-        render_results(
-            candidates=entry["candidates"],
-            spec=entry["spec"],
-            generation_history=history,
-            current_round=entry["round"],
-        )
-    else:
-        st.markdown("### Results will appear here")
-        st.info(
-            "Submit a prompt in the chat on the left to generate protein candidates.\n\n"
-            "Candidates are ranked by a composite score:\n"
-            "**0.5 × pTM + 0.3 × pLDDT + 0.2 × ESM2 log-likelihood**",
-            icon="⬅️",
-        )
+# ── Handle condensation request (button in condense expander) ─────────────────
+if st.session_state.pop("condense_request", False):
+    si = st.session_state.get("structured_inputs_cache", structured_inputs)
+    tgt_len = si.get("condense_target_length", "?")
+    key_res = si.get("condense_key_residues", "") or "no key residues specified"
+    auto_text = (
+        f"Condense scaffold to {tgt_len} residues, "
+        f"preserving: {key_res}"
+    )
+    add_user_message(auto_text)
+    with st.chat_message("user"):
+        st.markdown(auto_text)
+    _run_generation_round(
+        user_text=auto_text,
+        settings=settings,
+        pdb_bytes=pdb_bytes,
+        pdb_filename=pdb_filename,
+        selected_keywords=selected_keywords,
+        structured_inputs=si,
+        ai_infer_keywords=False,
+    )
+
+# ── Handle fresh user prompt ──────────────────────────────────────────────────
+elif user_text:
+    add_user_message(user_text)
+    with st.chat_message("user"):
+        st.markdown(user_text)
+
+    _run_generation_round(
+        user_text=user_text,
+        settings=settings,
+        pdb_bytes=pdb_bytes,
+        pdb_filename=pdb_filename,
+        selected_keywords=selected_keywords,
+        structured_inputs=structured_inputs,
+        ai_infer_keywords=ai_infer_keywords,
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# BELOW: Results
+# ════════════════════════════════════════════════════════════════════════════════
+history = st.session_state["generation_history"]
+viewing_idx = st.session_state.get("viewing_round", len(history) - 1)
+viewing_idx = max(0, min(viewing_idx, len(history) - 1))
+
+if history:
+    st.markdown("---")
+    entry = history[viewing_idx]
+    render_results(
+        candidates=entry["candidates"],
+        spec=entry["spec"],
+        generation_history=history,
+        current_round=entry["round"],
+    )

@@ -1,12 +1,12 @@
 """
-ui/results_panel.py — Candidate results display with refinement controls.
+ui/results_panel.py — Candidate results display.
 
 Renders:
-  - Round navigation breadcrumb (for multi-round chain-of-thought sessions)
+  - Round navigation breadcrumb (for multi-round sessions)
   - Summary metrics (best pTM, pLDDT, ESM2, diversity)
   - Ranked results table with ESM2 score column
   - Per-candidate expandable detail: full sequence, pLDDT chart, 3D viewer,
-    FASTA/PDB downloads, and the full refinement panel for top-5 candidates
+    FASTA/PDB downloads
 """
 
 from __future__ import annotations
@@ -15,10 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from core.result_processor import CandidateResult, candidates_to_fasta, diversity_summary
-from ui.refinement_panel import render_refinement_panel, render_round_breadcrumb
-
-# How many candidates get the refinement panel
-REFINE_TOP_N = 5
+from ui.refinement_panel import render_round_breadcrumb
 
 
 def render_results(
@@ -44,27 +41,56 @@ def render_results(
     render_round_breadcrumb(generation_history)
 
     st.markdown("---")
-    st.subheader(
-        f"🧬 Round {current_round} — "
-        f"{len(candidates)} Candidate{'s' if len(candidates) != 1 else ''}"
-    )
+    col_heading, col_newdesign = st.columns([5, 1])
+    with col_heading:
+        st.subheader(
+            f"🧬 Round {current_round} — "
+            f"{len(candidates)} Candidate{'s' if len(candidates) != 1 else ''}"
+        )
+    with col_newdesign:
+        st.markdown("<div style='padding-top:0.5rem'>", unsafe_allow_html=True)
+        if st.button("🔄 New Design", key="new_design_results_top",
+                     help="Clear current results and start a fresh design session."):
+            st.session_state["_show_new_design_dialog"] = True
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Summary metrics row ────────────────────────────────────────────────────
     best = candidates[0]
     div = diversity_summary(candidates)
     esm2_available = any(c.esm2_score != 0.0 for c in candidates)
+    struct_available = any(c.has_structure_scores for c in candidates)
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Best pTM", f"{best.ptm:.3f}",
-                help="Predicted TM-score (fold quality, 0–1)")
-    col2.metric("Best pLDDT", f"{best.mean_plddt:.1f}",
-                help="Mean per-residue confidence of top candidate (0–100)")
-    col3.metric("Best ESM2", f"{best.esm2_score:.3f}" if esm2_available else "N/A",
-                help="ESM2 masked marginal log-likelihood (fitness proxy, higher=better)")
-    col4.metric("Best Score", f"{best.composite_score:.3f}",
-                help="Composite: 0.5×pTM + 0.3×pLDDT + 0.2×ESM2 (normalised)")
+    col1.metric(
+        "Best pTM",
+        f"{best.ptm:.3f}" if best.has_structure_scores else "—",
+        help="Predicted TM-score (fold quality, 0–1). Fold a candidate to populate." if not struct_available else "Predicted TM-score (fold quality, 0–1)",
+    )
+    col2.metric(
+        "Best pLDDT",
+        f"{best.mean_plddt:.1f}" if best.has_structure_scores else "—",
+        help="Mean per-residue confidence (0–100). Fold a candidate to populate." if not struct_available else "Mean per-residue confidence of top candidate (0–100)",
+    )
+    col3.metric(
+        "Best ESM2",
+        f"{best.esm2_score:.3f}" if esm2_available else "N/A",
+        help="ESM2 masked marginal log-likelihood (fitness proxy, higher=better)",
+    )
+    composite_help = (
+        "ESM2 fitness score only — fold candidates to unlock full composite (0.5×pTM + 0.3×pLDDT + 0.2×ESM2)"
+        if not struct_available else
+        "Composite: 0.5×pTM + 0.3×pLDDT + 0.2×ESM2 (normalised)"
+    )
+    col4.metric("Best Score", f"{best.composite_score:.3f}", help=composite_help)
     col5.metric("Mean Diversity", f"{div * 100:.1f}%",
                 help="Mean pairwise sequence diversity across candidates")
+
+    if not struct_available:
+        st.caption(
+            "💡 **pTM and pLDDT are not available for sequence-only generation.** "
+            "Click **🔬 Fold structure** on any candidate to run ESMFold and get structure confidence scores."
+        )
 
     st.markdown("---")
 
@@ -78,10 +104,12 @@ def render_results(
 | **pLDDT** | Per-residue confidence in predicted structure | 0–100 | More confident |
 | **ESM2** | Masked marginal log-likelihood — how "natural" the sequence is | ~−3 to 0 | More likely to fold & function |
 | **Novelty %** | Sequence distance from reference/template | 0–100% | More novel design |
-| **Composite** | Weighted combination: 0.5×pTM + 0.3×pLDDT + 0.2×ESM2 | 0–1 | Overall better candidate |
+| **Score** | ESM2 only (sequence generation) · or full 0.5×pTM + 0.3×pLDDT + 0.2×ESM2 (after folding) | 0–1 | Overall better candidate |
+
+**Note:** pTM and pLDDT are only available after folding. Click **🔬 Fold structure** on any candidate to run ESMFold and unlock the full composite score.
 
 **Tip:** For improving a known protein, prefer lower Novelty % with high ESM2 score.
-For exploring new sequence space, balance novelty with pTM/pLDDT quality.
+For exploring new sequence space, fold top candidates and compare pTM/pLDDT.
             """
         )
 
@@ -90,12 +118,14 @@ For exploring new sequence space, balance novelty with pTM/pLDDT quality.
 
     col_config = {
         "Rank": st.column_config.NumberColumn(width="small"),
-        "pTM": st.column_config.NumberColumn(format="%.3f", width="small"),
-        "pLDDT": st.column_config.NumberColumn(format="%.1f", width="small"),
-        "Composite ▼": st.column_config.ProgressColumn(
-            "Composite ▼", format="%.3f", min_value=0.0, max_value=1.0
+        "pTM": st.column_config.TextColumn(width="small"),
+        "pLDDT": st.column_config.TextColumn(width="small"),
+        "Score ▼": st.column_config.ProgressColumn(
+            "Score ▼", format="%.3f", min_value=0.0, max_value=1.0,
+            help="ESM2 fitness only (fold to get full composite with pTM + pLDDT)" if not struct_available else "Composite: 0.5×pTM + 0.3×pLDDT + 0.2×ESM2",
         ),
-        "Novelty %": st.column_config.NumberColumn(format="%.1f%%", width="small"),
+        "Novelty %": st.column_config.TextColumn(width="small",
+                                                   help="% positions different from reference. '—' when no reference was available."),
         "Sequence (preview)": st.column_config.TextColumn(width="large"),
     }
     if esm2_available:
@@ -106,29 +136,47 @@ For exploring new sequence space, balance novelty with pTM/pLDDT quality.
 
     # ── Bulk FASTA download ────────────────────────────────────────────────────
     fasta_str = candidates_to_fasta(candidates)
-    st.download_button(
-        label="⬇️ Download all as FASTA",
-        data=fasta_str,
-        file_name=f"esm3_round{current_round}_candidates.fasta",
-        mime="text/plain",
-        key=f"download_fasta_all_r{current_round}",
-    )
+    pfx = st.session_state.get("_session_file_prefix", "download")
+    col_dl1, col_dl2 = st.columns([1, 1])
+    with col_dl1:
+        st.download_button(
+            label="⬇️ Download all as FASTA",
+            data=fasta_str,
+            file_name=f"{pfx}_candidates.fasta",
+            mime="text/plain",
+            key=f"download_fasta_all_r{current_round}",
+            use_container_width=True,
+        )
+    with col_dl2:
+        pdb_candidates = [c for c in candidates if c.pdb_string]
+        if pdb_candidates:
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for c in pdb_candidates:
+                    zf.writestr(f"{pfx}_candidate_{c.rank}.pdb", c.pdb_string)
+            st.download_button(
+                label="⬇️ Download all PDBs (.zip)",
+                data=buf.getvalue(),
+                file_name=f"{pfx}_pdbs.zip",
+                mime="application/zip",
+                key=f"download_pdb_zip_r{current_round}",
+                use_container_width=True,
+            )
+        else:
+            st.caption("PDB structures not available — run with structure conditioning or fold candidates individually.")
 
     st.markdown("---")
 
-    # ── Per-candidate detail + refinement panels ───────────────────────────────
-    st.subheader("Candidate Details & Refinement")
-    st.caption(
-        f"Top {min(REFINE_TOP_N, len(candidates))} candidates have refinement controls. "
-        "Click 'Refine' to start the next generation round from any candidate."
-    )
+    # ── Per-candidate detail ───────────────────────────────────────────────────
+    st.subheader("Candidate Details")
 
     for candidate in candidates:
         _render_candidate_detail(
             candidate=candidate,
             spec=spec,
             current_round=current_round,
-            show_refine=(candidate.rank <= REFINE_TOP_N),
         )
 
 
@@ -136,17 +184,19 @@ def _render_candidate_detail(
     candidate: CandidateResult,
     spec,
     current_round: int,
-    show_refine: bool,
 ):
     """Render an expandable detail section for a single candidate."""
     esm2_str = f"ESM2={candidate.esm2_score:.3f} · " if candidate.esm2_score != 0.0 else ""
+    ptm_str = f"pTM: {candidate.ptm:.3f}" if candidate.has_structure_scores else "pTM: —"
+    plddt_str = f"pLDDT: {candidate.mean_plddt:.1f}" if candidate.has_structure_scores else "pLDDT: —"
+    novelty_str = f"Novelty: {candidate.novelty_pct:.1f}%" if candidate.has_novelty_ref else "Novelty: —"
     label = (
         f"**#{candidate.rank}** — "
         f"Score: {candidate.composite_score:.3f} · "
-        f"pTM: {candidate.ptm:.3f} · "
-        f"pLDDT: {candidate.mean_plddt:.1f} · "
+        f"{ptm_str} · "
+        f"{plddt_str} · "
         f"{esm2_str}"
-        f"Novelty: {candidate.novelty_pct:.1f}%"
+        f"{novelty_str}"
         + (" ✨ Top pick" if candidate.rank == 1 else "")
     )
     with st.expander(label, expanded=(candidate.rank == 1)):
@@ -158,11 +208,12 @@ def _render_candidate_detail(
             st.code(candidate.sequence, language=None)
 
         with col_dl:
+            pfx = st.session_state.get("_session_file_prefix", "download")
             single_fasta = f">{candidate.fasta_header()}\n{candidate.sequence}\n"
             st.download_button(
                 "⬇️ FASTA",
                 data=single_fasta,
-                file_name=f"r{current_round}_candidate_{candidate.rank}.fasta",
+                file_name=f"{pfx}_candidate_{candidate.rank}.fasta",
                 mime="text/plain",
                 key=f"fasta_r{current_round}_c{candidate.rank}_{candidate.index}",
             )
@@ -170,79 +221,76 @@ def _render_candidate_detail(
                 st.download_button(
                     "⬇️ PDB",
                     data=candidate.pdb_string,
-                    file_name=f"r{current_round}_candidate_{candidate.rank}.pdb",
+                    file_name=f"{pfx}_candidate_{candidate.rank}.pdb",
                     mime="chemical/x-pdb",
                     key=f"pdb_r{current_round}_c{candidate.rank}_{candidate.index}",
                 )
 
-        # ── 3D viewer ──────────────────────────────────────────────────────────
-        if candidate.pdb_string:
-            _render_3d_viewer(candidate, current_round)
+        # ── 3D viewer + fold on-demand ─────────────────────────────────────────
+        fold_key = f"fold_pdb_r{current_round}_c{candidate.rank}_{candidate.index}"
+        pdb_to_show = candidate.pdb_string or st.session_state.get(fold_key)
+
+        if pdb_to_show:
+            _render_3d_viewer(pdb_to_show, key_suffix=fold_key)
+            # Show PDB download for on-demand folded structures (generation-time
+            # structures already have a download button in col_dl above)
+            if not candidate.pdb_string:
+                st.download_button(
+                    "⬇️ PDB (folded)",
+                    data=pdb_to_show,
+                    file_name=f"r{current_round}_candidate_{candidate.rank}_folded.pdb",
+                    mime="chemical/x-pdb",
+                    key=f"dl_fold_{fold_key}",
+                )
         else:
-            st.caption("3D structure not available — use Forge API structure track for full coordinates.")
+            if st.button("🔬 Fold structure (ESMFold)", key=f"fold_btn_{fold_key}"):
+                with st.spinner("Folding with ESMFold via Forge API (~10–15s)…"):
+                    try:
+                        from core.esm_backend import fold_sequence
+                        from config import get_esm_client
+                        pdb = fold_sequence(candidate.sequence, client=get_esm_client())
+                        if pdb:
+                            st.session_state[fold_key] = pdb
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Folding returned no structure. "
+                                "Download the FASTA and fold in ColabFold or ESMFold server."
+                            )
+                    except Exception as exc:
+                        st.error(f"Folding failed: {exc}")
 
         # ── pLDDT chart ────────────────────────────────────────────────────────
         if candidate.plddt_per_residue:
             _render_plddt_chart(candidate, current_round)
 
-        # ── Refinement panel (top N only) ──────────────────────────────────────
-        if show_refine:
-            st.markdown("---")
-            panel_key = f"r{current_round}_c{candidate.rank}"
 
-            # Toggle button to show/hide the refinement panel
-            toggle_key = f"show_refine_{panel_key}"
-            if toggle_key not in st.session_state:
-                st.session_state[toggle_key] = False
-
-            if st.button(
-                f"🔬 Refine from candidate #{candidate.rank}",
-                key=f"toggle_refine_{panel_key}",
-                use_container_width=False,
-            ):
-                st.session_state[toggle_key] = not st.session_state[toggle_key]
-
-            if st.session_state[toggle_key]:
-                refine_options = render_refinement_panel(
-                    candidate=candidate,
-                    original_spec=spec,
-                    round_num=current_round + 1,
-                    panel_key=panel_key,
-                )
-                if refine_options is not None:
-                    # Signal app.py to start a refinement generation round
-                    st.session_state["refine_request"] = {
-                        "candidate": candidate,
-                        "options": refine_options,
-                        "from_round": current_round,
-                        "from_rank": candidate.rank,
-                    }
-                    st.session_state[toggle_key] = False
-                    st.rerun()
-
-
-def _render_3d_viewer(candidate: CandidateResult, round_num: int):
+def _render_3d_viewer(pdb_string: str, key_suffix: str = ""):
     st.markdown("**Predicted 3D structure:**")
     try:
         import py3Dmol
-        import stmol
+        from streamlit.components.v1 import html as _st_html
 
-        view = py3Dmol.view(width=600, height=380)
-        view.addModel(candidate.pdb_string, "pdb")
+        view = py3Dmol.view(width=900, height=480)
+        view.addModel(pdb_string, "pdb")
         view.setStyle({"cartoon": {"colorscheme": "ssJmol"}})
         view.addSurface(
             py3Dmol.VDW,
-            {"opacity": 0.15, "color": "white"},
+            {"opacity": 0.12, "color": "white"},
             {"hetflag": False},
         )
         view.zoomTo()
-        stmol.showmol(view, height=380)
+        # py3Dmol._make_html() returns a self-contained HTML snippet with
+        # the 3Dmol.js viewer embedded — render via Streamlit's HTML component.
+        _st_html(view._make_html(), height=492, scrolling=False)
     except ImportError:
         st.info(
-            "Install `stmol` + `py3Dmol` for 3D viewer: `pip install stmol py3Dmol`. "
+            "3D viewer requires `py3Dmol`: `pip install py3Dmol`. "
             "Download the PDB to view in PyMOL or ChimeraX.",
             icon="ℹ️",
         )
+    except Exception as exc:
+        st.warning(f"3D viewer error: {exc}. Download the PDB above to view locally.")
 
 
 def _render_plddt_chart(candidate: CandidateResult, round_num: int):
@@ -275,10 +323,10 @@ def _build_results_df(
     for c in candidates:
         row = {
             "Rank": c.rank,
-            "pTM": c.ptm,
-            "pLDDT": c.mean_plddt,
-            "Composite ▼": c.composite_score,
-            "Novelty %": c.novelty_pct,
+            "pTM": f"{c.ptm:.3f}" if c.has_structure_scores else "—",
+            "pLDDT": f"{c.mean_plddt:.1f}" if c.has_structure_scores else "—",
+            "Score ▼": c.composite_score,
+            "Novelty %": f"{c.novelty_pct:.1f}%" if c.has_novelty_ref else "—",
             "Length": len(c.sequence),
             "Sequence (preview)": c.sequence[:40] + ("…" if len(c.sequence) > 40 else ""),
         }
@@ -286,7 +334,7 @@ def _build_results_df(
             row["ESM2 LL"] = c.esm2_score
         rows.append(row)
 
-    col_order = ["Rank", "Composite ▼", "pTM", "pLDDT"]
+    col_order = ["Rank", "Score ▼", "pTM", "pLDDT"]
     if include_esm2:
         col_order.append("ESM2 LL")
     col_order += ["Novelty %", "Length", "Sequence (preview)"]

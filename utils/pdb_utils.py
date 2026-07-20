@@ -168,6 +168,91 @@ def get_sequence_from_pdb(
     return "".join(seq)
 
 
+def extract_full_backbone(
+    pdb_source: str | bytes | Path,
+    chain_id: str | None = None,
+) -> tuple[str, np.ndarray]:
+    """
+    Extract backbone coordinates for ALL residues in the PDB.
+
+    Used for full structure conditioning (inverse-folding mode): passes backbone
+    N/CA/C/O for every residue so ESM3 has structural context at masked positions.
+
+    Returns:
+        sequence: str          — single-letter AA sequence from ATOM records
+        coords:   np.ndarray   — shape (L, 37, 3), float32.
+                                 N/CA/C/O filled for every residue;
+                                 side-chain slots (4-36) remain NaN.
+    """
+    residues = get_residues(pdb_source, chain_id=chain_id)
+    sequence = get_sequence_from_pdb(pdb_source, chain_id=chain_id)
+    L = len(residues)
+
+    coords = np.full((L, ESM_NUM_ATOMS, 3), fill_value=np.nan, dtype=np.float32)
+
+    for i, residue in enumerate(residues):
+        for atom_name, atom_slot in zip(
+            BACKBONE_ATOM_NAMES,
+            (ESM_ATOM_N, ESM_ATOM_CA, ESM_ATOM_C, ESM_ATOM_O),
+        ):
+            if atom_name in residue:
+                coords[i, atom_slot, :] = residue[atom_name].get_vector().get_array()
+
+    return sequence, coords
+
+
+def extract_motif_by_source_indices(
+    pdb_source: str | bytes | Path,
+    target_length: int,
+    source_indices: list[int],
+    target_indices: list[int],
+    chain_id: str | None = None,
+) -> np.ndarray:
+    """
+    Extract backbone N/CA/C/O from specific PDB residues and place them at
+    specified positions in a new (shorter) protein coordinate array.
+
+    Used for scaffold condensation: active site residues from the original PDB
+    (at source_indices) are anchored at remapped positions (target_indices) in
+    a shorter protein of target_length.
+
+    Args:
+        pdb_source:     PDB file path or raw content.
+        target_length:  Length of the condensed protein to generate.
+        source_indices: 0-based positions in the PDB to read coordinates from.
+        target_indices: 0-based positions in the new protein to write to.
+                        Must be same length as source_indices (1-to-1 mapping).
+        chain_id:       Chain to extract from (None = all chains in order).
+
+    Returns:
+        numpy array of shape (target_length, 37, 3), dtype float32.
+        NaN at all positions except the motif residues.
+    """
+    residues = get_residues(pdb_source, chain_id=chain_id)
+    coords = np.full((target_length, ESM_NUM_ATOMS, 3), fill_value=np.nan, dtype=np.float32)
+
+    for src_idx, tgt_idx in zip(source_indices, target_indices):
+        if src_idx >= len(residues):
+            warnings.warn(
+                f"Source index {src_idx} exceeds PDB length {len(residues)} — skipping."
+            )
+            continue
+        if tgt_idx >= target_length:
+            warnings.warn(
+                f"Target index {tgt_idx} exceeds target_length {target_length} — skipping."
+            )
+            continue
+        residue = residues[src_idx]
+        for atom_name, atom_slot in zip(
+            BACKBONE_ATOM_NAMES,
+            (ESM_ATOM_N, ESM_ATOM_CA, ESM_ATOM_C, ESM_ATOM_O),
+        ):
+            if atom_name in residue:
+                coords[tgt_idx, atom_slot, :] = residue[atom_name].get_vector().get_array()
+
+    return coords
+
+
 def pdb_bytes_to_string(pdb_bytes: bytes) -> str:
     """Decode PDB bytes to string, stripping null bytes."""
     return pdb_bytes.decode(errors="replace").replace("\x00", "")

@@ -2,6 +2,9 @@
 .env
 .streamlit/secrets.toml
 
+# ── Local-only project docs (kept locally, not version-controlled) ────────────
+phyx44_protein_design_tool_grant_context.txt
+
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc

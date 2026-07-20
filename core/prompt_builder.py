@@ -7,7 +7,12 @@ object that ESM3 can use for conditional generation.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
 import numpy as np
 
@@ -50,6 +55,24 @@ def build_esm_protein(
         # Ensure correct length
         if len(sequence) != spec.protein_length:
             sequence = sequence.ljust(spec.protein_length, "_")[:spec.protein_length]
+
+        # If the template has no mask characters (e.g. haiku provided the full
+        # reference sequence), derive the mask from fixed_positions: keep only
+        # those positions and mask everything else so ESM3 has something to generate.
+        if "_" not in sequence:
+            if spec.fixed_positions:
+                seq_list = ["_"] * len(sequence)
+                for pos, aa in spec.fixed_positions.items():
+                    if 0 <= pos < len(seq_list):
+                        seq_list[pos] = aa.upper()
+                sequence = "".join(seq_list)
+                _log(f"INFO: sequence_template had no masks — derived mask from "
+                      f"{len(spec.fixed_positions)} fixed_positions.")
+            else:
+                # No fixed positions either → fully de novo at the given length
+                sequence = "_" * len(sequence)
+                _log("INFO: sequence_template had no masks and no fixed_positions "
+                      "— using fully masked (de novo) generation.")
     else:
         # Fully masked — de novo generation
         sequence = build_masked_sequence(spec.protein_length, spec.fixed_positions)
@@ -60,27 +83,101 @@ def build_esm_protein(
         for c in sequence.upper()
     )
 
-    # ── 2. Extract backbone coordinates (structure motif) ─────────────────────
+    # ── Minimum mask enforcement ────────────────────────────────────────────
+    # When the user provides a sequence for redesign but Haiku was too
+    # conservative (e.g. only 1 masked position out of 207), ESM3 can't
+    # generate meaningful diversity. Expand the mask to at least 15% of
+    # positions, choosing non-fixed positions randomly.
+    MIN_MASK_FRACTION = 0.15
+    mask_count = sequence.count("_")
+    total_len = len(sequence)
+    if 0 < mask_count < int(total_len * MIN_MASK_FRACTION) and total_len > 30:
+        import random
+        fixed_set = set(spec.fixed_positions.keys()) if spec.fixed_positions else set()
+        maskable = [i for i, c in enumerate(sequence) if c != "_" and i not in fixed_set]
+        needed = int(total_len * MIN_MASK_FRACTION) - mask_count
+        if needed > 0 and maskable:
+            to_mask = random.sample(maskable, min(needed, len(maskable)))
+            seq_list = list(sequence)
+            for idx in to_mask:
+                seq_list[idx] = "_"
+            sequence = "".join(seq_list)
+            _log(f"INFO: expanded mask from {mask_count} to {sequence.count('_')}/{total_len} "
+                 f"(min {MIN_MASK_FRACTION:.0%} threshold)")
+
+    # Final safety check: if still no masks, ESM3 has nothing to generate.
+    if "_" not in sequence:
+        _log("WARNING: sequence has no mask tokens after processing — "
+              "masking all positions to allow generation.")
+        sequence = "_" * len(sequence)
+
+    # ── 2a. Full structure conditioning (PDB provided, no explicit motif pinning) ──
+    # When a PDB is uploaded and the user hasn't requested specific motif-index
+    # pinning, pass backbone coordinates for ALL residues. This gives ESM3
+    # complete structural context at every masked position (inverse-folding mode),
+    # preventing the K/R bias that arises from sequence-only generation when many
+    # K/R residues are fixed.
+    import torch
+    full_coords: "torch.Tensor | None" = None
+    if pdb_source is not None and not spec.use_structure_motif:
+        try:
+            from utils.pdb_utils import extract_full_backbone
+            pdb_seq, full_coords_np = extract_full_backbone(
+                pdb_source, chain_id=spec.motif_chain_id
+            )
+            if len(pdb_seq) != spec.protein_length:
+                _log(
+                    f"INFO: PDB length ({len(pdb_seq)}) ≠ protein_length "
+                    f"({spec.protein_length}) — skipping full structure conditioning"
+                )
+                full_coords = None
+            else:
+                full_coords = torch.tensor(full_coords_np, dtype=torch.float32)
+                _log(
+                    f"INFO: full structure conditioning enabled "
+                    f"({spec.protein_length} residues)"
+                )
+        except Exception as e:
+            _log(f"WARNING: full backbone extraction failed ({e}) — no structure track")
+            full_coords = None
+
+    # ── 2b. Partial motif pinning (explicit motif_residue_indices requested) ───
     coordinates: np.ndarray | None = None
 
     if spec.use_structure_motif:
         if pdb_source is None:
-            raise ValueError(
-                "Structure motif was requested (use_structure_motif=True) but no PDB "
-                "file was provided. Please upload a PDB file."
+            _log("INFO: use_structure_motif=True but no PDB provided — skipping structure track.")
+            spec.use_structure_motif = False
+        elif not spec.motif_residue_indices:
+            _log("INFO: use_structure_motif=True but motif_residue_indices is empty — skipping structure track.")
+            spec.use_structure_motif = False
+        elif spec.motif_source_indices:
+            # Scaffold condensation path: source positions in PDB ≠ target positions in new protein.
+            # Extract backbone coords from original PDB positions, place at remapped target positions.
+            try:
+                from utils.pdb_utils import extract_motif_by_source_indices
+                coordinates = extract_motif_by_source_indices(
+                    pdb_source=pdb_source,
+                    target_length=spec.protein_length,
+                    source_indices=spec.motif_source_indices,
+                    target_indices=spec.motif_residue_indices,
+                    chain_id=spec.motif_chain_id,
+                )
+                _log(
+                    f"INFO: condensation structure motif — extracted {len(spec.motif_source_indices)} "
+                    f"residues from PDB at {spec.motif_source_indices}, "
+                    f"placed at {spec.motif_residue_indices} in {spec.protein_length}-aa target"
+                )
+            except Exception as e:
+                _log(f"WARNING: condensation coordinate extraction failed ({e}) — no structure track")
+                coordinates = None
+        else:
+            coordinates = extract_backbone_coordinates(
+                pdb_source=pdb_source,
+                protein_length=spec.protein_length,
+                motif_residue_indices=spec.motif_residue_indices,
+                chain_id=spec.motif_chain_id,
             )
-        if not spec.motif_residue_indices:
-            raise ValueError(
-                "use_structure_motif is True but motif_residue_indices is empty. "
-                "Specify which residue positions should have their coordinates fixed."
-            )
-
-        coordinates = extract_backbone_coordinates(
-            pdb_source=pdb_source,
-            protein_length=spec.protein_length,
-            motif_residue_indices=spec.motif_residue_indices,
-            chain_id=spec.motif_chain_id,
-        )
 
     # ── 3. Build function annotations ─────────────────────────────────────────
     function_annotations = _build_function_annotations(
@@ -90,7 +187,13 @@ def build_esm_protein(
     # ── 4. Construct ESMProtein ────────────────────────────────────────────────
     protein_kwargs: dict = {"sequence": sequence}
 
-    if coordinates is not None:
+    # Full backbone takes priority over partial motif coordinates.
+    # Both are converted to torch.Tensor (ESMProtein requires Tensor, not ndarray).
+    if full_coords is not None:
+        protein_kwargs["coordinates"] = full_coords
+    elif coordinates is not None:
+        if isinstance(coordinates, np.ndarray):
+            coordinates = torch.tensor(coordinates, dtype=torch.float32)
         protein_kwargs["coordinates"] = coordinates
 
     if function_annotations:
@@ -129,7 +232,7 @@ def _build_function_annotations(keywords: list[str], protein_length: int = 1) ->
             # Validate by attempting a dry-run encode if possible
             valid.append(ann)
         except Exception as e:
-            print(f"INFO: Skipping function keyword '{kw}' (not in ESM3 vocabulary: {e})")
+            _log(f"INFO: Skipping function keyword '{kw}' (not in ESM3 vocabulary: {e})")
 
     return valid if valid else None
 
@@ -148,7 +251,12 @@ def describe_prompt(spec: PromptSpec, pdb_provided: bool = False) -> str:
     if spec.function_keywords:
         parts.append(f"**Function keywords:** {', '.join(spec.function_keywords)}")
 
-    if spec.use_structure_motif and pdb_provided:
+    if spec.motif_source_indices and pdb_provided:
+        parts.append(
+            f"**Scaffold condensation:** {len(spec.motif_source_indices)} key residues anchored "
+            f"from PDB at remapped positions in {spec.protein_length}-residue target"
+        )
+    elif spec.use_structure_motif and pdb_provided:
         parts.append(
             f"**Structure motif:** {len(spec.motif_residue_indices)} backbone positions "
             f"pinned from uploaded PDB"

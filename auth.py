@@ -1,17 +1,25 @@
 """
 auth.py — Google OAuth2 gate for Streamlit on Cloud Run.
 
+Uses direct HTTP calls to Google's OAuth endpoints (no PKCE) to avoid the
+code-verifier session-state loss problem that occurs when google-auth-oauthlib
+generates a PKCE challenge but session state is wiped during the redirect.
+
+Auth state lives in st.session_state (in-memory per Streamlit WebSocket session).
+Users must re-authenticate after a page refresh or new tab — this is a Streamlit
+architectural constraint; there is no reliable way to persist cookies from within
+a Streamlit app without a dedicated server-side session store.
+
 Usage in app.py:
     from auth import check_auth, render_user_badge
     check_auth()   # call before any st.* content; stops unauthenticated users
-    ...
     render_user_badge()  # in sidebar: shows email + sign-out button
 
 Environment variables required:
     GOOGLE_CLIENT_ID      — from GCP Console → APIs & Services → Credentials
     GOOGLE_CLIENT_SECRET  — same credential
     OAUTH_REDIRECT_URI    — must exactly match the URI registered in GCP Console
-                            (e.g. https://prot-prompt.tools.phyx44.com)
+                            e.g. https://prot-prompt.tools.phyx44.com
     ALLOWED_EMAIL_DOMAIN  — e.g. "phyx44.com"  (any @phyx44.com account passes)
     ALLOWED_EMAILS        — optional comma-separated override list
 
@@ -20,13 +28,14 @@ If GOOGLE_CLIENT_ID is not set (local dev), auth is bypassed entirely.
 
 from __future__ import annotations
 
+import html as _html_lib
 import os
-import secrets
+import urllib.parse
 
+import requests as http_requests
 import streamlit as st
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
-from google_auth_oauthlib.flow import Flow
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -34,42 +43,50 @@ _CLIENT_ID      = os.getenv("GOOGLE_CLIENT_ID", "")
 _CLIENT_SECRET  = os.getenv("GOOGLE_CLIENT_SECRET", "")
 _REDIRECT_URI   = os.getenv("OAUTH_REDIRECT_URI", "https://prot-prompt.tools.phyx44.com")
 _ALLOWED_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "phyx44.com")
-_ALLOWED_EMAILS = os.getenv("ALLOWED_EMAILS", "")   # comma-separated, optional override
+_ALLOWED_EMAILS = os.getenv("ALLOWED_EMAILS", "")  # comma-separated, optional override
 
-_SCOPES = [
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-]
+_AUTH_URL  = "https://accounts.google.com/o/oauth2/auth"
+_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_SCOPES    = "openid email profile"
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _is_allowed(email: str) -> bool:
-    """Return True if the email matches the allowed domain or explicit list."""
     email = email.lower().strip()
     if _ALLOWED_EMAILS:
-        allowed = {e.strip().lower() for e in _ALLOWED_EMAILS.split(",")}
-        return email in allowed
+        for entry in _ALLOWED_EMAILS.split(","):
+            entry = entry.strip().lower()
+            if entry.startswith("@") and email.endswith(entry):
+                return True
+            if entry == email:
+                return True
+        return False
     return email.endswith(f"@{_ALLOWED_DOMAIN}")
 
 
-def _make_flow() -> Flow:
-    """Build an OAuth2 Flow from env config."""
-    client_config = {
-        "web": {
-            "client_id": _CLIENT_ID,
-            "client_secret": _CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [_REDIRECT_URI],
-        }
+def _build_auth_url() -> str:
+    params = {
+        "client_id":     _CLIENT_ID,
+        "redirect_uri":  _REDIRECT_URI,
+        "response_type": "code",
+        "scope":         _SCOPES,
+        "prompt":        "select_account",
+        "access_type":   "offline",
     }
-    return Flow.from_client_config(
-        client_config,
-        scopes=_SCOPES,
-        redirect_uri=_REDIRECT_URI,
-    )
+    return _AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+
+def _exchange_code(code: str) -> dict:
+    resp = http_requests.post(_TOKEN_URL, data={
+        "code":          code,
+        "client_id":     _CLIENT_ID,
+        "client_secret": _CLIENT_SECRET,
+        "redirect_uri":  _REDIRECT_URI,
+        "grant_type":    "authorization_code",
+    })
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -78,30 +95,26 @@ def check_auth() -> None:
     """
     Gate the app behind Google OAuth.
 
-    - If GOOGLE_CLIENT_ID is not configured: no-op (local dev mode).
-    - If session already authenticated: returns immediately.
-    - If Google has redirected back with ?code=...: exchanges code for token,
-      verifies email, stores in session_state, clears query params, reruns.
-    - Otherwise: renders the sign-in page and calls st.stop().
+    - No-op if GOOGLE_CLIENT_ID is not set (local dev mode).
+    - Returns immediately if session is already authenticated.
+    - If ?code=... is present: exchanges code, verifies email, stores session.
+    - Otherwise: renders sign-in page and calls st.stop().
     """
-    # Local dev — skip auth if credentials not configured
     if not _CLIENT_ID or not _CLIENT_SECRET:
         return
 
-    # Already authenticated this session
     if st.session_state.get("_auth_email"):
         return
 
     params = st.query_params
 
-    # ── Handle OAuth callback (Google redirected back with ?code=...) ──────────
+    # ── Handle OAuth callback ──────────────────────────────────────────────────
     if "code" in params:
         try:
-            flow = _make_flow()
-            flow.fetch_token(code=params["code"])
+            token_data = _exchange_code(params["code"])
 
             id_info = id_token.verify_oauth2_token(
-                flow.credentials.id_token,
+                token_data["id_token"],
                 google_requests.Request(),
                 _CLIENT_ID,
             )
@@ -116,6 +129,7 @@ def check_auth() -> None:
 
             st.session_state["_auth_email"] = email
             st.session_state["_auth_name"]  = name
+            st.session_state["_log_session_start"] = True
             st.query_params.clear()
             st.rerun()
 
@@ -131,15 +145,10 @@ def check_auth() -> None:
 
 
 def render_user_badge() -> None:
-    """
-    Show the signed-in user's email in the sidebar with a Sign out button.
-    Call this inside render_sidebar() or directly after check_auth().
-    Safe to call even if auth is disabled (no-op when no email in session).
-    """
+    """Show signed-in email + Sign out button at bottom of sidebar."""
     email = st.session_state.get("_auth_email")
     if not email:
         return
-
     with st.sidebar:
         st.divider()
         name = st.session_state.get("_auth_name", email)
@@ -150,58 +159,60 @@ def render_user_badge() -> None:
             st.rerun()
 
 
-# ── Login page renderer ────────────────────────────────────────────────────────
+# ── Login page ─────────────────────────────────────────────────────────────────
 
 def _render_login_page(error: str | None = None) -> None:
-    """Render the full-page Google sign-in screen."""
-    flow = _make_flow()
-    auth_url, _ = flow.authorization_url(
-        prompt="select_account",
-        access_type="offline",
-    )
-
-    st.markdown(
-        """
-        <style>
-        /* Hide Streamlit chrome on the login page */
-        #MainMenu, header, footer { visibility: hidden; }
-        .block-container { padding-top: 0 !important; }
-        .login-wrap {
-            display: flex; flex-direction: column; align-items: center;
-            justify-content: center; min-height: 80vh; text-align: center;
-        }
-        .login-card {
-            background: #0e1117; border: 1px solid #262730;
-            border-radius: 16px; padding: 3rem 3.5rem; max-width: 440px;
-            box-shadow: 0 4px 32px rgba(0,0,0,0.4);
-        }
-        .login-card h1 { font-size: 2rem; margin-bottom: 0.25rem; }
-        .login-card p  { color: #9099a5; margin-bottom: 1.75rem; }
-        .google-btn {
-            display: inline-flex; align-items: center; gap: 10px;
-            background: #4285F4; color: white !important;
-            padding: 12px 28px; border-radius: 8px;
-            text-decoration: none !important; font-weight: 600;
-            font-size: 15px; transition: background 0.2s;
-        }
-        .google-btn:hover { background: #3367D6; }
-        .error-msg { color: #ff4b4b; margin-top: 1rem; font-size: 14px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    error_html = f'<p class="error-msg">{error}</p>' if error else ""
+    auth_url = _build_auth_url()
+    auth_url_attr = _html_lib.escape(auth_url, quote=True)
+    error_html = f'<p class="error-msg">{_html_lib.escape(error)}</p>' if error else ""
 
     st.markdown(
         f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600&display=swap');
+        #MainMenu, header, footer {{ visibility: hidden; }}
+        .block-container {{ padding-top: 0 !important; }}
+        .login-wrap {{
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; min-height: 80vh; text-align: center;
+            font-family: 'Montserrat', system-ui, sans-serif;
+        }}
+        .login-card {{
+            background: #ffffff;
+            border: 1px solid #e5e5e5;
+            border-radius: 16px;
+            padding: 2.8rem 3rem;
+            max-width: 420px;
+            box-shadow: 0 2px 16px rgba(0,0,0,0.06);
+        }}
+        .login-card h1 {{
+            font-size: 1.2rem; font-weight: 600; color: #111111;
+            margin-bottom: 0.4rem; line-height: 1.35;
+            font-family: 'Montserrat', system-ui, sans-serif;
+        }}
+        .login-card p {{
+            color: #888888; font-size: 0.82rem; margin-bottom: 1.8rem;
+            font-family: 'Montserrat', system-ui, sans-serif;
+        }}
+        .google-btn {{
+            display: inline-flex; align-items: center; gap: 10px;
+            background: #00d4aa; color: #000000 !important;
+            padding: 11px 26px; border-radius: 8px;
+            text-decoration: none !important; font-weight: 600;
+            font-size: 0.85rem; letter-spacing: 0.02em;
+            font-family: 'Montserrat', system-ui, sans-serif;
+            transition: background 0.18s;
+        }}
+        .google-btn:hover {{ background: #00b894; }}
+        .error-msg {{ color: #e05050; margin-top: 1rem; font-size: 0.8rem; }}
+        </style>
         <div class="login-wrap">
           <div class="login-card">
-            <h1>🧬</h1>
-            <h1>ESM3 Protein<br>Engineering Prompter</h1>
+            <div style="font-size:2rem;margin-bottom:.5rem">🧬</div>
+            <h1>Protein Design Tool</h1>
             <p>Sign in with your <strong>@{_ALLOWED_DOMAIN}</strong> account to continue.</p>
-            <a href="{auth_url}" class="google-btn">
-              <svg width="18" height="18" viewBox="0 0 48 48">
+            <a href="{auth_url_attr}" class="google-btn">
+              <svg width="17" height="17" viewBox="0 0 48 48">
                 <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
                 <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
                 <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
