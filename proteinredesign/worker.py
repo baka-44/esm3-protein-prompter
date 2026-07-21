@@ -29,6 +29,8 @@ import tempfile
 import traceback
 from dataclasses import dataclass, field
 
+from proteinredesign.manifest import Preset
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -168,6 +170,14 @@ _CHECKPOINT_FLAG = {
 
 _HEADER_SCORE = re.compile(r"(?:^|,\s*)(?:score|overall_confidence|global_score)=([-\d.]+)")
 
+# Which MPNN checkpoint performs the actual sequence design, per preset. #1 keeps
+# the backbone with no ligand context (ProteinMPNN); #2 conditions on the ligand
+# HETATM already filtered into the PDB by the config builder (LigandMPNN).
+_DESIGN_CHECKPOINT = {
+    Preset.FIXED_BACKBONE_REDESIGN: "proteinmpnn",
+    Preset.LIGAND_AWARE_REDESIGN: "ligand_mpnn",
+}
+
 
 def _fixed_residue_tokens(params: dict) -> str:
     """Author-numbered residue ids for LigandMPNN --fixed_residues, e.g. 'A67 A82' [MPNN-2]."""
@@ -237,60 +247,34 @@ def run_proteinmpnn(
     """
     Design ~`n_seqs` sequences on the fixed backbone (keeping the fixed residues).
     Returns [(sequence, mpnn_score), ...] (score = mean neg-LL, lower = better [MPNN-3]).
+
+    For checkpoint="ligand_mpnn", LigandMPNN's run.py automatically parses and
+    conditions on any HETATM ligand present in the PDB — the caller is responsible
+    for the PDB containing ONLY the intended ligand's HETATM records (see
+    utils.pdb_utils.filter_pdb_keep_ligand, used by the preset #2 config builder).
     """
     out_folder = tempfile.mkdtemp(prefix="mpnn_")
     batch_size = min(max(1, n_seqs), 8)
     n_batches = max(1, -(-n_seqs // batch_size))  # ceil
+    extra = ["--ligand_mpnn_use_atom_context", "1"] if checkpoint == "ligand_mpnn" else None
     _run_ligandmpnn(pdb_path, out_folder, checkpoint, fixed_residue_tokens,
-                    n_batches, batch_size, temperature)
+                    n_batches, batch_size, temperature, extra=extra)
     return _parse_seqs_fasta(out_folder)[:n_seqs]
 
 
 def score_with_checkpoint(sequences: list[str], pdb_path: str, checkpoint: str) -> list[float]:
     """
-    Score existing sequences on the fixed backbone under `checkpoint` (D1 metadata).
-    Best-effort: on any failure returns NaN per sequence so the pipeline still ranks
-    on the remaining signals. Uses LigandMPNN score.py [MPNN-1]; VERIFY its flags/output.
+    Score existing sequences under `checkpoint` (D1 metadata / ranking signal only —
+    never a hard filter). Currently always returns NaN: LigandMPNN's score.py has no
+    way to score an externally-supplied sequence — it evaluates only the sequence
+    already present in the input PDB (no --fasta_path / --sequence flag exists). A
+    real implementation would need to write a copy of the PDB with each candidate
+    sequence's residue identities substituted in, then score that per-sequence PDB
+    with score.py's --single_aa_score / --autoregressive_score mode — non-trivial
+    and not required for MVP (D1 metadata gracefully NaNs; composite ranking already
+    handles NaN in _minmax). Parked as future work, not a preset #2 blocker.
     """
-    model_type, ckpt_flag = _CHECKPOINT_FLAG[checkpoint]
-    workdir = tempfile.mkdtemp(prefix="mpnnscore_")
-    fasta = os.path.join(workdir, "seqs.fa")
-    with open(fasta, "w") as fh:
-        for i, s in enumerate(sequences):
-            fh.write(f">seq_{i}\n{s}\n")
-    out = os.path.join(workdir, "out")
-    try:
-        subprocess.run(
-            ["python", os.path.join(_LIGANDMPNN_DIR, "score.py"),
-             "--model_type", model_type, ckpt_flag, _mpnn_checkpoint_path(checkpoint),
-             "--pdb_path", pdb_path, "--fasta_path", fasta, "--out_folder", out,
-             "--use_sequence", "1"],
-            check=True, cwd=_LIGANDMPNN_DIR,
-        )
-        return _parse_score_stats(out, len(sequences))
-    except Exception as exc:  # noqa: BLE001 — metadata scoring is non-critical
-        _log(f"WARN score_with_checkpoint({checkpoint}) failed: {exc}")
-        return [float("nan")] * len(sequences)
-
-
-def _parse_score_stats(out_folder: str, n: int) -> list[float]:
-    """Read LigandMPNN score.py stats (.pt) → per-sequence scores [MPNN-1]. NaN if unreadable."""
-    files = sorted(glob.glob(os.path.join(out_folder, "**", "*.pt"), recursive=True))
-    if not files:
-        return [float("nan")] * n
-    try:
-        import torch
-        stats = torch.load(files[0], map_location="cpu")
-        # score.py stores a per-sequence score tensor/array under a "score"-like key.
-        for key in ("score", "scores", "global_score", "overall_confidence"):
-            if key in stats:
-                vals = stats[key]
-                vals = vals.tolist() if hasattr(vals, "tolist") else list(vals)
-                flat = [float(v) for v in (vals if isinstance(vals, list) else [vals])]
-                return (flat + [float("nan")] * n)[:n]
-    except Exception as exc:  # noqa: BLE001
-        _log(f"WARN _parse_score_stats: {exc}")
-    return [float("nan")] * n
+    return [float("nan")] * len(sequences)
 
 
 _esmfold_model = None
@@ -382,11 +366,12 @@ def run_pipeline(manifest, workdir: str) -> dict:
     """
     from proteinredesign import jobstore
     from proteinredesign import storage
-    from proteinredesign.manifest import JobStatus, Preset
+    from proteinredesign.manifest import JobStatus
 
-    if manifest.preset is not Preset.FIXED_BACKBONE_REDESIGN:
+    design_checkpoint = _DESIGN_CHECKPOINT.get(manifest.preset)
+    if design_checkpoint is None:
         raise NotImplementedError(
-            f"Increment 1 implements preset #1 only; got {manifest.preset.value}."
+            f"Preset {manifest.preset.value} not yet implemented in the worker."
         )
 
     job_id = manifest.job_id
@@ -401,10 +386,12 @@ def run_pipeline(manifest, workdir: str) -> dict:
     pdb_path = os.path.join(workdir, "input.pdb")
     storage.download_to_path(manifest.pdb_uri, pdb_path)
 
-    # 1. ProteinMPNN design (over-generate).
-    jobstore.update_job(job_id, stage="ProteinMPNN design", progress=0.2)
-    designed = run_proteinmpnn(pdb_path, fixed_tokens, n_seqs=n_generate, checkpoint="proteinmpnn")
-    candidates = [Candidate(sequence=seq, mpnn_scores={"proteinmpnn": score})
+    # 1. MPNN design (over-generate). Checkpoint depends on the preset (D6): plain
+    # ProteinMPNN for #1, LigandMPNN for #2 (conditions on the ligand already
+    # filtered into the PDB by the preset #2 config builder).
+    jobstore.update_job(job_id, stage=f"{design_checkpoint} design", progress=0.2)
+    designed = run_proteinmpnn(pdb_path, fixed_tokens, n_seqs=n_generate, checkpoint=design_checkpoint)
+    candidates = [Candidate(sequence=seq, mpnn_scores={design_checkpoint: score})
                   for seq, score in designed]
 
     # 2. Multi-checkpoint scoring (D1) — SolubleMPNN as additional metadata.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 from proteinredesign.config_builders.preset1 import Preset1Config, build_preset1_config
+from proteinredesign.config_builders.preset2 import Preset2Config, build_preset2_config
 from proteinredesign.manifest import JobManifest, Preset
 
 
@@ -59,6 +60,53 @@ def submit_preset1(
         manifest,
         manifest_uri=manifest_uri,
         title=f"Fixed-backbone redesign · {cfg.mapping_summary or fixed_residues_str}",
+    )
+
+    _trigger_job(manifest_uri)
+    return rec, cfg
+
+
+def submit_preset2(
+    *,
+    pdb_bytes: bytes,
+    pdb_filename: str,
+    ligand_key: tuple[str, str, int],
+    fixed_residues_str: str,
+    chain_id: str | None,
+    user_email: str,
+    num_outputs: int = 10,
+):
+    """
+    Validate inputs, persist them, and launch a preset #2 (ligand-aware redesign) job.
+
+    Returns (JobRecord, Preset2Config). Raises ConfigError on invalid input
+    (before anything is uploaded). Uploads the FILTERED PDB (only the chosen
+    ligand's HETATM kept) — not the raw upload — so the worker never has to
+    repeat the ligand-selection/filtering step.
+    """
+    cfg: Preset2Config = build_preset2_config(
+        pdb_bytes, ligand_key, fixed_residues_str, chain_id=chain_id
+    )
+
+    manifest = JobManifest(
+        preset=Preset.LIGAND_AWARE_REDESIGN,
+        user_email=user_email,
+        pdb_uri="",  # set after upload
+        params=cfg.to_params(),
+        num_outputs=num_outputs,
+    )
+
+    from proteinredesign import jobstore, storage
+
+    manifest.pdb_uri = storage.put_input_pdb(
+        manifest.job_id, cfg.filtered_pdb_bytes, filename=pdb_filename or "input.pdb"
+    )
+    manifest_uri = storage.write_manifest(manifest.job_id, manifest.to_json())
+
+    rec = jobstore.create_job(
+        manifest,
+        manifest_uri=manifest_uri,
+        title=f"Ligand-aware redesign · {cfg.ligand.resname} ({cfg.ligand.chain_id}#{cfg.ligand.res_seq})",
     )
 
     _trigger_job(manifest_uri)
