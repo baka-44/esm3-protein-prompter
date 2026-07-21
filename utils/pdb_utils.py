@@ -10,6 +10,7 @@ Provides helpers to:
 
 import io
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -264,3 +265,109 @@ def extract_motif_by_source_indices(
 def pdb_bytes_to_string(pdb_bytes: bytes) -> str:
     """Decode PDB bytes to string, stripping null bytes."""
     return pdb_bytes.decode(errors="replace").replace("\x00", "")
+
+
+# ── Ligand detection (preset #2 — D8/B6) ───────────────────────────────────────
+# Waters, common crystallographic ions, and cryo/buffer additives are excluded from
+# the ligand picker by default so scientists only confirm among plausible ligands.
+# Not exhaustive — a curated, adjustable list, not a comprehensive PDB ontology.
+_SOLVENT_ION_ADDITIVE_BLOCKLIST = frozenset({
+    # waters
+    "HOH", "WAT", "DOD", "H2O", "OH2",
+    # common monoatomic/small ions
+    "NA", "K", "CL", "MG", "CA", "ZN", "MN", "FE", "FE2", "CU", "CU1", "NI", "CO",
+    "CD", "HG", "LI", "RB", "CS", "BA", "SR", "AL", "PB", "AG", "AU", "PT", "BR",
+    "IOD", "F", "GD", "LA", "CE", "EU", "TB", "YB", "3CO", "3NI", "NH4",
+    # common cryoprotectant / crystallization buffer additives
+    "GOL", "EDO", "PEG", "PG4", "1PE", "PGE", "MPD", "DMS", "ACT", "TRS", "BME",
+    "CIT", "FMT", "SO4", "PO4", "NO3", "IMD", "BOG", "EPE", "MES", "BU2", "BU3",
+    "12P", "P6G", "PEP", "UNX", "UNL", "ACE",
+})
+
+
+@dataclass
+class HetGroup:
+    """A candidate ligand: one HETATM residue group in the uploaded PDB."""
+
+    resname: str
+    chain_id: str
+    res_seq: int   # PDB author residue number
+    atom_count: int
+
+    @property
+    def key(self) -> tuple[str, str, int]:
+        return (self.resname, self.chain_id, self.res_seq)
+
+    def label(self) -> str:
+        return f"{self.resname} · chain {self.chain_id} · residue {self.res_seq} · {self.atom_count} atoms"
+
+
+def get_hetatm_groups(pdb_source: str | bytes | Path, chain_id: str | None = None) -> list["HetGroup"]:
+    """
+    Return candidate ligand HETATM groups in the PDB, excluding common solvents,
+    ions, and crystallization additives (see _SOLVENT_ION_ADDITIVE_BLOCKLIST).
+
+    Args:
+        pdb_source: PDB file path or raw content.
+        chain_id:   If given, only groups on this chain are returned.
+
+    Returns:
+        List of HetGroup, one per distinct (resname, chain, residue number).
+    """
+    structure = parse_pdb(pdb_source)
+    model = structure[0]
+
+    groups: list[HetGroup] = []
+    for chain in model:
+        if chain_id is not None and chain.id != chain_id:
+            continue
+        for residue in chain:
+            if residue.id[0] == " ":
+                continue  # standard amino acid — not a HETATM group
+            resname = residue.get_resname().strip()
+            if resname in _SOLVENT_ION_ADDITIVE_BLOCKLIST:
+                continue
+            groups.append(HetGroup(
+                resname=resname,
+                chain_id=chain.id,
+                res_seq=residue.id[1],
+                atom_count=sum(1 for _ in residue.get_atoms()),
+            ))
+    return groups
+
+
+def filter_pdb_keep_ligand(pdb_source: str | bytes | Path, ligand: tuple[str, str, int]) -> bytes:
+    """
+    Return PDB bytes with all standard protein ATOM records kept, plus HETATM
+    records ONLY for the selected ligand group. All other HETATMs (waters, other
+    buffer/ions, unselected ligand candidates) are dropped, so LigandMPNN's
+    automatic ligand-context parsing sees only the intended ligand.
+
+    Args:
+        pdb_source: PDB file path or raw content.
+        ligand:     (resname, chain_id, res_seq) identifying the group to keep —
+                    as returned by HetGroup.key from get_hetatm_groups().
+
+    Returns:
+        PDB file content as bytes.
+    """
+    from Bio.PDB import PDBIO, Select
+
+    resname, chain_id, res_seq = ligand
+    structure = parse_pdb(pdb_source)
+
+    class _LigandSelect(Select):
+        def accept_residue(self, residue):
+            if residue.id[0] == " ":
+                return True  # keep all standard protein residues
+            return (
+                residue.get_resname().strip() == resname
+                and residue.get_parent().id == chain_id
+                and residue.id[1] == res_seq
+            )
+
+    io_writer = PDBIO()
+    io_writer.set_structure(structure)
+    buf = io.StringIO()
+    io_writer.save(buf, select=_LigandSelect())
+    return buf.getvalue().encode()
