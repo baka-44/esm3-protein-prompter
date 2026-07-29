@@ -98,17 +98,56 @@ def _render_results(job) -> None:
     ])
     st.dataframe(df, hide_index=True, use_container_width=True)
 
-    # Bulk FASTA download (fetched from GCS).
-    try:
-        from proteinredesign import storage
-        fasta = storage.download_bytes(storage.output_uri(job.job_id, "candidates.fasta"))
-        st.download_button(
-            "⬇️ Download all as FASTA", data=fasta,
-            file_name=f"{job.job_id}_candidates.fasta", mime="text/plain",
-            key=f"dl_fasta_{job.job_id}",
-        )
-    except Exception:
-        pass
+    # Bulk downloads — FASTA (sequences) and a zip of every candidate's ESMFold
+    # structure (both already persisted to GCS by the worker).
+    pdb_names = tuple(c["pdb"] for c in cands if c.get("pdb"))
+    col_fasta, col_pdb = st.columns(2)
+
+    with col_fasta:
+        try:
+            from proteinredesign import storage
+            fasta = storage.download_bytes(storage.output_uri(job.job_id, "candidates.fasta"))
+            st.download_button(
+                "⬇️ Download all as FASTA", data=fasta,
+                file_name=f"{job.job_id}_candidates.fasta", mime="text/plain",
+                key=f"dl_fasta_{job.job_id}", use_container_width=True,
+            )
+        except Exception:
+            pass
+
+    with col_pdb:
+        if pdb_names:
+            try:
+                zip_bytes = _build_pdb_zip(job.job_id, pdb_names)
+                st.download_button(
+                    "⬇️ Download all PDBs (.zip)", data=zip_bytes,
+                    file_name=f"{job.job_id}_pdbs.zip", mime="application/zip",
+                    key=f"dl_pdbzip_{job.job_id}", use_container_width=True,
+                )
+            except Exception:
+                pass
+
+
+@st.cache_data(show_spinner=False)
+def _build_pdb_zip(job_id: str, pdb_names: tuple[str, ...]) -> bytes:
+    """
+    Fetch each candidate's ESMFold PDB from GCS and bundle them into a zip.
+    Cached by (job_id, pdb_names) so the GCS reads happen once per job rather
+    than on every dashboard re-render/poll.
+    """
+    import io
+    import zipfile
+
+    from proteinredesign import storage
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in pdb_names:
+            pdb = storage.download_bytes(storage.output_uri(job_id, name))
+            # Prefix with the job id so extracting multiple jobs' zips into one
+            # folder doesn't collide (candidate_1.pdb -> <job>_candidate_1.pdb).
+            zf.writestr(f"{job_id}_{name}", pdb)
+    return buf.getvalue()
 
 
 def _ago(ts: float) -> str:
