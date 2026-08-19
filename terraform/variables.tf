@@ -25,8 +25,19 @@ variable "job_name" {
 
 variable "worker_image" {
   type        = string
-  description = "Full Artifact Registry image ref for the worker (built from proteinredesign/Dockerfile.worker)."
+  description = "Full Artifact Registry image ref for the MPNN worker (built from proteinredesign/Dockerfile.worker)."
   # e.g. us-central1-docker.pkg.dev/<project>/proteinredesign/worker:latest
+}
+
+variable "rf3_job_name" {
+  type    = string
+  default = "proteinredesign-rf3-worker"
+}
+
+variable "rf3_worker_image" {
+  type        = string
+  description = "Full Artifact Registry image ref for the RF3 worker (built from proteinredesign/Dockerfile.rf3worker). Python 3.12 / foundry base — serves RF3 presets (#8, later #3/#6). See D11."
+  # e.g. us-central1-docker.pkg.dev/<project>/proteinredesign/rf3-worker:latest
 }
 
 variable "frontend_service_account" {

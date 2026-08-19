@@ -84,18 +84,32 @@ def _render_results(job) -> None:
         st.warning("No candidates passed QC. Try loosening constraints or increasing outputs.")
         return
 
-    df = pd.DataFrame([
-        {
+    # "Diversity" (RF3 drift-from-input, Å) is only meaningful for RF3 presets
+    # (scaffold diversification) — show the column only when candidates carry it.
+    def _is_num(v) -> bool:
+        return isinstance(v, (int, float)) and v == v  # not None, not NaN
+
+    has_diversity = any(_is_num(c.get("diversity_from_input")) for c in cands)
+
+    def _row(c: dict) -> dict:
+        row = {
             "Rank": c["rank"],
             "Score": round(c.get("composite_score", 0.0), 3),
             "ESM2": round(c.get("esm2_score", 0.0), 3),
             "pLDDT": round(c.get("plddt", 0.0), 1),
             "RMSD Å": round(c.get("rmsd_to_design", 0.0), 2),
-            "Length": len(c.get("sequence", "")),
-            "Sequence (preview)": c.get("sequence", "")[:40] + ("…" if len(c.get("sequence", "")) > 40 else ""),
         }
-        for c in cands
-    ])
+        if has_diversity:
+            d = c.get("diversity_from_input")
+            row["Diversity Å"] = round(d, 2) if _is_num(d) else "—"
+        row["Length"] = len(c.get("sequence", ""))
+        row["Sequence (preview)"] = c.get("sequence", "")[:40] + ("…" if len(c.get("sequence", "")) > 40 else "")
+        return row
+
+    df = pd.DataFrame([_row(c) for c in cands])
+    if has_diversity:
+        st.caption("**RMSD Å** = self-consistency vs the generated backbone (lower = better). "
+                   "**Diversity Å** = drift from the original input backbone (higher = more novel).")
     st.dataframe(df, hide_index=True, use_container_width=True)
 
     # Bulk downloads — FASTA (sequences) and a zip of every candidate's ESMFold

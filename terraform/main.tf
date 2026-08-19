@@ -179,3 +179,60 @@ resource "google_cloud_run_v2_job" "worker" {
 
   depends_on = [google_project_service.apis]
 }
+
+# ── Cloud Run Job — RF3 GPU worker (D11: second image / second job) ────────────
+# Serves RF3-diffusion presets (#8 scaffold diversification; later #3/#6). Identical
+# infra to `worker` (same SA, buckets, L4, scale-to-zero) — ONLY the image differs
+# (Python 3.12 / foundry base). A Cloud Run Job's image is fixed in its template, so
+# a second job is how the frontend routes RF3 presets to the RF3 image. Idle = $0.
+resource "google_cloud_run_v2_job" "rf3_worker" {
+  name                = var.rf3_job_name
+  location            = var.region
+  deletion_protection = false
+
+  template {
+    template {
+      timeout         = "3600s"
+      max_retries     = 1
+      service_account = google_service_account.worker.email
+
+      gpu_zonal_redundancy_disabled = true
+      node_selector {
+        accelerator = "nvidia-l4"
+      }
+
+      containers {
+        image = var.rf3_worker_image
+        resources {
+          limits = {
+            cpu              = "8"
+            memory           = "32Gi"
+            "nvidia.com/gpu" = "1"
+          }
+        }
+        env {
+          name  = "GCP_PROJECT"
+          value = var.project_id
+        }
+        env {
+          name  = "GCP_REGION"
+          value = var.region
+        }
+        env {
+          name  = "PROTEINREDESIGN_INPUTS_BUCKET"
+          value = google_storage_bucket.inputs.name
+        }
+        env {
+          name  = "PROTEINREDESIGN_OUTPUTS_BUCKET"
+          value = google_storage_bucket.outputs.name
+        }
+        env {
+          name  = "PROTEINREDESIGN_WEIGHTS_BUCKET"
+          value = google_storage_bucket.weights.name
+        }
+      }
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
