@@ -368,19 +368,23 @@ def esm2_scores(sequences: list[str]) -> list[float]:
 # (above) design + QC the sequence. This adapter runs ONLY in the rf3-worker image
 # (D11) — the mpnn-worker image (#1/#2) never imports/executes it.
 #
-# NOTE — interface assumptions to VERIFY at container-build / de-risk time against
-# the pinned foundry `rfd3` version (mirrors the [MPNN-*]/[ESM-*] verification notes):
-#   [RF3-1] CLI: `rfd3 design inputs=<cfg.json> out_dir=<dir>` (hydra key=value style);
-#           confirm the exact design entrypoint + arg names from foundry docs.
-#   [RF3-2] Input JSON fields: {"input": <pdb>, "contig": "<chain>1-<L>", "partial_t": <Å>}.
-#           partial_t is a NOISE MAGNITUDE IN Å (recommended 5–15), not a timestep count.
-#   [RF3-3] Number of designs (K): confirm the flag (e.g. inference.num_designs / a
-#           per-input replicate count) — assumed `num_designs` here.
-#   [RF3-4] Checkpoint location: `foundry install rfd3 --checkpoint-dir <dir>`; we point
-#           it at the GCS-synced weights dir (subdir "rfdiffusion").
-#   [RF3-5] Output: one backbone PDB per design under out_dir (glob "*.pdb").
+# Interface VERIFIED 2026-08-19 against foundry 0.2.0 (`rfd3` / models/rfd3 docs):
+#   [RF3-1] CLI: `rfd3 design out_dir=<dir> inputs=<cfg.json> ckpt_path=<file> \
+#           diffusion_batch_size=<K> skip_existing=False` (hydra key=value overrides).
+#   [RF3-2] Input JSON is {<run_name>: <InputSpecification>}. For whole-backbone
+#           diversification the minimal spec is {"input": <pdb>, "partial_t": <Å>} —
+#           NO contig needed (docs' minimal partial-diffusion example), which also
+#           sidesteps RF3 contig author-numbering. partial_t is a NOISE MAGNITUDE in Å
+#           (recommended 5–15), not a timestep count. (Multi-chain inputs diffuse all
+#           chains; the config builder warns when the PDB has >1 chain — MVP scope.)
+#   [RF3-3] Number of designs (K) = `diffusion_batch_size` (default 8).
+#   [RF3-4] Checkpoint: single file `rfd3_latest.ckpt`, passed as `ckpt_path=`. Synced
+#           from the GCS weights bucket subdir "rfdiffusion" via ensure_weights (A6).
+#   [RF3-5] Output: one `*.cif.gz` (+ `.json`) per design under out_dir — converted to
+#           PDB here for the downstream ProteinMPNN stage (which reads PDB).
 
 _RFD3_CMD = os.getenv("RFD3_CMD", "rfd3")
+_RFD3_CKPT_NAME = os.getenv("RFD3_CKPT_NAME", "rfd3_latest.ckpt")
 
 
 def _rf3_weights_dir() -> str:
@@ -388,9 +392,25 @@ def _rf3_weights_dir() -> str:
     return ensure_weights("rfdiffusion")
 
 
+def _cif_gz_to_pdb(cif_gz_path: str) -> str:
+    """Decompress an RF3 `.cif.gz` design and write it back out as a `.pdb` [RF3-5]."""
+    import gzip
+
+    from Bio.PDB import MMCIFParser, PDBIO
+
+    cif_path = cif_gz_path[:-3] if cif_gz_path.endswith(".gz") else cif_gz_path + ".cif"
+    with gzip.open(cif_gz_path, "rt") as fi, open(cif_path, "w") as fo:
+        fo.write(fi.read())
+    structure = MMCIFParser(QUIET=True).get_structure("rf3", cif_path)
+    pdb_path = cif_path.rsplit(".", 1)[0] + ".pdb"
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(pdb_path)
+    return pdb_path
+
+
 def run_rf3_partial(
     input_pdb_path: str,
-    contig: str,
     partial_t: float,
     num_designs: int,
     out_dir: str,
@@ -399,31 +419,32 @@ def run_rf3_partial(
     RF3 partial diffusion: partially noise the whole backbone (`partial_t` Å) and
     re-denoise to `num_designs` structurally-diverse-but-related backbones.
 
-    Returns a list of generated backbone PDB paths (one per design). See the
-    [RF3-*] verification notes above — exact foundry CLI/arg names are pinned at
-    container-build time.
+    Returns a list of generated backbone PDB paths (one per design), converted from
+    RF3's native `.cif.gz` output. See the [RF3-*] verification notes above.
     """
     os.makedirs(out_dir, exist_ok=True)
-    cfg = {"input": input_pdb_path, "contig": contig, "partial_t": float(partial_t)}
+    spec = {"diversify": {"input": input_pdb_path, "partial_t": float(partial_t)}}
     cfg_path = os.path.join(out_dir, "rfd3_input.json")
     with open(cfg_path, "w") as fh:
-        json.dump(cfg, fh)
+        json.dump(spec, fh)
 
+    ckpt_path = os.path.join(_rf3_weights_dir(), _RFD3_CKPT_NAME)
     cmd = [
         _RFD3_CMD, "design",
-        f"inputs={cfg_path}",
         f"out_dir={out_dir}",
-        f"num_designs={int(num_designs)}",
-        f"checkpoint_dir={_rf3_weights_dir()}",
+        f"inputs={cfg_path}",
+        f"ckpt_path={ckpt_path}",
+        f"diffusion_batch_size={int(num_designs)}",
+        "skip_existing=False",
     ]
     subprocess.run(cmd, check=True)
 
-    backbones = sorted(glob.glob(os.path.join(out_dir, "**", "*.pdb"), recursive=True))
-    if not backbones:
+    cifs = sorted(glob.glob(os.path.join(out_dir, "**", "*.cif.gz"), recursive=True))
+    if not cifs:
         raise RuntimeError(
-            f"RF3 produced no backbone PDBs in {out_dir} (contig={contig}, partial_t={partial_t})."
+            f"RF3 produced no design outputs (*.cif.gz) in {out_dir} (partial_t={partial_t})."
         )
-    return backbones
+    return [_cif_gz_to_pdb(c) for c in cifs]
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -436,7 +457,6 @@ def _generate_rf3_candidates(
     candidates, each tagged with its parent backbone for dual-QC (D10.2/D10.3).
     """
     params = manifest.params
-    contig = params["contig"]
     partial_t = float(params["partial_t"])
     k = int(params["k"])
     m = int(params["m"])
@@ -444,7 +464,7 @@ def _generate_rf3_candidates(
     jobstore.update_job(job_id, stage="RF3 partial diffusion", progress=0.15)
     rf3_dir = os.path.join(workdir, "rf3")
     backbones = run_rf3_partial(
-        input_pdb_path, contig=contig, partial_t=partial_t, num_designs=k, out_dir=rf3_dir
+        input_pdb_path, partial_t=partial_t, num_designs=k, out_dir=rf3_dir
     )
 
     candidates: list[Candidate] = []
