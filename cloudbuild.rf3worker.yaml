@@ -1,0 +1,19 @@
+# Cloud Build config for the proteinredesign RF3 GPU worker image (D11 — second image).
+# Serves RF3-diffusion presets (#8 scaffold diversification). Built on the foundry base;
+# see proteinredesign/Dockerfile.rf3worker.
+# Build:  gcloud builds submit --config cloudbuild.rf3worker.yaml --project=phyx44-proteinredesign-v1 .
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'proteinredesign/Dockerfile.rf3worker'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/phyx44-proteinredesign-v1/proteinredesign/rf3-worker:latest'
+      - '.'
+timeout: 3600s
+images:
+  - 'us-central1-docker.pkg.dev/phyx44-proteinredesign-v1/proteinredesign/rf3-worker:latest'
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 200
