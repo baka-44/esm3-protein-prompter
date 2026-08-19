@@ -250,6 +250,92 @@ attribution**. Keeps the A4 monolith simple (one diffusion model).
 - **Default MPNN checkpoint for #1 fixed-backbone redesign: ProteinMPNN** (SolubleMPNN available
   as an option / for scoring per D1).
 
+### D10 — Scaffold diversification preset (#8 / UI "Scaffold diversification") — build decisions
+First RFdiffusion-requiring preset to ship; chosen deliberately as the **lowest-risk way to stand
+up RF3 in the worker** (partial diffusion = one input backbone + one noise dial, no motif-placement
+or residue-index mapping). Decisions locked with the user (2026-08-19):
+
+- **D10.1 — RF3 partial diffusion** (not classic RFdiffusion). Consistent with D6 (one diffusion
+  model across #3/#6/#8). **✅ VERIFIED 2026-08-19** (foundry `production` branch, model `rfd3`):
+  - **Partial diffusion IS supported.** Parameter is **`partial_t`** — note it is a *noise
+    magnitude in Å* (recommended **5.0–15.0 Å**; start ~2 Å and increase), **not** a timestep
+    count, and it does *not* change `num_timesteps`. More Å → more diversity. Input is JSON/YAML.
+  - **Minimal whole-protein-diversification config confirmed** — single chain, no motif, no
+    binder/hotspots, nothing fixed (everything unfixes by default):
+    `{"input": "prot.pdb", "contig": "A1-<L>", "partial_t": <Å>}`; run `rfd3 design inputs=cfg.json`.
+    This is the *simplest* RF3 mode — validates the "lowest-risk RF3 bring-up" rationale for #8.
+  - **⚠️ Known caveat (foundry issue #153, closed, no maintainer reply):** RF3 partial diffusion
+    lost binding-site constraints on a **binder** (spurious transmembrane helices). That failure
+    mode is **hotspot/binder-specific** — our no-hotspot whole-protein diversification avoids it —
+    but confirm empirically on the first real run (part of deploy task).
+  - **License: BSD 3-Clause** (repo `LICENSE.md`, SPDX `BSD-3-Clause`; no separate weights license
+    or non-commercial/academic carve-out found in `models/rfd3/`). **This supersedes the CC BY 4.0
+    assumption in D6/D9** — RF3 is *more* permissive than assumed (BSD needs no attribution beyond
+    retaining the copyright notice in redistributed source). Residual: weights download via
+    `foundry install rfd3` from a separate checkpoint host — confirm no click-through terms at
+    install; keep the credits footnote regardless (good practice).
+  - **🔴 Integration finding — RF3 does NOT drop into the current worker container.** `rc-foundry`
+    requires **Python ≥ 3.12** + `torch ≥ 2.2` + NVIDIA `cuequivariance_*_cu12` ops; our worker
+    image is **Python 3.10** (Ubuntu 22.04 default). **Recommended container-strategy change:** base
+    `Dockerfile.worker` on the official **`rosettacommons/foundry`** image (bundles RF3 + Py3.12 +
+    weights; "slim" tag can fetch weights) and layer LigandMPNN + ESMFold + our pipeline on top —
+    rather than pip-installing RF3 into the existing 3.10 image. Keeps the A4 monolith. **Must
+    re-verify** the MPNN/ESMFold/ESM2 stack (currently 3.10) runs under 3.12 on the new base.
+    Weights → pre-download with `foundry install rfd3` and push to `gs://…-weights/rfdiffusion/`
+    (same GCS pattern as `esmfold/`); exact checkpoint size TBD empirically (docs don't state).
+- **D10.2 — Dual QC reference.** The self-consistency hard gate (pLDDT + RMSD) is measured against
+  **each candidate's own RF3-generated backbone** — NOT the input (partial diffusion intentionally
+  moves the backbone, so RMSD-to-input is large by design and would reject everything). Separately,
+  **RMSD-to-input is reported as a "diversity / drift-from-input" metric** — a first-class results
+  column, since controllable drift *is* this preset's scientific signal. Requires the pipeline to
+  track candidate→parent-backbone parentage and a per-preset choice of RMSD reference (contained
+  change to `run_pipeline`; all RF3 presets will need this branch).
+- **D10.3 — Two-level fan-out via user sliders (replaces the fixed num_outputs + OVERGEN_FACTOR
+  for this preset).** `K` = number of RF3 backbones (slider **1–N**, N=10 max); `M` = MPNN
+  sequences per backbone (slider **1–10**); total raw designs = K×M, all folded through ESMFold
+  QC, final results = all QC-passed, ranked (cap K×M). Plus a **diversity slider** → RF3
+  `partial_T` (low/med/high noise level).
+- **D10.4 — UI surface:** one input PDB + K slider + M slider + diversity slider + **optional**
+  chain selector. **No fixed residues** in the base version (that's motif scaffolding #3 territory).
+- **D10.5 — Compute guardrail (open, proposed).** Worst case K=10×M=10 = **100 ESMFold folds** +
+  10 RF3 partial runs; on L4 that risks approaching/exceeding the **3600 s** job timeout for
+  larger proteins. **Proposed:** surface a UI time-estimate warning above a K×M threshold (mirror
+  the ESM3 app's `n_candidates>20` warning) and/or a soft cap on K×M; bump the Cloud Run Job
+  timeout only if needed. Confirm approach at implementation.
+
+### D11 — Container architecture: TWO images / TWO jobs (supersedes A4 monolith for the RF3 tier)
+**Decided 2026-08-19.** A4's single-monolith choice is **revised** in light of D10.1's finding that
+RF3 requires **Python 3.12** while the working #1/#2 stack is **Python 3.10**. Rather than migrate
+the proven prod presets into a shared 3.12 image, split by preset family:
+
+- **`mpnn-worker`** (existing image, Python 3.10 — MPNN + ESMFold + ESM2): serves #1, #2.
+  **Never rebuilt for RF3 work** → zero regression risk to working prod presets.
+- **`rf3-worker`** (new image, Python 3.12 on the official `rosettacommons/foundry` base —
+  RF3 + MPNN + ESMFold + ESM2): serves #8 (and later #3/#6). **Self-contained**: runs the whole
+  `RF3 → MPNN → ESMFold` pipeline in **one job execution** (no cross-container chaining — the clean
+  `submit→job→done` model is preserved).
+
+**Why two Cloud Run Jobs (not one job routing by a preset var):** a Cloud Run Job's **image is
+fixed in its template** — per-execution `Overrides` can set env/args/resources/timeout but **not the
+image**. So one job ⟺ one image; two images necessarily means two jobs. The preset→image routing
+therefore lives at the **frontend** (`submit.py` maps preset → job name, like `_DESIGN_CHECKPOINT`
+maps preset → checkpoint today). The second job is cheap: **scales to zero ($0 idle)**, shares the
+**same buckets / Firestore / worker SA**; only the image + Python differ. Terraform = a near-copy of
+the existing job block.
+
+**Weights are NOT duplicated (A6 unchanged):** both images fetch weights at runtime from the **same
+GCS weights bucket** via `ensure_weights(subdir)` — `mpnn/`, `esmfold/`, plus a new `rfdiffusion/`
+subdir for RF3. The only thing duplicated between images is the **runtime dependency environment**
+(torch + libs), because the two images sit on different Python/base layers (Artifact Registry can't
+dedupe them). The multi-GB model weights live once in GCS. The tiny ESM2 model (~30 MB) stays baked
+in both (negligible).
+
+**Trade-off accepted:** MPNN/ESMFold deps are installed in both images, and MPNN/ESMFold must be
+re-verified on Python 3.12 in the new image (isolated — if they break there, #1/#2 are untouched).
+Stage-splitting (RF3-only container + shared MPNN/QC, chained across two executions) was rejected
+for MVP — its tighter image isolation isn't worth the two-execution orchestration; revisit only if
+per-stage GPU right-sizing is needed (deferred with A2/A4 scale-out).
+
 ### D9 — Ops / compliance (C)
 - **Budget alerts: not required.** Cost governance is already covered by D4 (scale-to-zero,
   dedicated project/folder = single billing line, 6-month review reminder); auto-disable-billing

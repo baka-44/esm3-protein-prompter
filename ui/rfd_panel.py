@@ -20,7 +20,8 @@ _PRESETS = [
      "Redesign a protein around a bound ligand — upload a protein–ligand complex PDB."),
     ("Motif scaffolding", False, "Build a new protein around a fixed motif (RFdiffusion3). Coming soon."),
     ("Enzyme active-site scaffolding", False, "Scaffold an enzyme around a catalytic site (RF3 all-atom). Coming soon."),
-    ("Scaffold diversification", False, "Generate variants of a structure (partial diffusion). Coming soon."),
+    ("Scaffold diversification", True,
+     "Generate structurally-diverse variants of a backbone (RF3 partial diffusion), same length and fold."),
 ]
 
 
@@ -48,6 +49,8 @@ def render_rfd_engine(user_email: str) -> None:
         _render_preset1_form(user_email)
     elif preset_label == "Ligand-aware redesign":
         _render_preset2_form(user_email)
+    elif preset_label == "Scaffold diversification":
+        _render_preset5_form(user_email)
 
     st.divider()
     render_job_dashboard(user_email)
@@ -195,6 +198,87 @@ def _render_preset2_form(user_email: str) -> None:
                 chain_id=chain,
                 user_email=user_email,
                 num_outputs=num_outputs,
+            )
+            st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Submission failed: {e}")
+
+
+def _render_preset5_form(user_email: str) -> None:
+    from proteinredesign.config_builders.preset5 import (
+        ConfigError, K_MAX, M_MAX, PARTIAL_T_MAX, PARTIAL_T_MIN, build_preset5_config,
+    )
+    from proteinredesign.submit import backend_configured, submit_preset5
+
+    uploaded = st.file_uploader(
+        "Input PDB", type=["pdb"],
+        help="The backbone to diversify. RF3 keeps its length and overall fold, "
+             "generating structurally-varied relatives.",
+        key="rfd_p5_pdb",
+    )
+    chain = st.text_input("Chain", placeholder="auto", key="rfd_p5_chain",
+                          help="Chain to diversify. Leave blank to use the first chain.").strip() or None
+
+    col_k, col_m = st.columns(2)
+    with col_k:
+        k = st.slider("K — backbones (RF3 variants)", 1, K_MAX, 5, key="rfd_p5_k",
+                      help="How many diverse backbones RF3 generates by partial diffusion.")
+    with col_m:
+        m = st.slider("M — sequences per backbone", 1, M_MAX, 3, key="rfd_p5_m",
+                      help="ProteinMPNN designs this many sequences on each backbone.")
+
+    partial_t = st.slider(
+        "Diversity — partial-diffusion noise (Å)",
+        PARTIAL_T_MIN, PARTIAL_T_MAX, 8.0, step=0.5, key="rfd_p5_pt",
+        help="RF3 partial_t: more Å → more divergence from the input (5–15 Å typical). "
+             "Start small for tight variants.",
+    )
+
+    # Compute budget warning (D10.5) — every one of K×M designs is folded by ESMFold
+    # (the slow QC stage), so surface an estimate when the fan-out is large, mirroring
+    # the ESM3 app's >20-candidate warning.
+    total = k * m
+    st.caption(f"Total designs: **{k}×{m} = {total}** (each folded by ESMFold for QC, then ranked).")
+    if total > 40:
+        st.warning(
+            f"{total} designs is a large run — RF3 + {total} ESMFold folds may take many "
+            f"minutes and could approach the job time limit for larger proteins. Consider "
+            f"lowering K or M. Keep the tab open; results appear in the dashboard below."
+        )
+
+    pdb_bytes = uploaded.read() if uploaded is not None else None
+
+    cfg = None
+    if pdb_bytes:
+        try:
+            cfg = build_preset5_config(pdb_bytes, partial_t, k, m, chain_id=chain)
+            st.success(
+                f"Diversifying chain **{cfg.chain_id}** ({cfg.length} aa) · contig `{cfg.contig}` · "
+                f"{cfg.k}×{cfg.m} designs · {cfg.partial_t:g} Å"
+            )
+            for w in cfg.warnings:
+                st.warning(w)
+        except ConfigError as e:
+            st.error(str(e))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the PDB: {e}")
+
+    if st.button("🚀 Submit diversification job", type="primary", disabled=cfg is None,
+                 use_container_width=True, key="rfd_p5_submit"):
+        if not backend_configured():
+            st.error("The generation backend isn't configured (GCP project + buckets). "
+                     "Deploy the proteinredesign backend first.")
+            return
+        try:
+            rec, cfg = submit_preset5(
+                pdb_bytes=pdb_bytes,
+                pdb_filename=uploaded.name,
+                partial_t=partial_t,
+                k=k,
+                m=m,
+                chain_id=chain,
+                user_email=user_email,
             )
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()

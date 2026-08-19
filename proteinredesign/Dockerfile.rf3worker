@@ -1,0 +1,59 @@
+# proteinredesign RF3 GPU worker — the second Cloud Run Job image (D11).
+# Serves RF3-diffusion presets (#8 scaffold diversification; later #3/#6). The
+# MPNN-only presets (#1/#2) keep running on the separate Python-3.10 Dockerfile.worker
+# image, which this file DOES NOT touch (zero regression risk to working presets).
+#
+# Why a separate image: RF3 (rc-foundry) requires Python 3.12 + torch>=2.2 +
+# NVIDIA cuequivariance, incompatible with the 3.10 mpnn-worker. We base on the
+# official foundry image (bundles RF3 + Py3.12 + the right torch) and layer our
+# MPNN + ESMFold + ESM2 + pipeline on top, so a diversification job runs the whole
+# RF3 → MPNN → ESMFold pipeline in one execution.
+#
+# Build:  docker build -f proteinredesign/Dockerfile.rf3worker -t <region>-docker.pkg.dev/<proj>/proteinredesign/rf3-worker .
+# Run:    the Cloud Run Job sets PROTEINREDESIGN_MANIFEST_URI + the PROTEINREDESIGN_* bucket/project env.
+#
+# Model weights are NOT baked (A6): MPNN/ESMFold/RF3 checkpoints are fetched at
+# runtime from the SAME GCS weights bucket via proteinredesign.storage.ensure_weights()
+# (subdirs mpnn/, esmfold/, rfdiffusion/). Only the tiny ESM2 scorer (~30 MB) is baked.
+#
+# NOTE — VERIFY at build/de-risk time (D10.1):
+#   * the exact foundry base tag (pin a version; "slim" fetches weights vs the full
+#     image bundling them — we fetch from GCS so slim is preferred);
+#   * that torch from the base is CPU/CUDA-consistent for transformers ESMFold;
+#   * LigandMPNN + transformers import cleanly under Python 3.12.
+
+# TODO(deploy): pin an explicit foundry version tag instead of a moving one.
+FROM rosettacommons/foundry:slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# transformers (ESMFold via EsmForProteinFolding + ESM2 scorer), Biopython (PDB/RMSD),
+# and the GCP clients used by proteinredesign.storage / proteinredesign.jobstore.
+# torch is provided by the foundry base — do NOT reinstall it (avoids clobbering the
+# base's CUDA-matched build). No `esm` SDK here (ESMFold/ESM2 come from transformers),
+# so the esm-module-shadow + torchvision::nms issues that bite the ESM3 app don't apply.
+RUN pip install --no-cache-dir \
+        "transformers>=4.40.0" \
+        "biopython>=1.83" "numpy>=1.24" \
+        "google-cloud-storage>=2.14" "google-cloud-firestore>=2.14"
+
+# Pre-bake the tiny ESM2 scoring model (~30 MB) so QC scoring needs no HF network at runtime.
+RUN python -c "from transformers import AutoTokenizer, EsmForMaskedLM; \
+    AutoTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D'); \
+    EsmForMaskedLM.from_pretrained('facebook/esm2_t6_8M_UR50D'); \
+    print('ESM2 baked')"
+
+# ProteinMPNN / SolubleMPNN / LigandMPNN — unified LigandMPNN repo (MIT). Same as the
+# mpnn-worker image. Install only its pure-Python deps (NOT its requirements.txt, which
+# pins torch/nvidia-* and would clobber the foundry base's torch).
+RUN git clone --depth 1 https://github.com/dauparas/LigandMPNN.git /opt/ligandmpnn
+RUN pip install --no-cache-dir prody ml_collections dm-tree scipy pyparsing
+ENV LIGANDMPNN_DIR=/opt/ligandmpnn
+
+# App code: config.py, utils/, core/esm2_scorer.py, proteinredesign/
+COPY . /app
+
+ENTRYPOINT ["python", "-m", "proteinredesign.worker"]

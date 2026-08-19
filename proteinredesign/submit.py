@@ -13,7 +13,8 @@ import os
 
 from proteinredesign.config_builders.preset1 import Preset1Config, build_preset1_config
 from proteinredesign.config_builders.preset2 import Preset2Config, build_preset2_config
-from proteinredesign.manifest import JobManifest, Preset
+from proteinredesign.config_builders.preset5 import Preset5Config, build_preset5_config
+from proteinredesign.manifest import JobManifest, MPNN_ONLY_PRESETS, Preset
 
 
 def backend_configured() -> bool:
@@ -62,7 +63,7 @@ def submit_preset1(
         title=f"Fixed-backbone redesign · {cfg.mapping_summary or fixed_residues_str}",
     )
 
-    _trigger_job(manifest_uri)
+    _trigger_job(manifest_uri, preset=manifest.preset)
     return rec, cfg
 
 
@@ -109,16 +110,80 @@ def submit_preset2(
         title=f"Ligand-aware redesign · {cfg.ligand.resname} ({cfg.ligand.chain_id}#{cfg.ligand.res_seq})",
     )
 
-    _trigger_job(manifest_uri)
+    _trigger_job(manifest_uri, preset=manifest.preset)
     return rec, cfg
 
 
-def _trigger_job(manifest_uri: str) -> None:
+def submit_preset5(
+    *,
+    pdb_bytes: bytes,
+    pdb_filename: str,
+    partial_t: float,
+    k: int,
+    m: int,
+    chain_id: str | None,
+    user_email: str,
+):
+    """
+    Validate inputs, persist them, and launch a scaffold-diversification job (RF3
+    partial diffusion → MPNN → ESMFold QC). Routes to the **rf3-worker** Cloud Run
+    Job (Python 3.12 / foundry image), not the MPNN-only worker (D11).
+
+    Returns (JobRecord, Preset5Config). Raises ConfigError on invalid input (before
+    anything is uploaded). The fan-out is K×M raw designs; `num_outputs` is set to
+    K×M so every QC-passed candidate is returned, ranked (D10.3).
+    """
+    cfg: Preset5Config = build_preset5_config(
+        pdb_bytes, partial_t, k, m, chain_id=chain_id
+    )
+
+    manifest = JobManifest(
+        preset=Preset.SCAFFOLD_DIVERSIFICATION,
+        user_email=user_email,
+        pdb_uri="",  # set after upload
+        params=cfg.to_params(),
+        num_outputs=cfg.total_designs,
+    )
+
+    from proteinredesign import jobstore, storage
+
+    manifest.pdb_uri = storage.put_input_pdb(
+        manifest.job_id, pdb_bytes, filename=pdb_filename or "input.pdb"
+    )
+    manifest_uri = storage.write_manifest(manifest.job_id, manifest.to_json())
+
+    rec = jobstore.create_job(
+        manifest,
+        manifest_uri=manifest_uri,
+        title=(f"Scaffold diversification · chain {cfg.chain_id} · "
+               f"{cfg.k}×{cfg.m} · {cfg.partial_t:g}Å"),
+    )
+
+    _trigger_job(manifest_uri, preset=manifest.preset)
+    return rec, cfg
+
+
+def _job_name_for_preset(preset: "Preset") -> str:
+    """
+    Route a preset to its Cloud Run Job (D11: two images / two jobs).
+    - MPNN-only presets (#1/#2) → the Python-3.10 `mpnn-worker` job (default).
+    - RF3 presets (#8, later #3/#6) → the Python-3.12 `rf3-worker` job.
+    A Cloud Run Job's image is fixed in its template, so routing lives here.
+    """
+    if preset in MPNN_ONLY_PRESETS:
+        return os.getenv("PROTEINREDESIGN_JOB_NAME", "proteinredesign-worker")
+    return os.getenv("PROTEINREDESIGN_RF3_JOB_NAME", "proteinredesign-rf3-worker")
+
+
+def _trigger_job(manifest_uri: str, preset: "Preset | None" = None) -> None:
     """Launch the Cloud Run Job with a per-execution PROTEINREDESIGN_MANIFEST_URI override."""
     from config import GCP_PROJECT
 
     region = os.getenv("GCP_REGION", "us-central1")
-    job_name = os.getenv("PROTEINREDESIGN_JOB_NAME", "proteinredesign-worker")
+    job_name = (
+        _job_name_for_preset(preset) if preset is not None
+        else os.getenv("PROTEINREDESIGN_JOB_NAME", "proteinredesign-worker")
+    )
 
     from google.cloud import run_v2
 

@@ -54,6 +54,13 @@ class Candidate:
     pdb: str = ""              # ESMFold-predicted structure (PDB text)
     composite_score: float = 0.0
     rank: int = 0
+    # RF3 presets (e.g. scaffold diversification): the generated backbone this
+    # sequence was designed on — used as the self-consistency RMSD *reference*
+    # (NOT the input; partial diffusion moves the backbone by design — D10.2).
+    parent_backbone_path: str = ""
+    # RF3 presets only: CA-RMSD of the final fold vs the ORIGINAL input backbone —
+    # reported as a "diversity / drift-from-input" metric (NaN = not applicable).
+    diversity_from_input: float = float("nan")
 
     @property
     def passes_structural_gate(self) -> bool:
@@ -176,6 +183,7 @@ _HEADER_SCORE = re.compile(r"(?:^|,\s*)(?:score|overall_confidence|global_score)
 _DESIGN_CHECKPOINT = {
     Preset.FIXED_BACKBONE_REDESIGN: "proteinmpnn",
     Preset.LIGAND_AWARE_REDESIGN: "ligand_mpnn",
+    Preset.SCAFFOLD_DIVERSIFICATION: "proteinmpnn",  # RF3 backbones → ProteinMPNN (D6)
 }
 
 
@@ -355,7 +363,106 @@ def esm2_scores(sequences: list[str]) -> list[float]:
     return score_sequences(sequences, mode="pseudo")
 
 
+# ── RF3 adapter (rf3-worker image only — foundry base, Python 3.12) ────────────
+# RF3 outputs BACKBONES ONLY (no sequence); the downstream MPNN→ESMFold stages
+# (above) design + QC the sequence. This adapter runs ONLY in the rf3-worker image
+# (D11) — the mpnn-worker image (#1/#2) never imports/executes it.
+#
+# NOTE — interface assumptions to VERIFY at container-build / de-risk time against
+# the pinned foundry `rfd3` version (mirrors the [MPNN-*]/[ESM-*] verification notes):
+#   [RF3-1] CLI: `rfd3 design inputs=<cfg.json> out_dir=<dir>` (hydra key=value style);
+#           confirm the exact design entrypoint + arg names from foundry docs.
+#   [RF3-2] Input JSON fields: {"input": <pdb>, "contig": "<chain>1-<L>", "partial_t": <Å>}.
+#           partial_t is a NOISE MAGNITUDE IN Å (recommended 5–15), not a timestep count.
+#   [RF3-3] Number of designs (K): confirm the flag (e.g. inference.num_designs / a
+#           per-input replicate count) — assumed `num_designs` here.
+#   [RF3-4] Checkpoint location: `foundry install rfd3 --checkpoint-dir <dir>`; we point
+#           it at the GCS-synced weights dir (subdir "rfdiffusion").
+#   [RF3-5] Output: one backbone PDB per design under out_dir (glob "*.pdb").
+
+_RFD3_CMD = os.getenv("RFD3_CMD", "rfd3")
+
+
+def _rf3_weights_dir() -> str:
+    from proteinredesign.storage import ensure_weights
+    return ensure_weights("rfdiffusion")
+
+
+def run_rf3_partial(
+    input_pdb_path: str,
+    contig: str,
+    partial_t: float,
+    num_designs: int,
+    out_dir: str,
+) -> list[str]:
+    """
+    RF3 partial diffusion: partially noise the whole backbone (`partial_t` Å) and
+    re-denoise to `num_designs` structurally-diverse-but-related backbones.
+
+    Returns a list of generated backbone PDB paths (one per design). See the
+    [RF3-*] verification notes above — exact foundry CLI/arg names are pinned at
+    container-build time.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cfg = {"input": input_pdb_path, "contig": contig, "partial_t": float(partial_t)}
+    cfg_path = os.path.join(out_dir, "rfd3_input.json")
+    with open(cfg_path, "w") as fh:
+        json.dump(cfg, fh)
+
+    cmd = [
+        _RFD3_CMD, "design",
+        f"inputs={cfg_path}",
+        f"out_dir={out_dir}",
+        f"num_designs={int(num_designs)}",
+        f"checkpoint_dir={_rf3_weights_dir()}",
+    ]
+    subprocess.run(cmd, check=True)
+
+    backbones = sorted(glob.glob(os.path.join(out_dir, "**", "*.pdb"), recursive=True))
+    if not backbones:
+        raise RuntimeError(
+            f"RF3 produced no backbone PDBs in {out_dir} (contig={contig}, partial_t={partial_t})."
+        )
+    return backbones
+
+
 # ── Orchestration ─────────────────────────────────────────────────────────────
+
+def _generate_rf3_candidates(
+    manifest, input_pdb_path: str, workdir: str, design_checkpoint: str, jobstore, job_id: str
+) -> list["Candidate"]:
+    """
+    RF3 partial diffusion (K backbones) → ProteinMPNN (M sequences each) → K×M
+    candidates, each tagged with its parent backbone for dual-QC (D10.2/D10.3).
+    """
+    params = manifest.params
+    contig = params["contig"]
+    partial_t = float(params["partial_t"])
+    k = int(params["k"])
+    m = int(params["m"])
+
+    jobstore.update_job(job_id, stage="RF3 partial diffusion", progress=0.15)
+    rf3_dir = os.path.join(workdir, "rf3")
+    backbones = run_rf3_partial(
+        input_pdb_path, contig=contig, partial_t=partial_t, num_designs=k, out_dir=rf3_dir
+    )
+
+    candidates: list[Candidate] = []
+    for i, bb_path in enumerate(backbones, start=1):
+        jobstore.update_job(
+            job_id, stage=f"{design_checkpoint} design (backbone {i}/{len(backbones)})",
+            progress=0.2 + 0.15 * (i / max(len(backbones), 1)),
+        )
+        # No fixed residues in this preset — the whole chain is redesigned on the
+        # generated backbone (empty fixed-tokens string).
+        designed = run_proteinmpnn(bb_path, "", n_seqs=m, checkpoint=design_checkpoint)
+        for seq, score in designed:
+            candidates.append(Candidate(
+                sequence=seq, mpnn_scores={design_checkpoint: score},
+                parent_backbone_path=bb_path,
+            ))
+    return candidates
+
 
 def run_pipeline(manifest, workdir: str) -> dict:
     """
@@ -380,19 +487,30 @@ def run_pipeline(manifest, workdir: str) -> dict:
     fixed_tokens = _fixed_residue_tokens(params)
     n_target = manifest.num_outputs
     n_generate = max(n_target * OVERGEN_FACTOR, n_target)
+    is_rf3 = manifest.requires_rfdiffusion()
 
     # 0. Fetch the input PDB.
     jobstore.update_job(job_id, status=JobStatus.RUNNING.value, stage="Preparing inputs", progress=0.05)
     pdb_path = os.path.join(workdir, "input.pdb")
     storage.download_to_path(manifest.pdb_uri, pdb_path)
 
-    # 1. MPNN design (over-generate). Checkpoint depends on the preset (D6): plain
-    # ProteinMPNN for #1, LigandMPNN for #2 (conditions on the ligand already
-    # filtered into the PDB by the preset #2 config builder).
-    jobstore.update_job(job_id, stage=f"{design_checkpoint} design", progress=0.2)
-    designed = run_proteinmpnn(pdb_path, fixed_tokens, n_seqs=n_generate, checkpoint=design_checkpoint)
-    candidates = [Candidate(sequence=seq, mpnn_scores={design_checkpoint: score})
-                  for seq, score in designed]
+    # 1. Generate candidates. Two shapes (D11):
+    #    - MPNN-only presets (#1/#2): design directly on the fixed input backbone.
+    #    - RF3 presets (#8 scaffold diversification): RF3 partial diffusion first
+    #      makes K backbones, then MPNN designs M sequences on each (K×M total).
+    if is_rf3:
+        candidates = _generate_rf3_candidates(
+            manifest, pdb_path, workdir, design_checkpoint, jobstore, job_id
+        )
+    else:
+        jobstore.update_job(job_id, stage=f"{design_checkpoint} design", progress=0.2)
+        designed = run_proteinmpnn(pdb_path, fixed_tokens, n_seqs=n_generate,
+                                   checkpoint=design_checkpoint)
+        candidates = [
+            Candidate(sequence=seq, mpnn_scores={design_checkpoint: score},
+                      parent_backbone_path=pdb_path)
+            for seq, score in designed
+        ]
 
     # 2. Multi-checkpoint scoring (D1) — SolubleMPNN as additional metadata.
     jobstore.update_job(job_id, stage="MPNN scoring", progress=0.35)
@@ -406,11 +524,21 @@ def run_pipeline(manifest, workdir: str) -> dict:
     for c, s in zip(candidates, esm2_scores(seqs)):
         c.esm2_score = s
 
-    # 4. ESMFold QC (D2 hard gate).
+    # 4. ESMFold QC (D2 hard gate). The self-consistency RMSD reference depends on
+    # the preset (D10.2): for MPNN-only presets the input backbone is held fixed, so
+    # RMSD-to-input IS the self-consistency metric. For RF3 presets the backbone was
+    # regenerated, so we measure against each candidate's OWN generated backbone, and
+    # separately report RMSD-to-input as the "diversity / drift-from-input" metric.
     jobstore.update_job(job_id, stage="ESMFold QC", progress=0.65)
     for c in candidates:
         c.pdb, c.plddt = run_esmfold(c.sequence)
-        c.rmsd_to_design = compute_ca_rmsd(c.pdb, pdb_path, chain_id)
+        ref_path = c.parent_backbone_path or pdb_path
+        # Generated RF3 backbones are single-chain (chain from the contig); compare
+        # against all chains there. Input-referenced presets use the chosen chain.
+        ref_chain = None if is_rf3 else chain_id
+        c.rmsd_to_design = compute_ca_rmsd(c.pdb, ref_path, ref_chain)
+        if is_rf3:
+            c.diversity_from_input = compute_ca_rmsd(c.pdb, pdb_path, chain_id)
 
     # 5. Gate + rank + trim to N.
     jobstore.update_job(job_id, stage="Ranking", progress=0.85)
@@ -432,6 +560,8 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
     for c in top:
         header = (f"candidate_{c.rank} score={c.composite_score:.3f} "
                   f"esm2={c.esm2_score:.3f} pLDDT={c.plddt:.1f} rmsd={c.rmsd_to_design:.2f}")
+        if c.diversity_from_input == c.diversity_from_input:  # not NaN → RF3 preset
+            header += f" diversity={c.diversity_from_input:.2f}"
         fasta_lines.append(f">{header}\n{c.sequence}")
         pdb_name = f"candidate_{c.rank}.pdb"
         if c.pdb:
@@ -439,7 +569,8 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
         records.append({
             "rank": c.rank, "sequence": c.sequence, "composite_score": c.composite_score,
             "esm2_score": c.esm2_score, "plddt": c.plddt, "rmsd_to_design": c.rmsd_to_design,
-            "mpnn_scores": c.mpnn_scores, "pdb": pdb_name if c.pdb else None,
+            "diversity_from_input": c.diversity_from_input, "mpnn_scores": c.mpnn_scores,
+            "pdb": pdb_name if c.pdb else None,
         })
     storage.write_output(job_id, "candidates.fasta", ("\n".join(fasta_lines) + "\n").encode())
     results = {"job_id": job_id, "preset": manifest.preset.value, "count": len(top),
