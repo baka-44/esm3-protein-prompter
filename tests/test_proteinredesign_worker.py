@@ -73,3 +73,34 @@ def test_soft_floor_never_starves_output():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── Engine helpers added for #6 / Borrowed Bodies (FG1) ──────────────────────────
+
+def test_mpnn_fixed_tokens_excludes_repack_and_dedups():
+    from proteinredesign.worker import _mpnn_fixed_tokens
+    # #6: no repack — all catalytic residues kept.
+    assert _mpnn_fixed_tokens(["A57", "A102", "A195"]) == "A57 A102 A195"
+    # BB2: interface residues in the repack set are dropped so MPNN redesigns them.
+    assert _mpnn_fixed_tokens(["A57", "A102", "B10", "B11"], repack_refs=["B10", "B11"]) == "A57 A102"
+    # De-dup, order-preserving.
+    assert _mpnn_fixed_tokens(["A1", "A1", "A2"]) == "A1 A2"
+
+
+def test_mpnn_checkpoint_selection_by_ligand():
+    from proteinredesign.worker import _mpnn_checkpoint_for
+    assert _mpnn_checkpoint_for({}) == "proteinmpnn"
+    assert _mpnn_checkpoint_for({"ligand": None}) == "proteinmpnn"
+    assert _mpnn_checkpoint_for({"ligand": {"resname": "NAI"}}) == "ligand_mpnn"
+
+
+def test_motif_rmsd_gate():
+    # motif gate off (inf) → NaN motif_rmsd is fine.
+    c_nan = _c("AAA", plddt=90, rmsd=1.0)
+    assert len(select_top_candidates([c_nan], num_outputs=10)) == 1
+    # finite gate → NaN motif_rmsd fails (QC couldn't be computed), low passes, high fails.
+    good = _c("GGG", plddt=90, rmsd=1.0); good.motif_rmsd = 0.8
+    bad = _c("BBB", plddt=90, rmsd=1.0); bad.motif_rmsd = 3.0
+    nan = _c("NNN", plddt=90, rmsd=1.0)  # motif_rmsd stays NaN
+    out = select_top_candidates([good, bad, nan], num_outputs=10, motif_rmsd_gate=1.5)
+    assert [c.sequence for c in out] == ["GGG"]
