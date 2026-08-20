@@ -267,6 +267,46 @@ def submit_preset3(
     return rec, cfg
 
 
+def submit_borrowed_bodies(*, package_bytes: bytes, user_email: str):
+    """
+    Launch a Borrowed Bodies job from an exported graft package (CC15). Reads the package, runs
+    the RF3 adapter (graft → indexed multi-segment contig + all-atom pins + repack), uploads the
+    composite PDB, and triggers the rf3-worker on the (built + validated) engine.
+
+    Returns (JobRecord, engine_params).
+    """
+    from proteinredesign.graft import GraftPackage, to_engine_params
+
+    package = GraftPackage.from_bytes(package_bytes)
+    errs = package.spec.validate()
+    if errs:
+        raise ValueError("Invalid graft package: " + "; ".join(errs))
+    params = to_engine_params(package)
+
+    manifest = JobManifest(
+        preset=Preset.BORROWED_BODIES,
+        user_email=user_email,
+        pdb_uri="",  # set after upload
+        params=params,
+        num_outputs=int(params["k"]) * int(params["m"]),
+    )
+
+    from proteinredesign import jobstore, storage
+
+    manifest.pdb_uri = storage.put_input_pdb(
+        manifest.job_id, package.composite_pdb, filename="composite.pdb"
+    )
+    manifest_uri = storage.write_manifest(manifest.job_id, manifest.to_json())
+
+    frags = [s.label for s in package.spec.fragments()]
+    rec = jobstore.create_job(
+        manifest, manifest_uri=manifest_uri,
+        title=f"Borrowed Bodies · {' → '.join(frags)} · {params['k']}×{params['m']}",
+    )
+    _trigger_job(manifest_uri, preset=manifest.preset)
+    return rec, params
+
+
 def _job_name_for_preset(preset: "Preset") -> str:
     """
     Route a preset to its Cloud Run Job (D11: two images / two jobs).
