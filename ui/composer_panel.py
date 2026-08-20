@@ -94,8 +94,6 @@ def render_composer(user_email: str) -> None:
             info = _chain_info(t_pdb.getvalue())
             if info:
                 st.caption(info)
-            with st.expander("Preview torso", expanded=False):
-                _view_structure(t_pdb.getvalue(), "#8a8a8a")
         c1, c2, c3 = st.columns(3)
         with c1:
             t_chain = st.text_input("Chain", placeholder="auto", key="cmp_tchain").strip() or None
@@ -111,8 +109,6 @@ def render_composer(user_email: str) -> None:
             info = _chain_info(m_pdb.getvalue())
             if info:
                 st.caption(info)
-            with st.expander("Preview mount", expanded=False):
-                _view_structure(m_pdb.getvalue(), "#e08a2b")
         mc1, mc2 = st.columns([1, 3])
         with mc1:
             m_chain = st.text_input("Chain", placeholder="auto", key="cmp_mchain").strip() or None
@@ -144,9 +140,22 @@ def render_composer(user_email: str) -> None:
             frags = " → ".join(s.label for s in composed.spec.fragments())
             st.success(f"Composed (snap-to-fit): **{frags}**  ·  contig "
                        f"`{to_engine_params(composed)['contig']}`")
-            repack = {f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues}
-            _view_composite(composed.composite_pdb.decode(errors="ignore"), repack)
-            st.caption("Torso = grey · Mount = orange · Repack shell = yellow sticks (CC9).")
+            # Exactly ONE py3Dmol viewer on the page at a time (multiple conflict → blank).
+            choice = st.radio("View", ["Composite", "Torso", "Mount"], horizontal=True,
+                              key="cmp_view", label_visibility="collapsed")
+            if choice == "Composite":
+                repack = {f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues}
+                _view_composite(composed.composite_pdb.decode(errors="ignore"), repack)
+                st.caption("Torso = grey · Mount = orange · Repack shell = yellow sticks (CC9).")
+            elif choice == "Torso" and t_pdb:
+                _view_structure(t_pdb.getvalue(), "#8a8a8a", height=420)
+            elif choice == "Mount" and m_pdb:
+                _view_structure(m_pdb.getvalue(), "#e08a2b", height=420)
+            st.download_button(
+                "⬇️ Download composite PDB", data=composed.composite_pdb,
+                file_name="composite.pdb", mime="chemical/x-pdb", key="cmp_dlpdb",
+                help="If the 3D view is blank, download and open in PyMOL / ChimeraX.",
+            )
 
     with panel:
         st.markdown("##### Live metrics")
