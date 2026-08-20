@@ -18,7 +18,8 @@ _PRESETS = [
      "Keep the input backbone; redesign the sequence while pinning chosen residues."),
     ("Ligand-aware redesign", True,
      "Redesign a protein around a bound ligand — upload a protein–ligand complex PDB."),
-    ("Motif scaffolding", False, "Build a new protein around a fixed motif (RFdiffusion3). Coming soon."),
+    ("Motif scaffolding", True,
+     "Keep chosen blocks of a structure fixed and generate the connecting regions (RF3 inpainting)."),
     ("Enzyme active-site scaffolding", True,
      "Scaffold a new protein around a catalytic site (RF3 all-atom), holding the catalytic geometry."),
     ("Scaffold diversification", True,
@@ -54,6 +55,8 @@ def render_rfd_engine(user_email: str) -> None:
         _render_preset5_form(user_email)
     elif preset_label == "Enzyme active-site scaffolding":
         _render_preset6_form(user_email)
+    elif preset_label == "Motif scaffolding":
+        _render_preset3_form(user_email)
 
     st.divider()
     render_job_dashboard(user_email)
@@ -282,6 +285,76 @@ def _render_preset5_form(user_email: str) -> None:
                 m=m,
                 chain_id=chain,
                 user_email=user_email,
+            )
+            st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Submission failed: {e}")
+
+
+def _render_preset3_form(user_email: str) -> None:
+    from proteinredesign.config_builders.preset3 import (
+        ConfigError, K_MAX, M_MAX, build_preset3_config,
+    )
+    from proteinredesign.submit import backend_configured, submit_preset3
+
+    uploaded = st.file_uploader(
+        "Input PDB", type=["pdb"],
+        help="The structure whose chosen blocks you want to keep fixed while the connecting "
+             "regions are regenerated.",
+        key="rfd_p3_pdb",
+    )
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        keep_str = st.text_input(
+            "Blocks to keep (fixed)",
+            placeholder="1-20, 50-80, 130-160, 190-200  (PDB author numbering)",
+            help="Discontiguous blocks held at their exact coordinates. RF3 regenerates the "
+                 "gaps between them (original gap lengths, so total length is preserved).",
+            key="rfd_p3_keep",
+        )
+    with col2:
+        chain = st.text_input("Chain", placeholder="auto", key="rfd_p3_chain",
+                              help="Chain the blocks are on.").strip() or None
+
+    col_k, col_m = st.columns(2)
+    with col_k:
+        k = st.slider("K — backbones", 1, K_MAX, 5, key="rfd_p3_k",
+                      help="How many RF3 structures to generate (varied bridges).")
+    with col_m:
+        m = st.slider("M — sequences per backbone", 1, M_MAX, 3, key="rfd_p3_m")
+
+    pdb_bytes = uploaded.read() if uploaded is not None else None
+
+    cfg = None
+    if pdb_bytes and keep_str.strip():
+        try:
+            cfg = build_preset3_config(pdb_bytes, keep_str, k, m, chain_id=chain)
+            blocks = ", ".join(f"{a}-{b}" for a, b in cfg.keep_ranges)
+            gaps = ", ".join(str(g) for g in cfg.gaps)
+            st.success(f"Chain **{cfg.chain_id}** · keep [{blocks}] · generate bridges [{gaps}] · "
+                       f"contig `{cfg.contig}`")
+            for w in cfg.warnings:
+                st.warning(w)
+        except ConfigError as e:
+            st.error(str(e))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the PDB: {e}")
+
+    total = k * m
+    st.caption(f"Total designs: **{k}×{m} = {total}** (each folded by ESMFold, motif-RMSD checked, ranked).")
+    if total > 40:
+        st.warning(f"{total} designs is a large run — consider lowering K or M. Keep the tab open.")
+
+    if st.button("🚀 Submit inpainting job", type="primary", disabled=cfg is None,
+                 use_container_width=True, key="rfd_p3_submit"):
+        if not backend_configured():
+            st.error("The generation backend isn't configured (GCP project + buckets).")
+            return
+        try:
+            rec, cfg = submit_preset3(
+                pdb_bytes=pdb_bytes, pdb_filename=uploaded.name,
+                keep_ranges_str=keep_str, k=k, m=m, chain_id=chain, user_email=user_email,
             )
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()

@@ -13,6 +13,7 @@ import os
 
 from proteinredesign.config_builders.preset1 import Preset1Config, build_preset1_config
 from proteinredesign.config_builders.preset2 import Preset2Config, build_preset2_config
+from proteinredesign.config_builders.preset3 import Preset3Config, build_preset3_config
 from proteinredesign.config_builders.preset5 import Preset5Config, build_preset5_config
 from proteinredesign.config_builders.preset6 import Preset6Config, build_preset6_config
 from proteinredesign.manifest import JobManifest, MPNN_ONLY_PRESETS, Preset
@@ -213,6 +214,53 @@ def submit_preset6(
         manifest_uri=manifest_uri,
         title=(f"Enzyme active-site scaffolding · {cfg.mapping_summary or catalytic_residues_str}"
                f"{lig} · {cfg.length_min}-{cfg.length_max} aa · {cfg.k}×{cfg.m}"),
+    )
+
+    _trigger_job(manifest_uri, preset=manifest.preset)
+    return rec, cfg
+
+
+def submit_preset3(
+    *,
+    pdb_bytes: bytes,
+    pdb_filename: str,
+    keep_ranges_str: str,
+    k: int,
+    m: int,
+    chain_id: str | None,
+    user_email: str,
+):
+    """
+    Validate inputs, persist them, and launch a motif-scaffolding / inpainting job (RF3
+    generates the bridges between the kept blocks → MPNN keeps the blocks, designs the bridges
+    → ESMFold + motif-RMSD QC). Routes to the rf3-worker (D11).
+
+    Returns (JobRecord, Preset3Config).
+    """
+    cfg: Preset3Config = build_preset3_config(
+        pdb_bytes, keep_ranges_str, k, m, chain_id=chain_id
+    )
+
+    manifest = JobManifest(
+        preset=Preset.MOTIF_SCAFFOLDING,
+        user_email=user_email,
+        pdb_uri="",  # set after upload
+        params=cfg.to_params(),
+        num_outputs=cfg.total_designs,
+    )
+
+    from proteinredesign import jobstore, storage
+
+    manifest.pdb_uri = storage.put_input_pdb(
+        manifest.job_id, pdb_bytes, filename=pdb_filename or "input.pdb"
+    )
+    manifest_uri = storage.write_manifest(manifest.job_id, manifest.to_json())
+
+    blocks = ", ".join(f"{a}-{b}" for a, b in cfg.keep_ranges)
+    rec = jobstore.create_job(
+        manifest,
+        manifest_uri=manifest_uri,
+        title=f"Motif scaffolding · chain {cfg.chain_id} · keep [{blocks}] · {cfg.k}×{cfg.m}",
     )
 
     _trigger_job(manifest_uri, preset=manifest.preset)
