@@ -43,10 +43,13 @@ def _ca_index(composite_pdb: bytes) -> dict[tuple[str, int], np.ndarray]:
     return idx
 
 
-def _heavy_atoms_by_chain(composite_pdb: bytes) -> dict[str, np.ndarray]:
+def _heavy_atoms_by_chain(composite_pdb: bytes, exclude: set[tuple[str, int]] | None = None) -> dict[str, np.ndarray]:
+    exclude = exclude or set()
     by_chain: dict[str, list] = {}
     for r in get_residues(composite_pdb, chain_id=None):
         ch = r.get_parent().id
+        if (ch, r.id[1]) in exclude:
+            continue
         for a in r:
             if a.element != "H":
                 by_chain.setdefault(ch, []).append(a.coord)
@@ -95,21 +98,24 @@ def compute_metrics(package: GraftPackage) -> list[Metric]:
         critical=True, ok=(infeasible == 0),
     ))
 
-    # ── Steric clash (inter-body heavy-atom overlaps) ─────────────────────────
-    heavy = _heavy_atoms_by_chain(composite)
+    # ── Steric clash (CORE–CORE heavy-atom overlaps) ──────────────────────────
+    # Exclude the repack shell: interface contact there is EXPECTED (MPNN redesigns it, BB2/CC9).
+    # Only overlaps between the fixed CORES are true, unresolvable clashes.
+    repack = {(r["chain"], r["author_num"]) for r in spec.repack_residues}
+    heavy = _heavy_atoms_by_chain(composite, exclude=repack)
     chains = list(heavy)
     clashes = 0
     if len(chains) >= 2:
-        A = heavy[chains[0]]
-        B = heavy[chains[1]]
-        # pairwise min-dist; count overlaps below the threshold.
-        dmat = np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)
-        clashes = int(np.count_nonzero(dmat < CLASH_DIST))
+        A, B = heavy[chains[0]], heavy[chains[1]]
+        if len(A) and len(B):
+            dmat = np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)
+            clashes = int(np.count_nonzero(dmat < CLASH_DIST))
     metrics.append(Metric(
-        "clash", "Steric clashes", float(clashes), "atom pairs",
+        "clash", "Core clashes", float(clashes), "atom pairs",
         desired="Ideal = 0",
-        what="Heavy-atom overlaps between the two bodies at this pose.",
-        meaning="Frozen clashes between the fixed bodies can't be relaxed and doom the fold.",
+        what="Heavy-atom overlaps between the two bodies' cores (excluding the repack interface).",
+        meaning="Core clashes between the fixed bodies can't be relaxed and doom the fold. "
+                "(Contact at the repack interface is expected and gets redesigned.)",
         critical=True, ok=(clashes == 0),
     ))
 
