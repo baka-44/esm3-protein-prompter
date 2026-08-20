@@ -23,23 +23,54 @@ def _parse_ranges(s: str) -> list[tuple[int, int]]:
     return out
 
 
-def _view_composite(pdb_text: str, repack_tokens: set[str]) -> None:
+def _view_composite(pdb_text: str, repack_tokens: set[str], height: int = 420) -> None:
     """View-only 3D render of the composite (torso = grey, mount = orange, repack = sticks)."""
-    import py3Dmol
-
-    view = py3Dmol.view(width=560, height=420)
+    try:
+        import py3Dmol
+        from streamlit.components.v1 import html as _st_html
+    except Exception:  # noqa: BLE001
+        st.caption("3D viewer unavailable (py3Dmol not installed).")
+        return
+    view = py3Dmol.view(width=560, height=height)
     view.addModel(pdb_text, "pdb")
     view.setStyle({"chain": "A"}, {"cartoon": {"color": "#8a8a8a"}})
     view.setStyle({"chain": "B"}, {"cartoon": {"color": "#e08a2b"}})
     for tok in repack_tokens:
-        chain, num = tok[0], tok[1:]
         try:
-            view.addStyle({"chain": chain, "resi": int(num)},
+            view.addStyle({"chain": tok[0], "resi": int(tok[1:])},
                           {"stick": {"colorscheme": "yellowCarbon", "radius": 0.2}})
         except ValueError:
             pass
     view.zoomTo()
-    st.components.v1.html(view._make_html(), height=430)
+    _st_html(view._make_html(), height=height + 10, scrolling=False)
+
+
+def _view_structure(pdb_bytes: bytes, color: str, height: int = 260) -> None:
+    """Single-protein preview (uploaded torso or mount, before composing)."""
+    try:
+        import py3Dmol
+        from streamlit.components.v1 import html as _st_html
+    except Exception:  # noqa: BLE001
+        return
+    view = py3Dmol.view(width=560, height=height)
+    view.addModel(pdb_bytes.decode(errors="ignore"), "pdb")
+    view.setStyle({}, {"cartoon": {"color": color}})
+    view.zoomTo()
+    _st_html(view._make_html(), height=height + 10, scrolling=False)
+
+
+def _chain_info(pdb_bytes: bytes) -> str:
+    """Human-readable chain/residue-range summary so users can pick valid cut/keep numbers."""
+    from utils.pdb_utils import get_residues
+    try:
+        residues = get_residues(pdb_bytes, chain_id=None)
+    except Exception:  # noqa: BLE001
+        return ""
+    chains: dict[str, list[int]] = {}
+    for r in residues:
+        chains.setdefault(r.get_parent().id, []).append(r.id[1])
+    return " · ".join(f"chain **{c}**: residues {min(ns)}–{max(ns)} ({len(ns)} aa)"
+                      for c, ns in chains.items())
 
 
 def render_composer(user_email: str) -> None:
@@ -59,6 +90,12 @@ def render_composer(user_email: str) -> None:
     with main:
         st.markdown("##### 1 · Torso (the stable body)")
         t_pdb = st.file_uploader("Torso PDB", type=["pdb"], key="cmp_torso")
+        if t_pdb:
+            info = _chain_info(t_pdb.getvalue())
+            if info:
+                st.caption(info)
+            with st.expander("Preview torso", expanded=False):
+                _view_structure(t_pdb.getvalue(), "#8a8a8a")
         c1, c2, c3 = st.columns(3)
         with c1:
             t_chain = st.text_input("Chain", placeholder="auto", key="cmp_tchain").strip() or None
@@ -70,6 +107,12 @@ def render_composer(user_email: str) -> None:
 
         st.markdown("##### 2 · Mount (the catalytic insert)")
         m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount")
+        if m_pdb:
+            info = _chain_info(m_pdb.getvalue())
+            if info:
+                st.caption(info)
+            with st.expander("Preview mount", expanded=False):
+                _view_structure(m_pdb.getvalue(), "#e08a2b")
         mc1, mc2 = st.columns([1, 3])
         with mc1:
             m_chain = st.text_input("Chain", placeholder="auto", key="cmp_mchain").strip() or None
