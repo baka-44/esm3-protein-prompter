@@ -135,7 +135,7 @@ def _write_composite(torso_struct, torso_keep: set[int], torso_chain: str,
             return 1 if (residue.id[0] == " " and residue.id[1] in self.keep) else 0
 
     io = PDBIO()
-    parts: list[str] = []
+    atom_lines: list[str] = []
     for struct, ch, keep, new_ch in (
         (torso_struct, torso_chain, torso_keep, out_torso_chain),
         (mount_struct, mount_chain, mount_keep, out_mount_chain),
@@ -148,8 +148,14 @@ def _write_composite(torso_struct, torso_keep: set[int], torso_chain: str,
         io.set_structure(struct)
         sink = StringIO()
         io.save(sink, _Keep(new_ch, keep, new_ch))
-        parts.append("\n".join(l for l in sink.getvalue().splitlines() if l.startswith(("ATOM", "HETATM"))))
-    return ("\n".join(parts) + "\nEND\n").encode()
+        atom_lines += [l for l in sink.getvalue().splitlines() if l.startswith(("ATOM", "HETATM"))]
+
+    # Each body was written with its own serials starting at 1 — renumber strictly increasing
+    # across the whole composite (RF3's PDB reader rejects non-increasing atom IDs).
+    renumbered = []
+    for serial, line in enumerate(atom_lines, start=1):
+        renumbered.append(f"{line[:6]}{serial:>5}{line[11:]}")
+    return ("\n".join(renumbered) + "\nEND\n").encode()
 
 
 def _auto_repack(composite_pdb: bytes, torso_chain: str, mount_chain: str,
