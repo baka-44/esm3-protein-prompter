@@ -19,7 +19,8 @@ _PRESETS = [
     ("Ligand-aware redesign", True,
      "Redesign a protein around a bound ligand — upload a protein–ligand complex PDB."),
     ("Motif scaffolding", False, "Build a new protein around a fixed motif (RFdiffusion3). Coming soon."),
-    ("Enzyme active-site scaffolding", False, "Scaffold an enzyme around a catalytic site (RF3 all-atom). Coming soon."),
+    ("Enzyme active-site scaffolding", True,
+     "Scaffold a new protein around a catalytic site (RF3 all-atom), holding the catalytic geometry."),
     ("Scaffold diversification", True,
      "Generate structurally-diverse variants of a backbone (RF3 partial diffusion), same length and fold."),
 ]
@@ -51,6 +52,8 @@ def render_rfd_engine(user_email: str) -> None:
         _render_preset2_form(user_email)
     elif preset_label == "Scaffold diversification":
         _render_preset5_form(user_email)
+    elif preset_label == "Enzyme active-site scaffolding":
+        _render_preset6_form(user_email)
 
     st.divider()
     render_job_dashboard(user_email)
@@ -279,6 +282,115 @@ def _render_preset5_form(user_email: str) -> None:
                 m=m,
                 chain_id=chain,
                 user_email=user_email,
+            )
+            st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Submission failed: {e}")
+
+
+def _render_preset6_form(user_email: str) -> None:
+    from proteinredesign.config_builders.preset6 import (
+        ConfigError, FIXED_ATOM_MODES, K_MAX, LENGTH_MAX, LENGTH_MIN, M_MAX,
+        build_preset6_config,
+    )
+    from proteinredesign.submit import backend_configured, submit_preset6
+    from utils.pdb_utils import get_hetatm_groups
+
+    uploaded = st.file_uploader(
+        "Parent enzyme PDB", type=["pdb"],
+        help="The enzyme whose catalytic site you want to transplant onto a new scaffold. "
+             "Include the cofactor as HETATM if the site needs one.",
+        key="rfd_p6_pdb",
+    )
+    pdb_bytes = uploaded.read() if uploaded is not None else None
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        catalytic_str = st.text_input(
+            "Catalytic residues",
+            placeholder="H57, D102, S195  (PDB author numbering)",
+            help="Active-site residues to preserve. Their geometry is held while RF3 builds a "
+                 "new body around them.",
+            key="rfd_p6_cat",
+        )
+    with col2:
+        chain = st.text_input("Chain", placeholder="auto", key="rfd_p6_chain",
+                              help="Chain the catalytic residues are on.").strip() or None
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        atoms_mode = st.selectbox(
+            "Fixed atoms", options=list(FIXED_ATOM_MODES), index=0, key="rfd_p6_atoms",
+            help="TIP = catalytic tip atoms (tightest hold, most freedom); "
+                 "BKBN = backbone; ALL = every atom.",
+        )
+    with col_b:
+        pass
+
+    # Optional cofactor picker (same HETATM detect/confirm as ligand-aware redesign).
+    ligand_key = None
+    if pdb_bytes:
+        try:
+            candidates = get_hetatm_groups(pdb_bytes)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the PDB: {e}")
+            candidates = []
+        if candidates:
+            labels = ["(none)"] + [c.label() for c in candidates]
+            picked = st.selectbox("Cofactor / ligand (optional)", options=labels, key="rfd_p6_lig")
+            if picked != "(none)":
+                ligand_key = candidates[labels.index(picked) - 1].key
+
+    col_l, col_r = st.columns(2)
+    with col_l:
+        length = st.slider("Scaffold length (aa)", LENGTH_MIN, LENGTH_MAX, (140, 200),
+                           key="rfd_p6_len",
+                           help="RF3 builds a new body of this length range around the site.")
+    with col_r:
+        colk, colm = st.columns(2)
+        with colk:
+            k = st.slider("K — scaffolds", 1, K_MAX, 5, key="rfd_p6_k")
+        with colm:
+            m = st.slider("M — seqs/scaffold", 1, M_MAX, 3, key="rfd_p6_m")
+
+    total = k * m
+    st.caption(f"Total designs: **{k}×{m} = {total}** (each folded by ESMFold, motif-RMSD checked, ranked).")
+    if total > 40:
+        st.warning(
+            f"{total} designs is a large run — RF3 all-atom + {total} ESMFold folds may take many "
+            f"minutes. Consider lowering K or M. Keep the tab open; results appear below."
+        )
+
+    cfg = None
+    if pdb_bytes and catalytic_str.strip():
+        try:
+            cfg = build_preset6_config(
+                pdb_bytes, catalytic_str, fixed_atoms_mode=atoms_mode, ligand_key=ligand_key,
+                length_min=length[0], length_max=length[1], k=k, m=m, chain_id=chain,
+            )
+            lig = f"  ·  cofactor **{cfg.ligand.resname}**" if cfg.ligand is not None else ""
+            st.success(f"Catalytic: {cfg.mapping_summary}  ·  chain {cfg.chain_id}{lig}  ·  "
+                       f"{cfg.length_min}-{cfg.length_max} aa")
+            for w in cfg.warnings:
+                st.warning(w)
+        except ConfigError as e:
+            st.error(str(e))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the PDB: {e}")
+
+    if st.button("🚀 Submit scaffolding job", type="primary", disabled=cfg is None,
+                 use_container_width=True, key="rfd_p6_submit"):
+        if not backend_configured():
+            st.error("The generation backend isn't configured (GCP project + buckets). "
+                     "Deploy the proteinredesign backend first.")
+            return
+        try:
+            rec, cfg = submit_preset6(
+                pdb_bytes=pdb_bytes, pdb_filename=uploaded.name,
+                catalytic_residues_str=catalytic_str, fixed_atoms_mode=atoms_mode,
+                ligand_key=ligand_key, length_min=length[0], length_max=length[1],
+                k=k, m=m, chain_id=chain, user_email=user_email,
             )
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()

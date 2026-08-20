@@ -90,6 +90,7 @@ def _render_results(job) -> None:
         return isinstance(v, (int, float)) and v == v  # not None, not NaN
 
     has_diversity = any(_is_num(c.get("diversity_from_input")) for c in cands)
+    has_motif = any(_is_num(c.get("motif_rmsd")) for c in cands)
 
     def _row(c: dict) -> dict:
         row = {
@@ -102,6 +103,9 @@ def _render_results(job) -> None:
         if has_diversity:
             d = c.get("diversity_from_input")
             row["Diversity Å"] = round(d, 2) if _is_num(d) else "—"
+        if has_motif:
+            mr = c.get("motif_rmsd")
+            row["Motif Å"] = round(mr, 2) if _is_num(mr) else "—"
         row["Length"] = len(c.get("sequence", ""))
         row["Sequence (preview)"] = c.get("sequence", "")[:40] + ("…" if len(c.get("sequence", "")) > 40 else "")
         return row
@@ -110,6 +114,9 @@ def _render_results(job) -> None:
     if has_diversity:
         st.caption("**RMSD Å** = self-consistency vs the generated backbone (lower = better). "
                    "**Diversity Å** = drift from the original input backbone (higher = more novel).")
+    if has_motif:
+        st.caption("**RMSD Å** = self-consistency vs the generated scaffold (lower = better). "
+                   "**Motif Å** = catalytic-geometry fidelity vs the parent enzyme (lower = better).")
     st.dataframe(df, hide_index=True, use_container_width=True)
 
     # Bulk downloads — FASTA (sequences) and a zip of every candidate's ESMFold
