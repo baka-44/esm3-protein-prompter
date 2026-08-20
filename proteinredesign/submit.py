@@ -14,6 +14,7 @@ import os
 from proteinredesign.config_builders.preset1 import Preset1Config, build_preset1_config
 from proteinredesign.config_builders.preset2 import Preset2Config, build_preset2_config
 from proteinredesign.config_builders.preset5 import Preset5Config, build_preset5_config
+from proteinredesign.config_builders.preset6 import Preset6Config, build_preset6_config
 from proteinredesign.manifest import JobManifest, MPNN_ONLY_PRESETS, Preset
 
 
@@ -157,6 +158,61 @@ def submit_preset5(
         manifest_uri=manifest_uri,
         title=(f"Scaffold diversification · chain {cfg.chain_id} · "
                f"{cfg.k}×{cfg.m} · {cfg.partial_t:g}Å"),
+    )
+
+    _trigger_job(manifest_uri, preset=manifest.preset)
+    return rec, cfg
+
+
+def submit_preset6(
+    *,
+    pdb_bytes: bytes,
+    pdb_filename: str,
+    catalytic_residues_str: str,
+    fixed_atoms_mode: str,
+    ligand_key: tuple[str, str, int] | None,
+    length_min: int,
+    length_max: int,
+    k: int,
+    m: int,
+    chain_id: str | None,
+    user_email: str,
+):
+    """
+    Validate inputs, persist them, and launch an enzyme active-site scaffolding job (RF3
+    all-atom scaffold → MPNN → ESMFold + motif-RMSD QC). Routes to the rf3-worker (D11).
+
+    Returns (JobRecord, Preset6Config). Uploads the FILTERED PDB (protein + only the chosen
+    cofactor) when a ligand is selected, so RF3/LigandMPNN see only the intended ligand.
+    """
+    cfg: Preset6Config = build_preset6_config(
+        pdb_bytes, catalytic_residues_str,
+        fixed_atoms_mode=fixed_atoms_mode, ligand_key=ligand_key,
+        length_min=length_min, length_max=length_max, k=k, m=m, chain_id=chain_id,
+    )
+
+    manifest = JobManifest(
+        preset=Preset.ENZYME_ACTIVE_SITE,
+        user_email=user_email,
+        pdb_uri="",  # set after upload
+        params=cfg.to_params(),
+        num_outputs=cfg.total_designs,
+    )
+
+    from proteinredesign import jobstore, storage
+
+    upload_bytes = cfg.filtered_pdb_bytes if cfg.filtered_pdb_bytes is not None else pdb_bytes
+    manifest.pdb_uri = storage.put_input_pdb(
+        manifest.job_id, upload_bytes, filename=pdb_filename or "input.pdb"
+    )
+    manifest_uri = storage.write_manifest(manifest.job_id, manifest.to_json())
+
+    lig = f" · {cfg.ligand.resname}" if cfg.ligand is not None else ""
+    rec = jobstore.create_job(
+        manifest,
+        manifest_uri=manifest_uri,
+        title=(f"Enzyme active-site scaffolding · {cfg.mapping_summary or catalytic_residues_str}"
+               f"{lig} · {cfg.length_min}-{cfg.length_max} aa · {cfg.k}×{cfg.m}"),
     )
 
     _trigger_job(manifest_uri, preset=manifest.preset)

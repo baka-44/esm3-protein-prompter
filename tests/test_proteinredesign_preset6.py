@@ -134,3 +134,12 @@ def test_unknown_ligand_raises():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── submit routing (D11: #6 → rf3 job) ───────────────────────────────────────────
+
+def test_enzyme_routes_to_rf3_job(monkeypatch):
+    from proteinredesign.manifest import Preset
+    from proteinredesign.submit import _job_name_for_preset
+    monkeypatch.delenv("PROTEINREDESIGN_RF3_JOB_NAME", raising=False)
+    assert _job_name_for_preset(Preset.ENZYME_ACTIVE_SITE) == "proteinredesign-rf3-worker"
