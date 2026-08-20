@@ -69,3 +69,12 @@ def test_far_pose_is_infeasible_and_gates_export():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_interface_contact_not_counted_as_core_clash():
+    # Snap-to-fit places the mount touching the torso — the interface (repack shell) is in
+    # contact, but that's expected (MPNN redesigns it). Core-core clash must be 0 for a clean
+    # composition, so it stays exportable.
+    _, m = _metrics()
+    assert m["clash"].value == 0
+    assert m["clash"].ok is True
