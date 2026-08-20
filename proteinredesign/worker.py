@@ -609,17 +609,24 @@ def _rf3_diffused_index_map(design_pdb_path: str) -> dict[str, str]:
 
 
 def _rf3_enzyme_output_mapping(
-    design_pdb_path: str, catalytic_keys: list[tuple[str, int]]
+    design_pdb_path: str,
+    motif_keys: list[tuple[str, int]],
+    identity_fallback: bool = False,
 ) -> tuple[list[str], list[int]]:
     """
-    Map the parent's catalytic residues to their RF3 *output* placement via the design's
-    `diffused_index_map`.
+    Map the parent's fixed-motif residues to their RF3 *output* placement via the design's
+    `diffused_index_map`. Used by enzyme scaffolding (catalytic residues, unindexed) and motif
+    scaffolding / inpainting (kept-block residues, indexed).
 
     Returns (output_residue_refs, seq_positions):
-      - output_residue_refs — e.g. ["A19","A61","A48"] — the catalytic residues in the DESIGN,
-        for MPNN --fixed_residues (fix them at their real output positions, NOT the input ones).
-      - seq_positions — 1-based sequence index of each catalytic residue in the design, ALIGNED
-        to `catalytic_keys` (0 for any that didn't map), for motif-RMSD against the parent.
+      - output_residue_refs — the motif residues in the DESIGN (e.g. ["A19",...]), for MPNN
+        --fixed_residues (fix them at their real output positions, NOT the input ones).
+      - seq_positions — 1-based sequence index of each motif residue in the design, ALIGNED to
+        `motif_keys` (0 for any that didn't map), for motif-RMSD against the parent.
+
+    `identity_fallback=True` (indexed motifs, e.g. inpainting): if a residue isn't in the map,
+    assume it kept its input (chain, author_num) in the output. Unindexed motifs (enzyme) leave
+    it False — identity would fix the wrong residue since RF3 renumbers them.
     """
     idx_map = _rf3_diffused_index_map(design_pdb_path)
     from utils.pdb_utils import get_residues
@@ -632,9 +639,11 @@ def _rf3_enzyme_output_mapping(
 
     out_refs: list[str] = []
     positions: list[int] = []
-    for chain, num in catalytic_keys:
+    for chain, num in motif_keys:
         out = idx_map.get(f"{chain}{num}")
         parsed = _parse_residue_ref(out) if out else None
+        if parsed is None and identity_fallback and (chain, num) in order:
+            parsed, out = (chain, num), f"{chain}{num}"
         if parsed is not None:
             out_refs.append(out)
             positions.append(order.get(parsed, 0))
@@ -708,6 +717,50 @@ def _generate_enzyme_candidates(
     return candidates
 
 
+def _generate_motif_candidates(
+    manifest, input_pdb_path: str, workdir: str, jobstore, job_id: str
+) -> list["Candidate"]:
+    """
+    Motif scaffolding / inpainting (#3): RF3 generates the bridges between the indexed kept
+    blocks (multi-segment contig), producing K structures; ProteinMPNN designs M sequences on
+    each, KEEPING the kept-block residues fixed and designing only the bridges. K×M candidates.
+
+    Unlike enzyme scaffolding the motif is *indexed* (kept blocks keep their coordinates and
+    register), so the output→input residue map is usually identity — with the diffused_index_map
+    consulted first and identity as the fallback.
+    """
+    params = manifest.params
+    k, m = int(params["k"]), int(params["m"])
+    checkpoint = _mpnn_checkpoint_for(params)  # ProteinMPNN (no ligand for #3)
+    motif_keys = [(r["chain_id"], r["author_num"]) for r in params.get("motif_residues", [])]
+    repack = list(params.get("repack_residues", []))  # empty for #3; the BB path (BB2) fills it
+
+    spec = {"input": input_pdb_path, "contig": params.get("contig")}
+    jobstore.update_job(job_id, stage="RF3 inpainting (bridges)", progress=0.15)
+    rf3_dir = os.path.join(workdir, "rf3")
+    designs = run_rf3_design(spec, num_designs=k, out_dir=rf3_dir, run_name="motif")
+    from proteinredesign import storage as _storage
+    _persist_rf3_outputs(job_id, rf3_dir, _storage)
+
+    candidates: list[Candidate] = []
+    for i, design_pdb in enumerate(designs, start=1):
+        jobstore.update_job(
+            job_id, stage=f"{checkpoint} design (scaffold {i}/{len(designs)})",
+            progress=0.2 + 0.15 * (i / max(len(designs), 1)),
+        )
+        out_refs, motif_positions = _rf3_enzyme_output_mapping(
+            design_pdb, motif_keys, identity_fallback=True
+        )
+        fixed_tokens = _mpnn_fixed_tokens(out_refs, repack)
+        designed = run_proteinmpnn(design_pdb, fixed_tokens, n_seqs=m, checkpoint=checkpoint)
+        for seq, score in designed:
+            candidates.append(Candidate(
+                sequence=seq, mpnn_scores={checkpoint: score},
+                parent_backbone_path=design_pdb, catalytic_pred_positions=motif_positions,
+            ))
+    return candidates
+
+
 def run_pipeline(manifest, workdir: str) -> dict:
     """
     Execute preset #1 end-to-end and return a results dict (also written to GCS).
@@ -727,6 +780,8 @@ def run_pipeline(manifest, workdir: str) -> dict:
     n_generate = max(n_target * OVERGEN_FACTOR, n_target)
     is_rf3 = manifest.requires_rfdiffusion()
     is_enzyme = manifest.preset == Preset.ENZYME_ACTIVE_SITE
+    is_motif = manifest.preset == Preset.MOTIF_SCAFFOLDING
+    has_motif_qc = is_enzyme or is_motif  # motif-RMSD fidelity check applies
 
     # 0. Fetch the input PDB.
     jobstore.update_job(job_id, status=JobStatus.RUNNING.value, stage="Preparing inputs", progress=0.05)
@@ -740,6 +795,8 @@ def run_pipeline(manifest, workdir: str) -> dict:
     #      catalytic motif → MPNN(M) keeping the catalytic residues fixed.
     if is_enzyme:
         candidates = _generate_enzyme_candidates(manifest, pdb_path, workdir, jobstore, job_id)
+    elif is_motif:
+        candidates = _generate_motif_candidates(manifest, pdb_path, workdir, jobstore, job_id)
     elif manifest.preset == Preset.SCAFFOLD_DIVERSIFICATION:
         candidates = _generate_rf3_candidates(
             manifest, pdb_path, workdir, _DESIGN_CHECKPOINT[manifest.preset], jobstore, job_id
@@ -777,7 +834,11 @@ def run_pipeline(manifest, workdir: str) -> dict:
     # regenerated, so we measure against each candidate's OWN generated backbone, and
     # separately report RMSD-to-input as the "diversity / drift-from-input" metric.
     jobstore.update_job(job_id, stage="ESMFold QC", progress=0.65)
-    cat_keys = [(r["chain_id"], r["author_num"]) for r in params.get("catalytic_residues", [])]
+    # Motif residues for the fidelity check: catalytic residues (#6) or kept-block residues (#3).
+    motif_keys = [
+        (r["chain_id"], r["author_num"])
+        for r in (params.get("catalytic_residues") or params.get("motif_residues") or [])
+    ]
     for c in candidates:
         c.pdb, c.plddt = run_esmfold(c.sequence)
         ref_path = c.parent_backbone_path or pdb_path
@@ -788,18 +849,17 @@ def run_pipeline(manifest, workdir: str) -> dict:
         # Diversification-only: drift of the fold from the ORIGINAL input backbone.
         if manifest.preset == Preset.SCAFFOLD_DIVERSIFICATION:
             c.diversity_from_input = compute_ca_rmsd(c.pdb, pdb_path, chain_id)
-        # Enzyme scaffolding: catalytic-geometry fidelity vs the parent (motif-RMSD).
-        if is_enzyme and c.catalytic_pred_positions:
+        # Enzyme / motif scaffolding: fidelity of the fixed motif vs the parent (motif-RMSD).
+        if has_motif_qc and c.catalytic_pred_positions:
             c.motif_rmsd = compute_motif_rmsd(
-                c.pdb, pdb_path, c.catalytic_pred_positions, cat_keys, ref_chain=chain_id
+                c.pdb, pdb_path, c.catalytic_pred_positions, motif_keys, ref_chain=chain_id
             )
 
-    # 5. Gate + rank + trim to N. Enzyme scaffolding adds the motif-RMSD gate (default OFF
-    # via MOTIF_RMSD_GATE=inf until [RF3-enz-1] mapping is validated at the first GPU run).
+    # 5. Gate + rank + trim to N. Enzyme/motif scaffolding add the motif-RMSD fidelity gate.
     jobstore.update_job(job_id, stage="Ranking", progress=0.85)
     top = select_top_candidates(
         candidates, num_outputs=n_target,
-        motif_rmsd_gate=(MOTIF_RMSD_GATE if is_enzyme else float("inf")),
+        motif_rmsd_gate=(MOTIF_RMSD_GATE if has_motif_qc else float("inf")),
     )
 
     # 6. Write artifacts to GCS.
