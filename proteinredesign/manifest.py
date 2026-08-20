@@ -27,6 +27,7 @@ class Preset(str, Enum):
     MOTIF_SCAFFOLDING = "motif_scaffolding"                 # #3  RF3
     ENZYME_ACTIVE_SITE = "enzyme_active_site"               # #6  RF3-all-atom
     SCAFFOLD_DIVERSIFICATION = "scaffold_diversification"   # #8  RF3 partial diffusion
+    BORROWED_BODIES = "borrowed_bodies"                     # Composer graft → RF3 multi-segment
 
 
 class JobStatus(str, Enum):

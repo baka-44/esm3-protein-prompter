@@ -392,6 +392,16 @@ if _engine == "rfd":
     render_rfd_engine(_user_email)
     st.stop()
 
+# Compose Graft — Borrowed Bodies composer (full-page cockpit, minimal sidebar).
+if _engine == "compose":
+    with st.sidebar:
+        render_engine_switch()
+    render_user_badge()
+    from ui.composer_panel import render_composer
+    _user_email = st.session_state.get("_auth_email") or "local@dev"
+    render_composer(_user_email)
+    st.stop()
+
 # ESM3 — conversational interface with the full generation-parameters sidebar.
 settings = render_sidebar()
 with st.sidebar:

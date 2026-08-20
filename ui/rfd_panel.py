@@ -22,6 +22,8 @@ _PRESETS = [
      "Keep chosen blocks of a structure fixed and generate the connecting regions (RF3 inpainting)."),
     ("Enzyme active-site scaffolding", True,
      "Scaffold a new protein around a catalytic site (RF3 all-atom), holding the catalytic geometry."),
+    ("Borrowed Bodies (import graft)", True,
+     "Run a graft package exported from the Compose Graft cockpit (mount grafted onto a torso)."),
     ("Scaffold diversification", True,
      "Generate structurally-diverse variants of a backbone (RF3 partial diffusion), same length and fold."),
 ]
@@ -57,6 +59,8 @@ def render_rfd_engine(user_email: str) -> None:
         _render_preset6_form(user_email)
     elif preset_label == "Motif scaffolding":
         _render_preset3_form(user_email)
+    elif preset_label == "Borrowed Bodies (import graft)":
+        _render_borrowed_bodies_form(user_email)
 
     st.divider()
     render_job_dashboard(user_email)
@@ -465,6 +469,46 @@ def _render_preset6_form(user_email: str) -> None:
                 ligand_key=ligand_key, length_min=length[0], length_max=length[1],
                 k=k, m=m, chain_id=chain, user_email=user_email,
             )
+            st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Submission failed: {e}")
+
+
+def _render_borrowed_bodies_form(user_email: str) -> None:
+    from proteinredesign.graft import GraftPackage, to_engine_params
+    from proteinredesign.submit import backend_configured, submit_borrowed_bodies
+
+    uploaded = st.file_uploader(
+        "Graft package (.graft)", type=["graft", "zip"],
+        help="Exported from the Compose Graft cockpit. Contains the composite structure + the "
+             "graft spec (fixed fragments, linkers, repack set).",
+        key="rfd_bb_pkg",
+    )
+
+    pkg = None
+    if uploaded is not None:
+        try:
+            pkg = GraftPackage.from_bytes(uploaded.getvalue())
+            errs = pkg.spec.validate()
+            if errs:
+                st.error("Invalid graft package: " + "; ".join(errs))
+                pkg = None
+            else:
+                params = to_engine_params(pkg)
+                frags = " → ".join(s.label for s in pkg.spec.fragments())
+                st.success(f"**{frags}**  ·  contig `{params['contig']}`  ·  "
+                           f"{params['k']}×{params['m']}  ·  repack {len(params['repack_residues'])} residues")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the graft package: {e}")
+
+    if st.button("🚀 Submit Borrowed Bodies job", type="primary", disabled=pkg is None,
+                 use_container_width=True, key="rfd_bb_submit"):
+        if not backend_configured():
+            st.error("The generation backend isn't configured (GCP project + buckets).")
+            return
+        try:
+            rec, _ = submit_borrowed_bodies(package_bytes=uploaded.getvalue(), user_email=user_email)
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001

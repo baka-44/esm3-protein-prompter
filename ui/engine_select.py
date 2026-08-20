@@ -26,9 +26,9 @@ def render_engine_chooser() -> None:
     )
     st.markdown("<div style='height:2.5vh'></div>", unsafe_allow_html=True)
 
-    left, mid, right = st.columns([1, 6, 1])
+    left, mid, right = st.columns([1, 8, 1])
     with mid:
-        c1, c2 = st.columns(2, gap="large")
+        c1, c2, c3 = st.columns(3, gap="large")
         with c1:
             with st.container(border=True):
                 st.markdown("##### 💬 ESM3")
@@ -57,12 +57,26 @@ def render_engine_chooser() -> None:
                 if st.button("Use RFdiffusion / MPNN", key="pick_rfd", use_container_width=True):
                     st.session_state["_engine"] = "rfd"
                     st.rerun()
+        with c3:
+            with st.container(border=True):
+                st.markdown("##### 🧩 Compose Graft")
+                st.markdown(
+                    "<span style='color:#666666;font-size:0.84rem'>"
+                    "Borrowed Bodies. Graft a catalytic mount onto a stable torso, pose them in a "
+                    "shared 3D frame, and export a graft package to run through RFdiffusion."
+                    "</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+                if st.button("Compose a graft", key="pick_compose", use_container_width=True):
+                    st.session_state["_engine"] = "compose"
+                    st.rerun()
 
 
 def render_engine_switch() -> None:
     """Small control (place in the sidebar) to return to the engine chooser."""
     current = st.session_state.get("_engine")
-    label = {"esm3": "ESM3", "rfd": "RFdiffusion / MPNN"}.get(current, "—")
+    label = {"esm3": "ESM3", "rfd": "RFdiffusion / MPNN", "compose": "Compose Graft"}.get(current, "—")
     st.caption(f"Engine · **{label}**")
     if st.button("⇄ Switch engine", key="switch_engine", use_container_width=True):
         st.session_state.pop("_engine", None)

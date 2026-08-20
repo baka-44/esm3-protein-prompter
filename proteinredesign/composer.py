@@ -1,0 +1,263 @@
+"""
+proteinredesign/composer.py — Borrowed Bodies compose geometry (Phase-1 cockpit-lite).
+
+Pure-CPU structural manipulation that turns a mount PDB + a torso PDB + the user's operations
+(retain / cut / pose) into a `graft.GraftPackage`: the torso is cut into two flanks and the mount
+is posed between them, all in one coordinate frame, with the N→C chain order, linkers, and repack
+shell derived. The interactive 3D editor (Phase 2) drives these same operations; here they are
+called with typed inputs.
+
+Conventions follow Biopython: a rigid transform is (rot 3×3, tran 3) with
+`new = old @ rot + tran` (so Bio.PDB `atom.transform(rot, tran)` and `Superimposer.rotran` compose
+directly).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from proteinredesign.graft import Fragment, GraftPackage, GraftSpec, Linker
+from utils.pdb_utils import get_residues, parse_pdb
+
+_IDENTITY = (np.eye(3), np.zeros(3))
+
+
+# ── chain / residue helpers ────────────────────────────────────────────────────
+
+def _chain_residues(pdb_source, chain_id: str | None):
+    """Ordered protein residues of the chosen chain (+ the chain id actually used)."""
+    residues = get_residues(pdb_source, chain_id=None)
+    if not residues:
+        raise ValueError("No protein residues (ATOM records) in the structure.")
+    chains: dict[str, list] = {}
+    for r in residues:
+        chains.setdefault(r.get_parent().id, []).append(r)
+    if chain_id is None:
+        chain_id = next(iter(chains))
+    if chain_id not in chains:
+        raise ValueError(f"Chain '{chain_id}' not found (have: {', '.join(chains)}).")
+    return chains[chain_id], chain_id
+
+
+def _range_set(ranges: list[tuple[int, int]]) -> set[int]:
+    out: set[int] = set()
+    for a, b in ranges:
+        out.update(range(a, b + 1))
+    return out
+
+
+def _contiguous_blocks(nums: list[int]) -> list[tuple[int, int]]:
+    """Sorted residue numbers → list of contiguous (start, end) blocks."""
+    nums = sorted(set(nums))
+    blocks: list[tuple[int, int]] = []
+    for n in nums:
+        if blocks and n == blocks[-1][1] + 1:
+            blocks[-1] = (blocks[-1][0], n)
+        else:
+            blocks.append((n, n))
+    return blocks
+
+
+def cut_torso(residue_nums: list[int], p1: int, p2: int) -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    Excise the middle between the two cut points (CC5): the residues strictly between p1 and p2
+    disappear, leaving TORSO-1 (…≤p1) and TORSO-2 (≥p2…). p1/p2 are kept as the flank ends.
+    Returns ((flank1_start, p1), (p2, flank2_end)).
+    """
+    lo, hi = min(residue_nums), max(residue_nums)
+    a, b = sorted((p1, p2))
+    if not (lo <= a < b <= hi):
+        raise ValueError(f"Cut points {p1},{p2} must lie within the chain {lo}-{hi} and be distinct.")
+    return (lo, a), (b, hi)
+
+
+# ── pose / snap-to-fit ─────────────────────────────────────────────────────────
+
+def _ca(residues, num: int):
+    for r in residues:
+        if r.id[1] == num and "CA" in r:
+            return np.array(r["CA"].coord, dtype=float)
+    return None
+
+
+def snap_to_fit(
+    torso_residues, flank1_end: int, flank2_start: int,
+    mount_residues, mount_n: int, mount_c: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Rigid transform (CC10) placing the mount so its termini close the two linkers: superpose the
+    mount's (N-term, C-term) CA onto the torso's (flank1 C-end, flank2 N-start) CA (Kabsch on the
+    two point pairs). Directionality: TORSO-1(C)→MOUNT(N), MOUNT(C)→TORSO-2(N) (CC8).
+    """
+    from Bio.SVDSuperimposer import SVDSuperimposer
+
+    t1 = _ca(torso_residues, flank1_end)
+    t2 = _ca(torso_residues, flank2_start)
+    mn = _ca(mount_residues, mount_n)
+    mc = _ca(mount_residues, mount_c)
+    if any(x is None for x in (t1, t2, mn, mc)):
+        raise ValueError("Could not find CA atoms for the terminus pairs used by snap-to-fit.")
+    fixed = np.array([t1, t2])       # where the mount ends should land
+    moving = np.array([mn, mc])      # the mount's termini
+    sup = SVDSuperimposer()
+    sup.set(fixed, moving)
+    sup.run()
+    rot, tran = sup.get_rotran()     # moving @ rot + tran ≈ fixed
+    return rot, tran
+
+
+# ── compose ────────────────────────────────────────────────────────────────────
+
+def _write_composite(torso_struct, torso_keep: set[int], torso_chain: str,
+                     mount_struct, mount_keep: set[int], mount_chain: str,
+                     rot: np.ndarray, tran: np.ndarray,
+                     out_torso_chain: str, out_mount_chain: str) -> bytes:
+    """
+    Write a composite PDB: kept torso residues on `out_torso_chain` (original coords/numbering) +
+    kept mount residues on `out_mount_chain` (posed by rot/tran, original numbering).
+    """
+    from io import StringIO
+
+    from Bio.PDB import PDBIO, Select
+
+    # Pose the mount in place.
+    for atom in mount_struct.get_atoms():
+        atom.set_coord(atom.coord @ rot + tran)
+
+    class _Keep(Select):
+        def __init__(self, chain_id, keep, new_chain):
+            self.chain_id, self.keep, self.new_chain = chain_id, keep, new_chain
+
+        def accept_chain(self, chain):
+            return 1 if chain.id == self.chain_id else 0
+
+        def accept_residue(self, residue):
+            return 1 if (residue.id[0] == " " and residue.id[1] in self.keep) else 0
+
+    io = PDBIO()
+    atom_lines: list[str] = []
+    for struct, ch, keep, new_ch in (
+        (torso_struct, torso_chain, torso_keep, out_torso_chain),
+        (mount_struct, mount_chain, mount_keep, out_mount_chain),
+    ):
+        # Relabel the chain so torso→A and mount→B in the composite.
+        for model in struct:
+            for chain in model:
+                if chain.id == ch:
+                    chain.id = new_ch
+        io.set_structure(struct)
+        sink = StringIO()
+        io.save(sink, _Keep(new_ch, keep, new_ch))
+        atom_lines += [l for l in sink.getvalue().splitlines() if l.startswith(("ATOM", "HETATM"))]
+
+    # Each body was written with its own serials starting at 1 — renumber strictly increasing
+    # across the whole composite (RF3's PDB reader rejects non-increasing atom IDs).
+    renumbered = []
+    for serial, line in enumerate(atom_lines, start=1):
+        renumbered.append(f"{line[:6]}{serial:>5}{line[11:]}")
+    return ("\n".join(renumbered) + "\nEND\n").encode()
+
+
+def _auto_repack(composite_pdb: bytes, torso_chain: str, mount_chain: str,
+                 junction_residues: list[tuple[str, int]], shell: float) -> list[dict]:
+    """
+    Repack shell (CC9): fixed-fragment residues (a) contacting the other body (within `shell` Å,
+    heavy atoms) or (b) flanking a linker junction. Backbone stays fixed; MPNN may re-identify them.
+    """
+    residues = get_residues(composite_pdb, chain_id=None)
+    torso = [r for r in residues if r.get_parent().id == torso_chain]
+    mount = [r for r in residues if r.get_parent().id == mount_chain]
+
+    def atoms(r):
+        return np.array([a.coord for a in r], dtype=float)
+
+    repack: set[tuple[str, int]] = set(junction_residues)
+    m_atoms = [atoms(r) for r in mount]
+    for r in torso:
+        ta = atoms(r)
+        if any(np.min(np.linalg.norm(ta[:, None, :] - ma[None, :, :], axis=2)) <= shell for ma in m_atoms):
+            repack.add((torso_chain, r.id[1]))
+    t_atoms = [atoms(r) for r in torso]
+    for r in mount:
+        ma = atoms(r)
+        if any(np.min(np.linalg.norm(ma[:, None, :] - ta[None, :, :], axis=2)) <= shell for ta in t_atoms):
+            repack.add((mount_chain, r.id[1]))
+    return [{"chain": c, "author_num": n} for c, n in sorted(repack)]
+
+
+def compose_graft(
+    *,
+    torso_pdb: bytes,
+    mount_pdb: bytes,
+    torso_cut: tuple[int, int],
+    mount_keep: list[tuple[int, int]],
+    torso_chain: str | None = None,
+    mount_chain: str | None = None,
+    mount_fixed_atoms: str = "ALL",
+    mount_termini: tuple[int, int] | None = None,     # (N-term num, C-term num); default fragment ends
+    pose: tuple[np.ndarray, np.ndarray] | None = None,  # explicit (rot, tran); None → snap-to-fit
+    linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
+    repack_shell: float = 5.0,
+    k: int = 5,
+    m: int = 3,
+) -> GraftPackage:
+    """
+    Domain-insertion compose: cut the torso into two flanks, keep the chosen mount residues, pose
+    the mount between the flanks (snap-to-fit by default), and emit a GraftPackage
+    (TORSO-1 / linker / MOUNT / linker / TORSO-2). See module docstring + CC1–CC17.
+    """
+    OUT_T, OUT_M = "A", "B"
+
+    torso_res, torso_chain = _chain_residues(torso_pdb, torso_chain)
+    mount_res, mount_chain = _chain_residues(mount_pdb, mount_chain)
+
+    (f1_start, f1_end), (f2_start, f2_end) = cut_torso([r.id[1] for r in torso_res], *torso_cut)
+    torso_keep = set(range(f1_start, f1_end + 1)) | set(range(f2_start, f2_end + 1))
+
+    mount_keep_set = _range_set(mount_keep)
+    mount_blocks = _contiguous_blocks([n for n in (r.id[1] for r in mount_res) if n in mount_keep_set])
+    if not mount_blocks:
+        raise ValueError("No mount residues kept — check the retain ranges.")
+    m_lo, m_hi = mount_blocks[0][0], mount_blocks[-1][1]
+    mn, mc = mount_termini or (m_lo, m_hi)
+
+    # Pose: snap-to-fit unless an explicit transform was given.
+    if pose is None:
+        rot, tran = snap_to_fit(torso_res, f1_end, f2_start, mount_res, mn, mc)
+    else:
+        rot, tran = pose
+
+    torso_struct = parse_pdb(torso_pdb)
+    mount_struct = parse_pdb(mount_pdb)
+    composite = _write_composite(
+        torso_struct, torso_keep, torso_chain, mount_struct, mount_keep_set, mount_chain,
+        rot, tran, OUT_T, OUT_M,
+    )
+
+    # N→C order (CC7): TORSO-1 / L1 / MOUNT(s) / L2 / TORSO-2. Multiple mount blocks become
+    # multiple MOUNT-i fragments joined by short designed connectors (schema-ready — CC17).
+    chain_order: list = [Fragment("TORSO-1", "torso", OUT_T, f1_start, f1_end, "BKBN")]
+    junctions: list[tuple[str, int]] = [(OUT_T, f1_end)]
+    chain_order.append(Linker(*linker_lengths[0]))
+    for i, (b_lo, b_hi) in enumerate(mount_blocks, start=1):
+        if i > 1:
+            chain_order.append(Linker(3, 8))  # intra-mount connector between kept blocks
+        chain_order.append(Fragment(f"MOUNT-{i}", "mount", OUT_M, b_lo, b_hi, mount_fixed_atoms))
+        junctions += [(OUT_M, b_lo), (OUT_M, b_hi)]
+    chain_order.append(Linker(*linker_lengths[1]))
+    chain_order.append(Fragment("TORSO-2", "torso", OUT_T, f2_start, f2_end, "BKBN"))
+    junctions.append((OUT_T, f2_start))
+
+    repack = _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell)
+
+    spec = GraftSpec(
+        chain_order=chain_order,
+        repack_residues=repack,
+        k=k, m=m,
+        provenance={
+            "torso_chain": torso_chain, "mount_chain": mount_chain,
+            "torso_cut": list(torso_cut), "mount_keep": [list(r) for r in mount_keep],
+            "posed_by": "explicit" if pose is not None else "snap_to_fit",
+        },
+    )
+    return GraftPackage(spec=spec, composite_pdb=composite)

@@ -733,9 +733,12 @@ def _generate_motif_candidates(
     k, m = int(params["k"]), int(params["m"])
     checkpoint = _mpnn_checkpoint_for(params)  # ProteinMPNN (no ligand for #3)
     motif_keys = [(r["chain_id"], r["author_num"]) for r in params.get("motif_residues", [])]
-    repack = list(params.get("repack_residues", []))  # empty for #3; the BB path (BB2) fills it
+    repack = list(params.get("repack_residues", []))  # empty for #3; Borrowed Bodies (BB2) fills it
 
-    spec = {"input": input_pdb_path, "contig": params.get("contig")}
+    # select_fixed_atoms is None for #3 (backbone-only, contig fixes it) and set for Borrowed
+    # Bodies (the mount's all-atom pins) — run_rf3_design drops None keys.
+    spec = {"input": input_pdb_path, "contig": params.get("contig"),
+            "select_fixed_atoms": params.get("select_fixed_atoms")}
     jobstore.update_job(job_id, stage="RF3 inpainting (bridges)", progress=0.15)
     rf3_dir = os.path.join(workdir, "rf3")
     designs = run_rf3_design(spec, num_designs=k, out_dir=rf3_dir, run_name="motif")
@@ -780,7 +783,8 @@ def run_pipeline(manifest, workdir: str) -> dict:
     n_generate = max(n_target * OVERGEN_FACTOR, n_target)
     is_rf3 = manifest.requires_rfdiffusion()
     is_enzyme = manifest.preset == Preset.ENZYME_ACTIVE_SITE
-    is_motif = manifest.preset == Preset.MOTIF_SCAFFOLDING
+    # Motif scaffolding (#3) and Borrowed Bodies both run the indexed multi-segment path.
+    is_motif = manifest.preset in (Preset.MOTIF_SCAFFOLDING, Preset.BORROWED_BODIES)
     has_motif_qc = is_enzyme or is_motif  # motif-RMSD fidelity check applies
 
     # 0. Fetch the input PDB.
