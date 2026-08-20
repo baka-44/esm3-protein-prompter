@@ -40,10 +40,11 @@ PLDDT_GATE = float(os.getenv("PROTEINREDESIGN_PLDDT_GATE", "70.0"))     # hard s
 RMSD_GATE = float(os.getenv("PROTEINREDESIGN_RMSD_GATE", "2.0"))         # Å, self-consistency
 ESM2_DROP_FRACTION = float(os.getenv("PROTEINREDESIGN_ESM2_DROP", "0.10"))  # soft floor: drop bottom 10%
 OVERGEN_FACTOR = int(os.getenv("PROTEINREDESIGN_OVERGEN_FACTOR", "3"))  # generate 3× to survive QC
-# Enzyme scaffolding (#6) catalytic-fidelity gate (Å). Default OFF (inf) — motif_rmsd is
-# reported but not gated until the [RF3-enz-1] output→sequence mapping is validated at the
-# first GPU run; then set a finite Å value (e.g. 1.5) to hard-gate on catalytic geometry.
-MOTIF_RMSD_GATE = float(os.getenv("PROTEINREDESIGN_MOTIF_RMSD_GATE", "inf"))
+# Enzyme scaffolding (#6) catalytic-fidelity gate (Å): reject designs whose catalytic
+# residues drift more than this from the parent. [RF3-enz-1] mapping validated at the first
+# GPU run (motif_rmsd ~0.7 Å on a clean scaffold), so this is ON by default. Env-overridable;
+# set to "inf" to disable (report-only).
+MOTIF_RMSD_GATE = float(os.getenv("PROTEINREDESIGN_MOTIF_RMSD_GATE", "1.5"))
 
 
 @dataclass
@@ -584,29 +585,78 @@ def _generate_rf3_candidates(
     return candidates
 
 
-def _rf3_catalytic_seq_positions(design_pdb_path: str, catalytic_keys: list[tuple[str, int]]) -> list[int]:
-    """
-    1-based sequence positions of the catalytic residues in an RF3 design output.
+_RESIDUE_REF = re.compile(r"([A-Za-z]+)(\d+)")
 
-    [RF3-enz-1] VERIFY at the first GPU run — RF3's residue numbering for an *unindexed*
-    motif in the output. Best-effort here: assume motif residues retain their input
-    (chain, author_num), and return their sequential index in the design's residue order.
-    Falls back to [] (→ motif_rmsd stays NaN, not gated) if they can't be located, so the
-    pipeline never crashes on the mapping. Finalise (or switch to parsing the sibling
-    per-design `.json`) after inspecting a real design.
+
+def _parse_residue_ref(ref: str) -> tuple[str, int] | None:
+    """'A19' → ('A', 19). Returns None if unparseable."""
+    m = _RESIDUE_REF.fullmatch(str(ref).strip())
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+def _rf3_diffused_index_map(design_pdb_path: str) -> dict[str, str]:
     """
+    RF3's per-design `diffused_index_map`: {input_residue_ref: output_residue_ref}, e.g.
+    {"A6": "A19", "A17": "A61", "A32": "A48"} — where RF3 placed each (unindexed) motif
+    residue in the output. Read from the sibling `.json` [RF3-enz-1, verified 2026-08-20].
+    """
+    json_path = design_pdb_path[:-4] + ".json" if design_pdb_path.endswith(".pdb") else ""
+    try:
+        with open(json_path) as fh:
+            return json.load(fh).get("diffused_index_map", {}) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _rf3_enzyme_output_mapping(
+    design_pdb_path: str, catalytic_keys: list[tuple[str, int]]
+) -> tuple[list[str], list[int]]:
+    """
+    Map the parent's catalytic residues to their RF3 *output* placement via the design's
+    `diffused_index_map`.
+
+    Returns (output_residue_refs, seq_positions):
+      - output_residue_refs — e.g. ["A19","A61","A48"] — the catalytic residues in the DESIGN,
+        for MPNN --fixed_residues (fix them at their real output positions, NOT the input ones).
+      - seq_positions — 1-based sequence index of each catalytic residue in the design, ALIGNED
+        to `catalytic_keys` (0 for any that didn't map), for motif-RMSD against the parent.
+    """
+    idx_map = _rf3_diffused_index_map(design_pdb_path)
     from utils.pdb_utils import get_residues
 
     try:
         residues = get_residues(design_pdb_path)
     except Exception:  # noqa: BLE001
-        return []
-    wanted = {tuple(k) for k in catalytic_keys}
+        residues = []
+    order = {(r.get_parent().id, r.id[1]): i for i, r in enumerate(residues, start=1)}
+
+    out_refs: list[str] = []
     positions: list[int] = []
-    for i, r in enumerate(residues, start=1):
-        if (r.get_parent().id, r.id[1]) in wanted:
-            positions.append(i)
-    return positions
+    for chain, num in catalytic_keys:
+        out = idx_map.get(f"{chain}{num}")
+        parsed = _parse_residue_ref(out) if out else None
+        if parsed is not None:
+            out_refs.append(out)
+            positions.append(order.get(parsed, 0))
+        else:
+            positions.append(0)
+    return out_refs, positions
+
+
+def _persist_rf3_outputs(job_id: str, out_dir: str, storage) -> None:
+    """
+    Save the raw RF3 design outputs (`*.cif.gz` all-atom structures + `*.json` metadata) to
+    GCS under the job prefix. These carry the ligand + the motif conditioning annotations the
+    ESMFold-refold PDBs lose, and are the true generative artefact. Best-effort (never fails a job).
+    """
+    try:
+        for path in sorted(glob.glob(os.path.join(out_dir, "**", "*.cif.gz"), recursive=True) +
+                           glob.glob(os.path.join(out_dir, "**", "*.json"), recursive=True)):
+            name = os.path.basename(path)
+            ct = "application/gzip" if name.endswith(".cif.gz") else "application/json"
+            storage.write_output(job_id, f"rf3/{name}", open(path, "rb").read(), content_type=ct)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN: could not persist RF3 outputs: {exc}")
 
 
 def _generate_enzyme_candidates(
@@ -622,7 +672,6 @@ def _generate_enzyme_candidates(
     k, m = int(params["k"]), int(params["m"])
     checkpoint = _mpnn_checkpoint_for(params)  # LigandMPNN if a cofactor is present
     catalytic_keys = [(r["chain_id"], r["author_num"]) for r in params.get("catalytic_residues", [])]
-    catalytic_tokens = [f"{c}{n}" for c, n in catalytic_keys]
     repack = list(params.get("repack_residues", []))  # empty for #6; the BB path (BB2) fills it
 
     # RF3 all-atom scaffold spec (assembled by the config builder — code, not the LLM, B5).
@@ -634,8 +683,10 @@ def _generate_enzyme_candidates(
         "length": params.get("length"),
     }
     jobstore.update_job(job_id, stage="RF3 all-atom scaffolding", progress=0.15)
-    designs = run_rf3_design(spec, num_designs=k, out_dir=os.path.join(workdir, "rf3"),
-                             run_name="enzyme")
+    rf3_dir = os.path.join(workdir, "rf3")
+    designs = run_rf3_design(spec, num_designs=k, out_dir=rf3_dir, run_name="enzyme")
+    from proteinredesign import storage as _storage
+    _persist_rf3_outputs(job_id, rf3_dir, _storage)  # save all-atom scaffolds + motif annotations
 
     candidates: list[Candidate] = []
     for i, design_pdb in enumerate(designs, start=1):
@@ -643,8 +694,11 @@ def _generate_enzyme_candidates(
             job_id, stage=f"{checkpoint} design (scaffold {i}/{len(designs)})",
             progress=0.2 + 0.15 * (i / max(len(designs), 1)),
         )
-        cat_positions = _rf3_catalytic_seq_positions(design_pdb, catalytic_keys)
-        fixed_tokens = _mpnn_fixed_tokens(catalytic_tokens, repack)
+        # Fix the catalytic residues at their REAL output positions (RF3 renumbers the
+        # unindexed motif) — from the design's diffused_index_map. Same map gives the
+        # sequence positions used for motif-RMSD.
+        out_refs, cat_positions = _rf3_enzyme_output_mapping(design_pdb, catalytic_keys)
+        fixed_tokens = _mpnn_fixed_tokens(out_refs, repack)
         designed = run_proteinmpnn(design_pdb, fixed_tokens, n_seqs=m, checkpoint=checkpoint)
         for seq, score in designed:
             candidates.append(Candidate(
