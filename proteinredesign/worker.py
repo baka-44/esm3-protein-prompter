@@ -45,6 +45,14 @@ OVERGEN_FACTOR = int(os.getenv("PROTEINREDESIGN_OVERGEN_FACTOR", "3"))  # genera
 # GPU run (motif_rmsd ~0.7 Å on a clean scaffold), so this is ON by default. Env-overridable;
 # set to "inf" to disable (report-only).
 MOTIF_RMSD_GATE = float(os.getenv("PROTEINREDESIGN_MOTIF_RMSD_GATE", "1.5"))
+# Motif scaffolding (#3) / Borrowed Bodies fix LARGE multi-block motifs (tens of residues), so the
+# catalytic-tip gate (1.5 Å) is too strict given ESMFold's own ~1-2 Å error — a fair test
+# (ubiquitin loop reinsertion) held the blocks at ~2.5 Å with pLDDT ~84. Looser gate for these.
+INPAINT_MOTIF_RMSD_GATE = float(os.getenv("PROTEINREDESIGN_INPAINT_MOTIF_RMSD_GATE", "2.5"))
+# Self-consistency (fold-vs-backbone) is also looser for large multi-block grafts — a fair test
+# sat at ~2.8 Å, above the small-design default (2.0). Looser gate for motif/BB (keeps the small
+# presets strict).
+INPAINT_RMSD_GATE = float(os.getenv("PROTEINREDESIGN_INPAINT_RMSD_GATE", "3.5"))
 
 
 @dataclass
@@ -859,12 +867,18 @@ def run_pipeline(manifest, workdir: str) -> dict:
                 c.pdb, pdb_path, c.catalytic_pred_positions, motif_keys, ref_chain=chain_id
             )
 
-    # 5. Gate + rank + trim to N. Enzyme/motif scaffolding add the motif-RMSD fidelity gate.
+    # 5. Gate + rank + trim to N. Motif-RMSD fidelity gate: tight (1.5 Å) for enzyme active-site
+    # scaffolding (small catalytic motif); looser (2.5 Å) for motif scaffolding / Borrowed Bodies
+    # (large multi-block motifs — ESMFold error dominates).
     jobstore.update_job(job_id, stage="Ranking", progress=0.85)
-    top = select_top_candidates(
-        candidates, num_outputs=n_target,
-        motif_rmsd_gate=(MOTIF_RMSD_GATE if has_motif_qc else float("inf")),
-    )
+    if is_enzyme:
+        motif_gate, rmsd_gate = MOTIF_RMSD_GATE, RMSD_GATE
+    elif is_motif:
+        motif_gate, rmsd_gate = INPAINT_MOTIF_RMSD_GATE, INPAINT_RMSD_GATE
+    else:
+        motif_gate, rmsd_gate = float("inf"), RMSD_GATE
+    top = select_top_candidates(candidates, num_outputs=n_target,
+                                rmsd_gate=rmsd_gate, motif_rmsd_gate=motif_gate)
 
     # 6. Write artifacts to GCS.
     jobstore.update_job(job_id, stage="Writing results", progress=0.95)
