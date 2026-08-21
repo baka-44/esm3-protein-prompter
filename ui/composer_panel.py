@@ -206,25 +206,38 @@ _FULLBLEED_CSS = """
 <style>
   /* Hide the big global PHYX44 banner — we render a compact top nav instead. */
   .phyx-banner { display: none !important; }
-  /* Streamlit's header overlays the top of the page and was clipping our nav row. Keep it thin
-     + transparent (it still holds the sidebar >> expand control) and pad content down to clear it. */
-  header[data-testid="stHeader"] { height: 2.6rem !important; background: transparent !important; }
-  /* Edge-to-edge canvas: drop Streamlit's centered max-width; pad the top past the header. */
+  /* Reclaim Streamlit's top bar: our nav overlays INTO the header band (no separate row).
+     The header stays as a thin, transparent, click-through strip so the sidebar >> expand
+     control still lives there; Streamlit's own toolbar (deploy / menu / status) is removed. */
+  header[data-testid="stHeader"] { height: 3rem !important; background: transparent !important;
+      pointer-events: none; }
+  /* Keep Streamlit's toolbar interactive (it hosts the sidebar >> expander); just make its
+     menu button unobtrusive. Everything in the header re-enables its own clicks. */
+  [data-testid="stToolbar"], [data-testid="stToolbar"] * ,
+  [data-testid="stExpandSidebarButton"], [data-testid="stExpandSidebarButton"] * {
+      pointer-events: auto !important; }
+  [data-testid="stMainMenu"], [data-testid="stAppDeployButton"] { display: none !important; }
+  /* Edge-to-edge canvas + NO top padding — the nav row sits in the header band. */
   .main .block-container, .block-container {
-      max-width: 100% !important; padding: 3rem 0.9rem 0 !important; }
+      max-width: 100% !important; padding: 0 0.9rem 0 !important; }
   /* Tighten the sidebar so it reads as a control rail, and let it collapse to nothing. */
   section[data-testid="stSidebar"] { width: 340px !important; }
   section[data-testid="stSidebar"] .block-container { padding-top: 0.6rem !important; }
 
-  /* ── compact top nav ── */
+  /* ── compact top nav (lives in the header band) ── */
+  /* Pull the nav row up into the ~3rem band; left pad leaves room for the >> toggle when the
+     sidebar is collapsed. No position/z-index — the row must NOT overlay the header's >> button. */
+  div[data-testid="stHorizontalBlock"]:has(#cmp-nav-anchor) {
+      min-height: 3rem; align-items: center; padding-left: 44px; }
   .cmp-nav { display: flex; align-items: center; gap: 14px; height: 34px; }
   .cmp-nav img { height: 26px; width: auto; }
   .cmp-nav .t { font-weight: 600; font-size: 0.9rem; color: #111; letter-spacing: -0.01em;
                 white-space: nowrap; }
   .cmp-nav .d { font-size: 0.72rem; color: #8a8a8a; white-space: nowrap; overflow: hidden;
                 text-overflow: ellipsis; }
-  /* keep the nav-row buttons small + right-aligned */
-  div[data-testid="stHorizontalBlock"]:has(#cmp-nav-anchor) button { padding: 2px 10px; min-height: 30px; }
+  /* keep the nav-row buttons small + never wrap */
+  div[data-testid="stHorizontalBlock"]:has(#cmp-nav-anchor) button {
+      padding: 3px 12px !important; min-height: 32px !important; white-space: nowrap !important; }
 </style>
 """
 
