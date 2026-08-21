@@ -125,6 +125,15 @@ def render_composer(user_email: str) -> None:
                  "already in the right frame — e.g. reinserting a loop from the SAME PDB — so its "
                  "native geometry is kept (snap-to-fit would displace it).",
         )
+        with st.expander("Manual pose adjust (Phase 2) — slide/rotate the mount", expanded=False):
+            st.caption("Nudge the mount on top of the base pose to slide it out of a clash. "
+                       "Watch the metrics on the right update live.")
+            tx = st.slider("Move X (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tx")
+            ty = st.slider("Move Y (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_ty")
+            tz = st.slider("Move Z (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tz")
+            rx = st.slider("Rotate X (°)", -180, 180, 0, 5, key="cmp_rx")
+            ry = st.slider("Rotate Y (°)", -180, 180, 0, 5, key="cmp_ry")
+            rz = st.slider("Rotate Z (°)", -180, 180, 0, 5, key="cmp_rz")
         fk, fm = st.columns(2)
         with fk:
             k = st.slider("K — backbones", 1, 10, 4, key="cmp_k")
@@ -137,7 +146,8 @@ def render_composer(user_email: str) -> None:
                 composed = compose_graft(
                     torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
                     torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
-                    torso_chain=t_chain, mount_chain=m_chain, repose=repose, k=k, m=m,
+                    torso_chain=t_chain, mount_chain=m_chain, repose=repose,
+                    nudge=(tx, ty, tz), rotate=(float(rx), float(ry), float(rz)), k=k, m=m,
                 )
             except Exception as e:  # noqa: BLE001
                 st.error(f"Could not compose: {e}")

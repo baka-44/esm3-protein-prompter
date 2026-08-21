@@ -106,6 +106,33 @@ def snap_to_fit(
     return rot, tran
 
 
+def _euler_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
+    """Euler angles (degrees) → 3×3 for the row-vector convention (v @ R)."""
+    ax, ay, az = np.radians([rx, ry, rz])
+    cx, sx = np.cos(ax), np.sin(ax)
+    cy, sy = np.cos(ay), np.sin(ay)
+    cz, sz = np.cos(az), np.sin(az)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return (Rz @ Ry @ Rx).T
+
+
+def _apply_manual(rot, tran, mount_res, mount_keep_set, nudge, rotate):
+    """
+    Compose a manual transform (rotate about the mount centre by `rotate` deg, then translate by
+    `nudge` Å) on top of the base pose (rot, tran), folded back into a single (rot', tran') that
+    maps the mount's INPUT coords to the final placement (new = old @ rot' + tran').
+    """
+    nudge = np.array(nudge, dtype=float)
+    coords = np.array([a.coord for r in mount_res if r.id[1] in mount_keep_set for a in r], dtype=float)
+    if coords.size == 0:
+        return rot, tran + nudge
+    c1 = coords.mean(0) @ rot + tran           # centre of the base-posed mount
+    Rm = _euler_matrix(*rotate)
+    return rot @ Rm, tran @ Rm - c1 @ Rm + c1 + nudge
+
+
 # ── compose ────────────────────────────────────────────────────────────────────
 
 def _write_composite(torso_struct, torso_keep: set[int], torso_chain: str,
@@ -197,6 +224,8 @@ def compose_graft(
     mount_termini: tuple[int, int] | None = None,     # (N-term num, C-term num); default fragment ends
     pose: tuple[np.ndarray, np.ndarray] | None = None,  # explicit (rot, tran); overrides repose
     repose: bool = True,                                # True → snap-to-fit; False → keep input coords
+    nudge: tuple[float, float, float] = (0.0, 0.0, 0.0),  # manual translation (Å) on top of the base pose (Phase 2)
+    rotate: tuple[float, float, float] = (0.0, 0.0, 0.0),  # manual rotation (deg, about the mount centre) on top
     linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
     repack_shell: float = 5.0,
     k: int = 5,
@@ -231,6 +260,11 @@ def compose_graft(
         rot, tran = snap_to_fit(torso_res, f1_end, f2_start, mount_res, mn, mc)
     else:
         rot, tran = _IDENTITY
+
+    # Manual nudge (Phase 2): translation + rotation-about-mount-centre, composed on top of the
+    # base pose. Lets the user slide/rotate the mount out of a clash that snap-to-fit couldn't.
+    if any(nudge) or any(rotate):
+        rot, tran = _apply_manual(rot, tran, mount_res, mount_keep_set, nudge, rotate)
 
     torso_struct = parse_pdb(torso_pdb)
     mount_struct = parse_pdb(mount_pdb)
