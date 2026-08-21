@@ -1,3 +1,7 @@
+[client]
+# Hide the built-in "Deploy / Print / Record / Made with Streamlit" toolbar clutter.
+toolbarMode = "minimal"
+
 [theme]
 base = "light"
 primaryColor = "#00d4aa"

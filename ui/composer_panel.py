@@ -133,88 +133,83 @@ def _apply_pick(pick) -> None:
         st.rerun()
 
 
+_FULLBLEED_CSS = """
+<style>
+  /* Hide the global PHYX44 banner + reclaim its vertical band on the cockpit page. */
+  .phyx-banner { display: none !important; }
+  /* Edge-to-edge canvas: drop Streamlit's centered max-width + padding. */
+  .main .block-container, .block-container {
+      max-width: 100% !important; padding: 0.4rem 0.6rem 0 !important; }
+  /* Tighten the sidebar so it reads as a control rail, and let it collapse to nothing. */
+  section[data-testid="stSidebar"] { width: 340px !important; }
+  section[data-testid="stSidebar"] .block-container { padding-top: 0.6rem !important; }
+</style>
+"""
+
+
 def render_composer(user_email: str) -> None:
     from ui.mol_component import mol_viewer
-    st.session_state.setdefault("cmp_grid", True)
-
-    # ── thin top header (nav bar) ──
-    h1, h2, h3, h4 = st.columns([6.0, 1.3, 1.4, 1.4])
-    with h1:
-        st.markdown("🧩 **Compose Graft** — Borrowed Bodies")
-    with h2:
-        if st.button(("▦ Grid" if st.session_state["cmp_grid"] else "▧ Grid"),
-                     key="cmp_grid_btn", use_container_width=True, help="Toggle the canvas grid."):
-            st.session_state["cmp_grid"] = not st.session_state["cmp_grid"]
-            st.rerun()
-    with h3:
-        if st.button("⇄ Engine", key="cmp_switch", use_container_width=True):
-            st.session_state.pop("_engine", None)
-            st.rerun()
-    with h4:
-        if st.button("Sign out", key="cmp_signout", use_container_width=True):
-            st.session_state.pop("_auth_email", None)
-            st.session_state.pop("_auth_name", None)
-            st.rerun()
-    st.divider()
-
     from proteinredesign.composer import compose_graft
     from proteinredesign.graft import to_engine_params
     from proteinredesign.graft_metrics import compute_metrics, critical_failures
 
-    left, centre, right = st.columns([2.0, 7.0, 2.4], gap="medium")
+    st.markdown(_FULLBLEED_CSS, unsafe_allow_html=True)
 
-    # ── LEFT · inputs (collapsible; expander body always runs → values persist) ──
-    with left:
-        with st.expander("◤ Inputs", expanded=True):
-            st.markdown("**Torso** (stable body)")
-            t_pdb = st.file_uploader("Torso PDB", type=["pdb"], key="cmp_torso", label_visibility="collapsed")
-            if t_pdb:
-                st.caption(_chain_info(t_pdb.getvalue()))
-            t_chain = st.text_input("Torso chain", placeholder="auto", key="cmp_tchain").strip() or None
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                cut1 = st.number_input("Cut 1", min_value=1, value=15, step=1, key="cmp_cut1")
-            with cc2:
-                cut2 = st.number_input("Cut 2", min_value=1, value=30, step=1, key="cmp_cut2")
-
-            st.markdown("**Mount** (catalytic insert)")
-            m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount", label_visibility="collapsed")
-            if m_pdb:
-                st.caption(_chain_info(m_pdb.getvalue()))
-            m_chain = st.text_input("Mount chain", placeholder="auto", key="cmp_mchain").strip() or None
-            keep = st.text_input("Residues to keep", placeholder="10-18  or  57,102,195", key="cmp_keep")
-            repose = st.checkbox("Re-pose (snap-to-fit)", value=True, key="cmp_repose",
-                                 help="OFF keeps the mount's input coords (same-PDB reinsertion).")
-            kk, mm = st.columns(2)
-            with kk:
-                k = st.slider("K", 1, 10, 4, key="cmp_k")
-            with mm:
-                m = st.slider("M", 1, 10, 2, key="cmp_m")
-
-    # Drag-to-pose accumulator (plain session keys, NOT widget keys — the 3D canvas drag adds to
-    # these; the sliders are an additional fine offset. Kept separate to avoid Streamlit's
-    # "can't modify a widget's state after it's created" error).
+    # Drag/scroll-to-pose accumulator (plain session keys — the canvas gestures add to these;
+    # kept separate from any widget key to avoid Streamlit's "can't modify a widget's state
+    # after it's created" error).
     for _dk in ("cmp_dnx", "cmp_dny", "cmp_dnz", "cmp_drx", "cmp_dry", "cmp_drz"):
         st.session_state.setdefault(_dk, 0.0)
     dnx, dny, dnz = (st.session_state[k] for k in ("cmp_dnx", "cmp_dny", "cmp_dnz"))
     drx, dry, drz = (st.session_state[k] for k in ("cmp_drx", "cmp_dry", "cmp_drz"))
 
-    # ── RIGHT (top) · pose — drag on the canvas (Move/Rotate) or fine-tune here ──
-    with right:
-        with st.expander("◥ Pose — drag on canvas or nudge", expanded=True):
-            if any(abs(v) > 1e-6 for v in (dnx, dny, dnz, drx, dry, drz)):
-                st.caption(f"drag: ({dnx:+.1f}, {dny:+.1f}, {dnz:+.1f}) Å · "
-                           f"({drx:+.0f}, {dry:+.0f}, {drz:+.0f})°")
-                if st.button("↺ Reset drag", key="cmp_reset_drag", use_container_width=True):
-                    for _dk in ("cmp_dnx", "cmp_dny", "cmp_dnz", "cmp_drx", "cmp_dry", "cmp_drz"):
-                        st.session_state[_dk] = 0.0
-                    st.rerun()
-            tx = st.slider("Move X (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tx")
-            ty = st.slider("Move Y (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_ty")
-            tz = st.slider("Move Z (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tz")
-            rx = st.slider("Rotate X (°)", -180, 180, 0, 5, key="cmp_rx")
-            ry = st.slider("Rotate Y (°)", -180, 180, 0, 5, key="cmp_ry")
-            rz = st.slider("Rotate Z (°)", -180, 180, 0, 5, key="cmp_rz")
+    # ── ALL controls live in the collapsible sidebar → collapse it and the canvas is the
+    #    whole screen. (Streamlit has no native right sidebar; the pose/selection/metrics
+    #    read-outs live as overlays inside the canvas instead.) ──
+    with st.sidebar:
+        n1, n2 = st.columns(2)
+        if n1.button("⇄ Engine", key="cmp_switch", use_container_width=True):
+            st.session_state.pop("_engine", None)
+            st.rerun()
+        if n2.button("Sign out", key="cmp_signout", use_container_width=True):
+            st.session_state.pop("_auth_email", None)
+            st.session_state.pop("_auth_name", None)
+            st.rerun()
+        st.markdown("### 🧩 Compose Graft")
+        st.caption("Borrowed Bodies — graft a catalytic **mount** onto a stable **torso**.")
+
+        st.markdown("**Torso** (stable body · grey)")
+        t_pdb = st.file_uploader("Torso PDB", type=["pdb"], key="cmp_torso", label_visibility="collapsed")
+        if t_pdb:
+            st.caption(_chain_info(t_pdb.getvalue()))
+        t_chain = st.text_input("Torso chain", placeholder="auto", key="cmp_tchain").strip() or None
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            cut1 = st.number_input("Cut 1", min_value=1, value=15, step=1, key="cmp_cut1")
+        with cc2:
+            cut2 = st.number_input("Cut 2", min_value=1, value=30, step=1, key="cmp_cut2")
+
+        st.markdown("**Mount** (catalytic insert · orange · movable)")
+        m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount", label_visibility="collapsed")
+        if m_pdb:
+            st.caption(_chain_info(m_pdb.getvalue()))
+        m_chain = st.text_input("Mount chain", placeholder="auto", key="cmp_mchain").strip() or None
+        keep = st.text_input("Residues to keep", placeholder="10-18  or  57,102,195", key="cmp_keep")
+        repose = st.checkbox("Re-pose (snap-to-fit)", value=True, key="cmp_repose",
+                             help="OFF keeps the mount's input coords (same-PDB reinsertion).")
+        kk, mm = st.columns(2)
+        with kk:
+            k = st.slider("K", 1, 10, 4, key="cmp_k")
+        with mm:
+            m = st.slider("M", 1, 10, 2, key="cmp_m")
+
+        if any(abs(v) > 1e-6 for v in (dnx, dny, dnz, drx, dry, drz)):
+            st.caption(f"🖐 mount pose: ({dnx:+.1f}, {dny:+.1f}, {dnz:+.1f}) Å · "
+                       f"({drx:+.0f}, {dry:+.0f}, {drz:+.0f})°")
+            if st.button("↺ Reset pose", key="cmp_reset_drag", use_container_width=True):
+                for _dk in ("cmp_dnx", "cmp_dny", "cmp_dnz", "cmp_drx", "cmp_dry", "cmp_drz"):
+                    st.session_state[_dk] = 0.0
+                st.rerun()
 
     composed, err = None, None
     if t_pdb and m_pdb and keep.strip():
@@ -223,50 +218,43 @@ def render_composer(user_email: str) -> None:
                 torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
                 torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
                 torso_chain=t_chain, mount_chain=m_chain, repose=repose,
-                nudge=(tx + dnx, ty + dny, tz + dnz),
-                rotate=(float(rx) + drx, float(ry) + dry, float(rz) + drz), k=k, m=m,
+                nudge=(dnx, dny, dnz), rotate=(drx, dry, drz), k=k, m=m,
             )
         except Exception as e:  # noqa: BLE001
             err = str(e)
 
-    # ── CENTRE · the canvas (max space) ──
-    with centre:
+    # ── metrics + export → sidebar bottom (all Streamlit chrome in one collapsible rail) ──
+    with st.sidebar:
         if composed is not None:
-            frags = " → ".join(s.label for s in composed.spec.fragments())
-            st.caption(f"{frags} · contig `{to_engine_params(composed)['contig']}` · "
-                       "torso grey · mount orange · repack sticks · **click a residue to pick it**")
-            repack = [f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues]
-            pick = mol_viewer(composed.composite_pdb.decode(errors="ignore"), repack=repack, key="cmp_mol")
-            _handle_component_event(pick)
-        elif t_pdb or m_pdb:
-            if err:
-                st.error(f"Could not compose: {err}")
-            src = t_pdb or m_pdb
-            st.caption(("Torso" if t_pdb else "Mount") + " · **click a residue to pick it** "
-                       "(→ set cut points / add to keep)")
-            pick = mol_viewer(src.getvalue().decode(errors="ignore"), key="cmp_mol")
-            _handle_component_event(pick)
-        else:
-            st.info("In the **Inputs** panel: upload a torso + mount, set the cut points and the "
-                    "mount residues to keep — the composite appears here.")
-
-    # ── RIGHT (bottom) · metrics & export ──
-    with right:
-        with st.expander("◢ Metrics & export", expanded=True):
-            if composed is None:
-                st.caption("Compose a graft to see metrics + export.")
+            st.divider()
+            metrics = compute_metrics(composed)
+            crit = critical_failures(metrics)
+            if crit:
+                st.error("Can't export — resolve the ⚠️ metrics.")
+                st.button("⬇️ Export graft package", disabled=True, use_container_width=True, key="cmp_exp0")
             else:
-                for mt in compute_metrics(composed):
-                    flag = "" if mt.ok else " ⚠️"
-                    st.metric(mt.label + flag, f"{mt.value:g} {mt.unit}".strip(),
-                              help=f"{mt.what}\n\n{mt.meaning}\n\n**Desired:** {mt.desired}")
-                if critical_failures(compute_metrics(composed)):
-                    st.error("Can't export — resolve the ⚠️ metrics.")
-                    st.button("⬇️ Export graft package", disabled=True, use_container_width=True, key="cmp_exp0")
-                else:
-                    st.download_button("⬇️ Export graft package", data=composed.to_bytes(),
-                                       file_name="graft_package.graft", mime="application/zip",
-                                       use_container_width=True, key="cmp_exp")
-                st.download_button("⬇️ Composite PDB", data=composed.composite_pdb,
-                                   file_name="composite.pdb", mime="chemical/x-pdb",
-                                   use_container_width=True, key="cmp_dlpdb")
+                st.download_button("⬇️ Export graft package", data=composed.to_bytes(),
+                                   file_name="graft_package.graft", mime="application/zip",
+                                   use_container_width=True, key="cmp_exp")
+            st.download_button("⬇️ Composite PDB", data=composed.composite_pdb,
+                               file_name="composite.pdb", mime="chemical/x-pdb",
+                               use_container_width=True, key="cmp_dlpdb")
+        elif err:
+            st.error(f"Could not compose: {err}")
+
+    # ── MAIN · the canvas, edge to edge ──
+    if composed is not None:
+        repack = [f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues]
+        hud_metrics = [{"label": mt.label, "value": f"{mt.value:g}", "unit": mt.unit, "ok": mt.ok}
+                       for mt in compute_metrics(composed)]
+        ev = mol_viewer(composed.composite_pdb.decode(errors="ignore"), repack=repack,
+                        metrics=hud_metrics, height=760, key="cmp_mol")
+        _handle_component_event(ev)
+    elif t_pdb or m_pdb:
+        src = t_pdb or m_pdb
+        ev = mol_viewer(src.getvalue().decode(errors="ignore"), height=760, key="cmp_mol")
+        _handle_component_event(ev)
+    else:
+        st.info("← In the sidebar: upload a **torso** + **mount**, set the cut points and the "
+                "mount residues to keep. The composite appears here — then click **✋ Pose Mount** "
+                "on the canvas to drag-rotate / two-finger-scroll the mount into place.")
