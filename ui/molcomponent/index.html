@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0d0d0d; overflow: hidden; }
+    #viewport { width: 100%; height: 100vh; position: relative; }
+    #hud {
+      position: absolute; top: 8px; right: 10px; z-index: 5;
+      font: 12px/1.4 'Montserrat', system-ui, sans-serif; color: #cfcfcf;
+      background: rgba(20,20,20,0.6); border: 1px solid #333; border-radius: 6px;
+      padding: 4px 8px; user-select: none;
+    }
+    #hud b { color: #e08a2b; }
+    #gridbtn {
+      position: absolute; top: 8px; left: 10px; z-index: 5; cursor: pointer;
+      font: 13px 'Montserrat', system-ui, sans-serif; color: #cfcfcf;
+      background: rgba(20,20,20,0.6); border: 1px solid #333; border-radius: 6px;
+      padding: 3px 8px; user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="viewport"></div>
+  <div id="gridbtn" title="Toggle grid">▦</div>
+  <div id="hud">click a residue</div>
+
+  <script>
+    // ── Bare Streamlit component protocol (no npm build) ─────────────────────
+    const Streamlit = {
+      _ready: false,
+      ready() {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+        this._ready = true;
+      },
+      setFrameHeight(h) {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
+      },
+      setValue(v) {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*");
+      },
+    };
+
+    let viewer = null, lastPdb = null, gridOn = true, gridShapes = [], lastCoords = null;
+
+    function drawGrid() {
+      gridShapes.forEach(s => viewer.removeShape(s));
+      gridShapes = [];
+      if (!gridOn || !lastCoords || !lastCoords.length) { viewer.render(); return; }
+      const xs = lastCoords.map(c => c[0]), ys = lastCoords.map(c => c[1]), zs = lastCoords.map(c => c[2]);
+      const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cz = (Math.min(...zs) + Math.max(...zs)) / 2;
+      const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...zs) - Math.min(...zs), 20) / 2 + 15;
+      const y0 = Math.min(...ys) - 5, step = 8, n = Math.floor(span / step);
+      for (let i = -n; i <= n; i++) {
+        const off = i * step;
+        gridShapes.push(viewer.addLine({ start: { x: cx - span, y: y0, z: cz + off }, end: { x: cx + span, y: y0, z: cz + off }, color: "0x333333" }));
+        gridShapes.push(viewer.addLine({ start: { x: cx + off, y: y0, z: cz - span }, end: { x: cx + off, y: y0, z: cz + span }, color: "0x333333" }));
+      }
+      viewer.render();
+    }
+
+    function buildModel(pdb, repackSet) {
+      document.getElementById("viewport").innerHTML = "";
+      viewer = $3Dmol.createViewer("viewport", { backgroundColor: "0x0d0d0d" });
+      viewer.addModel(pdb, "pdb");
+      viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
+      viewer.setStyle({ chain: "B" }, { cartoon: { color: "#e08a2b" } });
+      (repackSet || []).forEach(t => {
+        viewer.addStyle({ chain: t[0], resi: parseInt(t.slice(1)) },
+          { stick: { colorscheme: "yellowCarbon", radius: 0.2 } });
+      });
+      // click-to-pick: report the atom's residue back to Python
+      viewer.setClickable({}, true, (atom) => {
+        document.getElementById("hud").innerHTML = "picked <b>" + atom.chain + atom.resi + "</b> (" + atom.resn + ")";
+        Streamlit.setValue({ chain: atom.chain, resi: atom.resi, resn: atom.resn, ts: Date.now() });
+      });
+      // collect CA coords for the grid
+      lastCoords = [];
+      const atoms = viewer.getModel().selectedAtoms({ atom: "CA" });
+      atoms.forEach(a => lastCoords.push([a.x, a.y, a.z]));
+      viewer.zoomTo();
+      drawGrid();
+    }
+
+    document.getElementById("gridbtn").onclick = () => { gridOn = !gridOn; drawGrid(); };
+
+    function onRender(args) {
+      const pdb = args.pdb || "";
+      const h = args.height || 600;
+      if (pdb !== lastPdb) { lastPdb = pdb; if (pdb) buildModel(pdb, args.repack || []); }
+      document.getElementById("viewport").style.height = h + "px";
+      Streamlit.setFrameHeight(h + 4);
+    }
+
+    window.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "streamlit:render") onRender(e.data.args);
+    });
+    Streamlit.ready();
+    Streamlit.setFrameHeight(640);
+  </script>
+</body>
+</html>

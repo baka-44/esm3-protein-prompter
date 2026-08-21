@@ -90,7 +90,27 @@ def _view(pdb_text: str, *, repack_tokens: set[str] | None = None, single_color:
     _st_html(view._make_html(), height=height + 10, scrolling=False)
 
 
+def _apply_pick(pick) -> None:
+    """Show the last picked residue (from the interactive viewer) + apply it to cut/keep (M1)."""
+    if not isinstance(pick, dict) or pick.get("resi") is None:
+        return
+    chain, resi, resn = pick.get("chain"), int(pick["resi"]), pick.get("resn")
+    st.caption(f"Picked **{chain}{resi}** ({resn}) — apply to:")
+    b1, b2, b3 = st.columns(3)
+    if b1.button("→ Cut 1", key="cmp_pk_c1", use_container_width=True):
+        st.session_state["cmp_cut1"] = resi
+        st.rerun()
+    if b2.button("→ Cut 2", key="cmp_pk_c2", use_container_width=True):
+        st.session_state["cmp_cut2"] = resi
+        st.rerun()
+    if b3.button("+ Keep", key="cmp_pk_keep", use_container_width=True):
+        cur = st.session_state.get("cmp_keep", "").strip()
+        st.session_state["cmp_keep"] = f"{cur}, {resi}" if cur else str(resi)
+        st.rerun()
+
+
 def render_composer(user_email: str) -> None:
+    from ui.mol_component import mol_viewer
     st.session_state.setdefault("cmp_grid", True)
 
     # ── thin top header (nav bar) ──
@@ -174,16 +194,18 @@ def render_composer(user_email: str) -> None:
         if composed is not None:
             frags = " → ".join(s.label for s in composed.spec.fragments())
             st.caption(f"{frags} · contig `{to_engine_params(composed)['contig']}` · "
-                       "torso grey · mount orange · repack sticks")
-            repack = {f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues}
-            _view(composed.composite_pdb.decode(errors="ignore"), repack_tokens=repack,
-                  grid=st.session_state["cmp_grid"])
+                       "torso grey · mount orange · repack sticks · **click a residue to pick it**")
+            repack = [f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues]
+            pick = mol_viewer(composed.composite_pdb.decode(errors="ignore"), repack=repack, key="cmp_mol")
+            _apply_pick(pick)
         elif t_pdb or m_pdb:
             if err:
                 st.error(f"Could not compose: {err}")
             src = t_pdb or m_pdb
-            _view(src.getvalue().decode(errors="ignore"),
-                  single_color="#9aa0a6" if t_pdb else "#e08a2b", grid=st.session_state["cmp_grid"])
+            st.caption(("Torso" if t_pdb else "Mount") + " · **click a residue to pick it** "
+                       "(→ set cut points / add to keep)")
+            pick = mol_viewer(src.getvalue().decode(errors="ignore"), key="cmp_mol")
+            _apply_pick(pick)
         else:
             st.info("In the **Inputs** panel: upload a torso + mount, set the cut points and the "
                     "mount residues to keep — the composite appears here.")
