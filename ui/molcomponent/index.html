@@ -14,26 +14,25 @@
     .panel { position: absolute; z-index: 5; color: #cfcfcf; font-size: 12px;
              background: rgba(18,18,18,0.72); border: 1px solid #333; border-radius: 8px;
              padding: 6px 8px; user-select: none; backdrop-filter: blur(2px); }
-
-    /* top-left: mode toggle + grid */
     #tools { top: 10px; left: 12px; display: flex; gap: 6px; align-items: center; padding: 5px; }
     .seg { display: flex; border: 1px solid #333; border-radius: 6px; overflow: hidden; }
-    .seg > span { padding: 4px 10px; cursor: pointer; color: #b8b8b8; }
+    .seg > span { padding: 4px 10px; cursor: pointer; color: #b8b8b8; white-space: nowrap; }
     .seg > span.on { background: #e08a2b; color: #111; font-weight: 600; }
     .icon { padding: 4px 8px; cursor: pointer; border: 1px solid #333; border-radius: 6px; color: #b8b8b8; }
     .icon.on { border-color: #e08a2b; color: #e08a2b; }
 
-    /* top-right: metrics HUD */
-    #metrics { top: 10px; right: 12px; max-width: 210px; display: none; }
+    #metrics { top: 10px; right: 12px; max-width: 220px; display: none; }
     #metrics .row { display: flex; justify-content: space-between; gap: 12px; padding: 1px 0; }
     #metrics .k { color: #8a8a8a; } #metrics .v { color: #dcdcdc; }
     #metrics .bad .v, #metrics .bad .k { color: #ff6b6b; }
     #metrics h4 { margin: 0 0 4px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: #777; font-weight: 600; }
 
-    /* bottom-left: live pose readout */
+    /* posing state pill (only while Pose mode) */
+    #sel { top: 52px; left: 12px; display: none; border-color: #e08a2b; }
+    #sel.show { display: block; }
+    #sel b { color: #e08a2b; }
     #hud { bottom: 12px; left: 12px; display: none; }
-    #hud b { color: #e08a2b; }
-    #hud.show { display: block; }
+    #hud.show { display: block; } #hud b { color: #e08a2b; }
   </style>
 </head>
 <body>
@@ -48,6 +47,7 @@
     <span id="m_grid" class="icon on" title="Toggle reference grid">▦</span>
   </div>
 
+  <div id="sel" class="panel">posing <b>MOUNT</b> (orange) · torso fixed · <b>Esc</b> to release</div>
   <div id="metrics" class="panel"><h4>metrics</h4><div id="metrics_body"></div></div>
   <div id="hud" class="panel">click a residue</div>
 
@@ -58,14 +58,53 @@
       setValue(v) { window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*"); },
     };
 
-    let viewer = null, lastPdb = null, gridOn = true, gridShapes = [], bbox = null;
-    let mode = "cam";                        // "cam" | "pose"
-    const R_SENS = 0.6, T_SENS = 0.05;       // deg/px (drag rotate), Å per wheel-unit (translate)
+    // ── tiny vec / quat helpers (avoid depending on 3Dmol's internal math) ──────
+    const V = {
+      sub: (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]],
+      add: (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]],
+      scale: (a, s) => [a[0]*s, a[1]*s, a[2]*s],
+    };
+    function qMul(a, b) { // Hamilton product, quats as [x,y,z,w]
+      return [
+        a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
+        a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+        a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
+        a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2],
+      ];
+    }
+    const qConj = (q) => [-q[0], -q[1], -q[2], q[3]];
+    function qFromAxisAngle(axis, ang) {
+      const l = Math.hypot(axis[0], axis[1], axis[2]) || 1;
+      const s = Math.sin(ang / 2) / l;
+      return [axis[0]*s, axis[1]*s, axis[2]*s, Math.cos(ang / 2)];
+    }
+    function qToM3(q) { // → row-major 3x3 (standard rotation matrix, v' = R·v)
+      const [x, y, z, w] = q;
+      return [
+        1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w),
+        2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w),
+        2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y),
+      ];
+    }
+    const m3apply = (R, v) => [
+      R[0]*v[0] + R[1]*v[1] + R[2]*v[2],
+      R[3]*v[0] + R[4]*v[1] + R[5]*v[2],
+      R[6]*v[0] + R[7]*v[1] + R[8]*v[2],
+    ];
+    const qRot = (q, v) => m3apply(qToM3(q), v);
+
+    // ── viewer state ───────────────────────────────────────────────────────────
+    let viewer = null, model = null, lastPdb = null, mountChain = "B", lastReset = null;
+    let allAtoms = [], baseCoords = [], isMount = [], centroid = [0, 0, 0];
+    let qAcc = [0, 0, 0, 1], tAcc = [0, 0, 0];   // cumulative mount pose (about centroid)
+    let repackList = [];
+    let gridOn = true, gridShapes = [], bbox = null;
+    let mode = "cam";
+    const R_SENS = 0.6 * Math.PI / 180;          // rad per px (drag rotate)
+    const T_SENS = 0.05;                         // Å per wheel unit (translate)
 
     function hud(s, show) { const h = document.getElementById("hud"); h.innerHTML = s; h.classList.toggle("show", show !== false); }
 
-    // ── 3D reference grid: a floor + two back walls (a "corner box") so it reads as
-    //    scale from any orbit angle, not a flat 2D plane. Sized to the structure bbox. ──
     function drawGrid() {
       gridShapes.forEach(s => viewer.removeShape(s)); gridShapes = [];
       if (!gridOn || !bbox) { viewer.render(); return; }
@@ -75,41 +114,62 @@
       const C = "0x2c2c2c", CE = "0x3d3d3d";
       const line = (a, b, c) => gridShapes.push(viewer.addLine({ start: a, end: b, color: c }));
       const range = (a, b) => { const o = []; for (let v = Math.ceil(a / step) * step; v <= b; v += step) o.push(v); return o; };
-      // floor (y = lo.y): lines along x and z
       range(lo.x, hi.x).forEach(x => line({ x, y: lo.y, z: lo.z }, { x, y: lo.y, z: hi.z }, C));
       range(lo.z, hi.z).forEach(z => line({ x: lo.x, y: lo.y, z }, { x: hi.x, y: lo.y, z }, C));
-      // back wall (z = lo.z): lines along x and y
       range(lo.x, hi.x).forEach(x => line({ x, y: lo.y, z: lo.z }, { x, y: hi.y, z: lo.z }, C));
       range(lo.y, hi.y).forEach(y => line({ x: lo.x, y, z: lo.z }, { x: hi.x, y, z: lo.z }, C));
-      // side wall (x = lo.x): lines along z and y
       range(lo.z, hi.z).forEach(z => line({ x: lo.x, y: lo.y, z }, { x: lo.x, y: hi.y, z }, C));
       range(lo.y, hi.y).forEach(y => line({ x: lo.x, y, z: lo.z }, { x: lo.x, y, z: hi.z }, C));
-      // brighten the three shared edges for depth
       line({ x: lo.x, y: lo.y, z: lo.z }, { x: hi.x, y: lo.y, z: lo.z }, CE);
       line({ x: lo.x, y: lo.y, z: lo.z }, { x: lo.x, y: hi.y, z: lo.z }, CE);
       line({ x: lo.x, y: lo.y, z: lo.z }, { x: lo.x, y: lo.y, z: hi.z }, CE);
       viewer.render();
     }
 
-    function buildModel(pdb, repackSet) {
-      document.getElementById("viewport").innerHTML = "";
-      viewer = $3Dmol.createViewer("viewport", { backgroundColor: "0x0d0d0d" });
-      viewer.addModel(pdb, "pdb");
-      viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });     // torso (anchor)
-      viewer.setStyle({ chain: "B" }, { cartoon: { color: "#e08a2b" } });     // mount (movable)
-      // Faint CA spheres → a large, reliable click target on every residue.
+    // Full-detail styling (Camera mode): cartoon + faint CA click-spheres + repack sticks.
+    function styleFull() {
+      viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
+      viewer.setStyle({ chain: mountChain }, { cartoon: { color: "#e08a2b" } });
       viewer.addStyle({ atom: "CA" }, { sphere: { radius: 0.7, opacity: 0.14, color: "0xbbbbbb" } });
-      (repackSet || []).forEach(t => {
+      repackList.forEach(t => {
         viewer.addStyle({ chain: t[0], resi: parseInt(t.slice(1)) },
           { stick: { colorscheme: "yellowCarbon", radius: 0.2 } });
       });
+    }
+    // Cartoon-only (Pose mode): stick/sphere geometry doesn't follow setCoordinates, so we drop
+    // it while dragging and rebuild it (styleFull) on release — no detached side chains.
+    function styleCartoonOnly() {
+      viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
+      viewer.setStyle({ chain: mountChain }, { cartoon: { color: "#ffa64d" } });   // brighter = selected
+    }
+
+    function computeMountCoords() {
+      const out = allAtoms.map((a, j) => {
+        if (!isMount[j]) return baseCoords[j];
+        const p = V.add(V.add(qRot(qAcc, V.sub(baseCoords[j], centroid)), centroid), tAcc);
+        return p;
+      });
+      return out;
+    }
+    function applyPose() { model.setCoordinates(computeMountCoords(), "array"); viewer.render(); }
+
+    function buildModel(pdb) {
+      document.getElementById("viewport").innerHTML = "";
+      viewer = $3Dmol.createViewer("viewport", { backgroundColor: "0x0d0d0d" });
+      model = viewer.addModel(pdb, "pdb");
+      allAtoms = model.selectedAtoms({});
+      baseCoords = allAtoms.map(a => [a.x, a.y, a.z]);
+      isMount = allAtoms.map(a => a.chain === mountChain);
+      const mc = baseCoords.filter((_, j) => isMount[j]);
+      centroid = mc.length ? mc.reduce((s, p) => V.add(s, p), [0, 0, 0]).map(v => v / mc.length) : [0, 0, 0];
+      qAcc = [0, 0, 0, 1]; tAcc = [0, 0, 0];
+      styleFull();
       viewer.setClickable({}, true, (atom) => {
-        if (mode !== "cam") return;   // in Pose mode the overlay owns the gesture
+        if (mode !== "cam") return;
         hud("picked <b>" + atom.chain + atom.resi + "</b> (" + atom.resn + ")");
         Streamlit.setValue({ kind: "pick", chain: atom.chain, resi: atom.resi, resn: atom.resn, ts: Date.now() });
       });
-      // bounding box from CA atoms (for the grid)
-      const cas = viewer.getModel().selectedAtoms({ atom: "CA" });
+      const cas = allAtoms.filter(a => a.atom === "CA");
       if (cas.length) {
         const xs = cas.map(a => a.x), ys = cas.map(a => a.y), zs = cas.map(a => a.z);
         bbox = { min: { x: Math.min(...xs), y: Math.min(...ys), z: Math.min(...zs) },
@@ -117,6 +177,7 @@
       } else bbox = null;
       viewer.zoomTo();
       drawGrid();
+      if (mode === "pose") setMode("pose");   // keep cartoon-only if we were posing
     }
 
     function setMetrics(list) {
@@ -128,14 +189,24 @@
       box.style.display = "block";
     }
 
-    // ── mode toggle (Camera ⇄ Pose Mount) ──────────────────────────────────────
+    // ── camera basis (so drag rotates / scroll translates as seen) ──────────────
+    function camBasis() {
+      // rotationGroup.quaternion rotates world→view; invert to map screen axes to world.
+      let q = [0, 0, 0, 1];
+      try { const c = viewer.rotationGroup.quaternion; q = [c.x, c.y, c.z, c.w]; } catch (e) {}
+      const inv = qConj(q);
+      return { right: qRot(inv, [1, 0, 0]), up: qRot(inv, [0, 1, 0]) };
+    }
+
+    // ── mode toggle ─────────────────────────────────────────────────────────────
     function setMode(m) {
       mode = m;
       document.getElementById("m_cam").classList.toggle("on", m === "cam");
       document.getElementById("m_pose").classList.toggle("on", m === "pose");
       document.getElementById("overlay").classList.toggle("active", m === "pose");
-      if (m === "pose") hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true);
-      else hud("click a residue", false);
+      document.getElementById("sel").classList.toggle("show", m === "pose");
+      if (m === "pose") { styleCartoonOnly(); applyPose(); hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true); }
+      else { styleFull(); applyPose(); hud("click a residue", false); }
     }
     document.getElementById("m_cam").onclick = () => setMode("cam");
     document.getElementById("m_pose").onclick = () => setMode("pose");
@@ -144,42 +215,53 @@
     };
     window.addEventListener("keydown", (e) => { if (e.key === "Escape" && mode === "pose") setMode("cam"); });
 
-    // ── Pose gestures on the overlay (ChimeraX-style; applied to the mount) ─────
+    function sendPose() {
+      Streamlit.setValue({ kind: "pose_xform", rot: qToM3(qAcc), tran: tAcc, about: centroid, ts: Date.now() });
+    }
+
+    // ── live rotate (drag) ───────────────────────────────────────────────────────
     const ov = document.getElementById("overlay");
-    let dragging = false, sx = 0, sy = 0, accX = 0, accY = 0;
-    ov.addEventListener("mousedown", (e) => { dragging = true; sx = e.clientX; sy = e.clientY; accX = 0; accY = 0; ov.style.cursor = "grabbing"; });
+    let dragging = false, px = 0, py = 0;
+    ov.addEventListener("mousedown", (e) => { dragging = true; px = e.clientX; py = e.clientY; ov.style.cursor = "grabbing"; });
     window.addEventListener("mousemove", (e) => {
       if (!dragging) return;
-      accX = e.clientX - sx; accY = e.clientY - sy;
-      hud("rotate mount Δ <b>" + (accY * R_SENS).toFixed(0) + "°, " + (accX * R_SENS).toFixed(0) + "°</b> (release to apply)", true);
+      const dx = e.clientX - px, dy = e.clientY - py; px = e.clientX; py = e.clientY;
+      const b = camBasis();
+      // horizontal drag → spin about screen-up; vertical drag → tumble about screen-right
+      let q = qFromAxisAngle(b.up, dx * R_SENS);
+      q = qMul(qFromAxisAngle(b.right, dy * R_SENS), q);
+      qAcc = qMul(q, qAcc);
+      applyPose();
+      hud("rotating mount — release to apply", true);
     });
     window.addEventListener("mouseup", () => {
       if (!dragging) return;
       dragging = false; ov.style.cursor = "grab";
-      if (Math.abs(accX) < 2 && Math.abs(accY) < 2) return;   // ignore clicks / jitter
-      Streamlit.setValue({ kind: "pose", dnudge: [0, 0, 0], drotate: [accY * R_SENS, accX * R_SENS, 0], ts: Date.now() });
+      sendPose();
       hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true);
     });
-    // Two-finger scroll → translate the mount in the screen plane. Pinch-zoom (ctrlKey) is
-    // left to the camera. Debounced so one gesture sends one delta.
-    let wheelX = 0, wheelY = 0, wheelTimer = null;
+    // ── live translate (two-finger scroll) ───────────────────────────────────────
+    let wheelTimer = null;
     ov.addEventListener("wheel", (e) => {
-      if (e.ctrlKey) return;                 // pinch-zoom → let it fall through to the camera
+      if (e.ctrlKey) return;                 // pinch-zoom → camera
       e.preventDefault();
-      wheelX += e.deltaX; wheelY += e.deltaY;
-      hud("move mount Δ <b>" + (wheelX * T_SENS).toFixed(1) + ", " + (-wheelY * T_SENS).toFixed(1) + "</b> Å", true);
+      const b = camBasis();
+      const d = V.add(V.scale(b.right, e.deltaX * T_SENS), V.scale(b.up, -e.deltaY * T_SENS));
+      tAcc = V.add(tAcc, d);
+      applyPose();
+      hud("moving mount — release to apply", true);
       clearTimeout(wheelTimer);
-      wheelTimer = setTimeout(() => {
-        if (Math.abs(wheelX) < 1 && Math.abs(wheelY) < 1) { wheelX = wheelY = 0; return; }
-        Streamlit.setValue({ kind: "pose", dnudge: [wheelX * T_SENS, -wheelY * T_SENS, 0], drotate: [0, 0, 0], ts: Date.now() });
-        wheelX = wheelY = 0;
-        hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true);
-      }, 220);
+      wheelTimer = setTimeout(sendPose, 200);
     }, { passive: false });
 
     function onRender(args) {
       const pdb = args.pdb || "", h = args.height || 600;
-      if (pdb !== lastPdb) { lastPdb = pdb; if (pdb) buildModel(pdb, args.repack || []); }
+      mountChain = args.mount_chain || "B";
+      repackList = args.repack || [];
+      if (pdb !== lastPdb) { lastPdb = pdb; if (pdb) buildModel(pdb); }
+      if (args.reset_ts && args.reset_ts !== lastReset) {   // Python asked to reset the pose
+        lastReset = args.reset_ts; qAcc = [0, 0, 0, 1]; tAcc = [0, 0, 0]; applyPose();
+      }
       setMetrics(args.metrics || []);
       document.getElementById("viewport").style.height = h + "px";
       Streamlit.setFrameHeight(h + 4);

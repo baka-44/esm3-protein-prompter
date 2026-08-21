@@ -19,13 +19,18 @@ _component = components.declare_component("bb_mol_viewer", path=_DIR)
 
 
 def mol_viewer(pdb_text: str, *, repack: list[str] | None = None,
-               metrics: list[dict] | None = None, height: int = 620, key: str | None = None):
+               metrics: list[dict] | None = None, mount_chain: str = "B",
+               reset_ts: float | None = None, height: int = 620, key: str | None = None):
     """
-    Render `pdb_text` interactively in a full-bleed canvas. Returns the last component event:
+    Render `pdb_text` interactively in a full-bleed canvas. `pdb_text` is the *base* (snapped)
+    composite; the mount (`mount_chain`, default "B") is posed live client-side — the base never
+    changes during posing, so there is no server round-trip lag. Returns the last component event:
       - {"kind":"pick", "chain","resi","resn","ts"}  — a residue was clicked (Camera mode)
-      - {"kind":"pose", "dnudge":[x,y,z], "drotate":[rx,ry,rz], "ts"}  — the mount was dragged/scrolled
-    or None. `repack` = ["A15","B10",...] shown as sticks. `metrics` = [{label,value,unit,ok}]
-    shown as a read-only HUD in the top-right of the canvas.
+      - {"kind":"pose_xform", "rot":[9], "tran":[3], "about":[3], "ts"}  — cumulative rigid mount
+        transform (rotation matrix row-major + translation, about the mount centroid) on release
+    or None. `repack` = ["A15","B10",...] sticks (Camera mode only). `metrics` = [{label,value,
+    unit,ok}] shown as a read-only HUD. Bump `reset_ts` to reset the on-canvas pose to base.
     """
     return _component(pdb=pdb_text, repack=repack or [], metrics=metrics or [],
+                      mount_chain=mount_chain, reset_ts=reset_ts,
                       height=height, key=key, default=None)
