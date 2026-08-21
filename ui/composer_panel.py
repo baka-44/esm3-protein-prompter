@@ -258,11 +258,12 @@ def render_composer(user_email: str) -> None:
         if t_pdb:
             st.caption(_chain_info(t_pdb.getvalue()))
         t_chain = st.text_input("Torso chain", placeholder="auto", key="cmp_tchain").strip() or None
+        st.caption("**Excision span** — type it, or **✂ Cut** two torso residues on the canvas")
         cc1, cc2 = st.columns(2)
         with cc1:
-            cut1 = st.number_input("Cut 1", min_value=1, value=15, step=1, key="cmp_cut1")
+            cut1 = st.number_input("from", min_value=1, value=15, step=1, key="cmp_cut1")
         with cc2:
-            cut2 = st.number_input("Cut 2", min_value=1, value=30, step=1, key="cmp_cut2")
+            cut2 = st.number_input("to", min_value=1, value=30, step=1, key="cmp_cut2")
 
         st.markdown("**Mount** (catalytic insert · orange · movable)")
         m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount", label_visibility="collapsed")
