@@ -206,9 +206,12 @@ _FULLBLEED_CSS = """
 <style>
   /* Hide the big global PHYX44 banner — we render a compact top nav instead. */
   .phyx-banner { display: none !important; }
-  /* Edge-to-edge canvas: drop Streamlit's centered max-width + padding. */
+  /* Streamlit's header overlays the top of the page and was clipping our nav row. Keep it thin
+     + transparent (it still holds the sidebar >> expand control) and pad content down to clear it. */
+  header[data-testid="stHeader"] { height: 2.6rem !important; background: transparent !important; }
+  /* Edge-to-edge canvas: drop Streamlit's centered max-width; pad the top past the header. */
   .main .block-container, .block-container {
-      max-width: 100% !important; padding: 0.35rem 0.7rem 0 !important; }
+      max-width: 100% !important; padding: 3rem 0.9rem 0 !important; }
   /* Tighten the sidebar so it reads as a control rail, and let it collapse to nothing. */
   section[data-testid="stSidebar"] { width: 340px !important; }
   section[data-testid="stSidebar"] .block-container { padding-top: 0.6rem !important; }
