@@ -97,3 +97,26 @@ def test_compose_roundtrips_through_package_bytes():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_manual_nudge_translates_the_mount():
+    import numpy as np
+    from proteinredesign.graft_metrics import compute_metrics
+    base = compose_graft(torso_pdb=TORSO, mount_pdb=MOUNT, torso_cut=(15, 25), mount_keep=[(1, 20)])
+    nudged = compose_graft(torso_pdb=TORSO, mount_pdb=MOUNT, torso_cut=(15, 25), mount_keep=[(1, 20)],
+                           nudge=(0.0, 0.0, 30.0))
+    gap_base = {m.key: m for m in compute_metrics(base)}["max_linker_gap"].value
+    gap_nudged = {m.key: m for m in compute_metrics(nudged)}["max_linker_gap"].value
+    assert gap_nudged > gap_base + 10   # a 30 Å push opens the junction gaps
+
+
+def test_manual_rotation_is_rigid():
+    # A pure rotation about the mount centre preserves the mount's internal geometry (bond lengths).
+    import numpy as np
+    from utils.pdb_utils import get_residues
+    rotated = compose_graft(torso_pdb=TORSO, mount_pdb=MOUNT, torso_cut=(15, 25), mount_keep=[(1, 20)],
+                            rotate=(0.0, 90.0, 0.0))
+    res = [r for r in get_residues(rotated.composite_pdb, chain_id=None) if r.get_parent().id == "B"]
+    cas = [r["CA"].coord for r in res if "CA" in r]
+    d = np.linalg.norm(np.array(cas[1]) - np.array(cas[0]))
+    assert 3.0 < d < 4.5   # consecutive CA distance stays ~3.8 Å (rigid)
