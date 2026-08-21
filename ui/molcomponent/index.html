@@ -126,8 +126,20 @@
       viewer.render();
     }
 
+    // Write the current cumulative pose (qAcc about `centroid` + tAcc) into the mount atoms.
+    // 3Dmol only regenerates cartoon geometry on setStyle — NOT on setCoordinates+render — so
+    // every visual update must edit the atom objects and then re-apply the mount's style.
+    function writeMountCoords() {
+      for (let j = 0; j < allAtoms.length; j++) {
+        if (!isMount[j]) continue;
+        const p = V.add(V.add(qRot(qAcc, V.sub(baseCoords[j], centroid)), centroid), tAcc);
+        allAtoms[j].x = p[0]; allAtoms[j].y = p[1]; allAtoms[j].z = p[2];
+      }
+    }
+
     // Full-detail styling (Camera mode): cartoon + faint CA click-spheres + repack sticks.
     function styleFull() {
+      writeMountCoords();
       viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
       viewer.setStyle({ chain: mountChain }, { cartoon: { color: "#e08a2b" } });
       viewer.addStyle({ atom: "CA" }, { sphere: { radius: 0.7, opacity: 0.14, color: "0xbbbbbb" } });
@@ -135,23 +147,30 @@
         viewer.addStyle({ chain: t[0], resi: parseInt(t.slice(1)) },
           { stick: { colorscheme: "yellowCarbon", radius: 0.2 } });
       });
+      viewer.render();
     }
-    // Cartoon-only (Pose mode): stick/sphere geometry doesn't follow setCoordinates, so we drop
-    // it while dragging and rebuild it (styleFull) on release — no detached side chains.
+    // Cartoon-only (Pose mode): stick/sphere geometry can't follow a live coordinate edit, so we
+    // drop it while dragging and rebuild it (styleFull) on release — no detached side chains.
     function styleCartoonOnly() {
+      writeMountCoords();
       viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
       viewer.setStyle({ chain: mountChain }, { cartoon: { color: "#ffa64d" } });   // brighter = selected
+      viewer.render();
     }
 
-    function computeMountCoords() {
-      const out = allAtoms.map((a, j) => {
-        if (!isMount[j]) return baseCoords[j];
-        const p = V.add(V.add(qRot(qAcc, V.sub(baseCoords[j], centroid)), centroid), tAcc);
-        return p;
-      });
-      return out;
+    // Live pose update while dragging: rebuild ONLY the mount's cartoon (torso is untouched),
+    // throttled to one render per animation frame so rapid gestures don't pile up.
+    let poseDirty = false, poseRAF = null;
+    function renderPose() {
+      writeMountCoords();
+      viewer.setStyle({ chain: mountChain }, { cartoon: { color: mode === "pose" ? "#ffa64d" : "#e08a2b" } });
+      viewer.render();
     }
-    function applyPose() { model.setCoordinates(computeMountCoords(), "array"); viewer.render(); }
+    function applyPose() {
+      poseDirty = true;
+      if (poseRAF) return;
+      poseRAF = requestAnimationFrame(() => { poseRAF = null; if (poseDirty) { poseDirty = false; renderPose(); } });
+    }
 
     function buildModel(pdb) {
       document.getElementById("viewport").innerHTML = "";
@@ -205,8 +224,8 @@
       document.getElementById("m_pose").classList.toggle("on", m === "pose");
       document.getElementById("overlay").classList.toggle("active", m === "pose");
       document.getElementById("sel").classList.toggle("show", m === "pose");
-      if (m === "pose") { styleCartoonOnly(); applyPose(); hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true); }
-      else { styleFull(); applyPose(); hud("click a residue", false); }
+      if (m === "pose") { styleCartoonOnly(); hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true); }
+      else { styleFull(); hud("click a residue", false); }
     }
     document.getElementById("m_cam").onclick = () => setMode("cam");
     document.getElementById("m_pose").onclick = () => setMode("pose");
@@ -260,7 +279,8 @@
       repackList = args.repack || [];
       if (pdb !== lastPdb) { lastPdb = pdb; if (pdb) buildModel(pdb); }
       if (args.reset_ts && args.reset_ts !== lastReset) {   // Python asked to reset the pose
-        lastReset = args.reset_ts; qAcc = [0, 0, 0, 1]; tAcc = [0, 0, 0]; applyPose();
+        lastReset = args.reset_ts; qAcc = [0, 0, 0, 1]; tAcc = [0, 0, 0];
+        mode === "pose" ? styleCartoonOnly() : styleFull();
       }
       setMetrics(args.metrics || []);
       document.getElementById("viewport").style.height = h + "px";
