@@ -220,6 +220,12 @@ _FULLBLEED_CSS = """
   /* Edge-to-edge canvas + NO top padding — the nav row sits in the header band. */
   .main .block-container, .block-container {
       max-width: 100% !important; padding: 0 0.9rem 0 !important; }
+  /* Each st.markdown(<style>) (app.py's global CSS + this block) leaves an EMPTY element
+     container that still consumes a flex-gap row, stacking blank space above the nav and
+     shoving it under the header. Collapse any element container that holds only a <style>. */
+  [data-testid="stElementContainer"]:has(> [data-testid="stMarkdown"] style),
+  [data-testid="stElementContainer"]:has(> div > style),
+  [data-testid="stElementContainer"]:has(style) { display: none !important; }
   /* Tighten the sidebar so it reads as a control rail, and let it collapse to nothing. */
   section[data-testid="stSidebar"] { width: 340px !important; }
   section[data-testid="stSidebar"] .block-container { padding-top: 0.6rem !important; }
