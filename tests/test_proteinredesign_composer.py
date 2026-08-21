@@ -122,6 +122,30 @@ def test_manual_rotation_is_rigid():
     assert 3.0 < d < 4.5   # consecutive CA distance stays ~3.8 Å (rigid)
 
 
+def test_connection_points_are_the_two_linker_junctions():
+    # The exit-vector arrows (M3) are one per linker: TORSO-1.end → MOUNT-1.start and
+    # MOUNT-last.end → TORSO-2.start, with the mount-side endpoint flagged so the canvas moves
+    # it with the live pose. Mirror the extraction that ui/composer_panel._connection_points does.
+    from proteinredesign.graft import Fragment, Linker
+    from utils.pdb_utils import get_residues
+    base = compose_graft(torso_pdb=TORSO, mount_pdb=MOUNT, torso_cut=(15, 25), mount_keep=[(1, 20)])
+    ca = {(r.get_parent().id, r.id[1]): r["CA"].coord
+          for r in get_residues(base.composite_pdb, chain_id=None) if "CA" in r}
+    order = base.spec.chain_order
+    conns = []
+    for i, seg in enumerate(order):
+        if isinstance(seg, Linker) and 0 < i < len(order) - 1:
+            prev, nxt = order[i - 1], order[i + 1]
+            if isinstance(prev, Fragment) and isinstance(nxt, Fragment):
+                conns.append((prev.chain == "B", nxt.chain == "B",
+                              (prev.chain, prev.end) in ca, (nxt.chain, nxt.start) in ca))
+    assert len(conns) == 2
+    # first junction: torso→mount ; second: mount→torso ; all four endpoints resolve to a CA.
+    assert conns[0][:2] == (False, True)
+    assert conns[1][:2] == (True, False)
+    assert all(c[2] and c[3] for c in conns)
+
+
 def test_mount_transform_matches_client_math():
     # The live-canvas transform (R about `about` + t) must reproduce, atom-for-atom, the exact
     # coordinates the 3D component applies: new = R·(base − c) + c + t. This is what keeps the

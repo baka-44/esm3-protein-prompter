@@ -20,6 +20,7 @@ _component = components.declare_component("bb_mol_viewer", path=_DIR)
 
 def mol_viewer(pdb_text: str, *, repack: list[str] | None = None,
                metrics: list[dict] | None = None, mount_chain: str = "B",
+               connections: list[dict] | None = None,
                reset_ts: float | None = None, height: int = 620, key: str | None = None):
     """
     Render `pdb_text` interactively in a full-bleed canvas. `pdb_text` is the *base* (snapped)
@@ -32,5 +33,5 @@ def mol_viewer(pdb_text: str, *, repack: list[str] | None = None,
     unit,ok}] shown as a read-only HUD. Bump `reset_ts` to reset the on-canvas pose to base.
     """
     return _component(pdb=pdb_text, repack=repack or [], metrics=metrics or [],
-                      mount_chain=mount_chain, reset_ts=reset_ts,
+                      mount_chain=mount_chain, connections=connections or [], reset_ts=reset_ts,
                       height=height, key=key, default=None)

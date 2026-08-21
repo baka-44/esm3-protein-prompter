@@ -42,12 +42,16 @@
   <div id="tools" class="panel">
     <div class="seg">
       <span id="m_cam" class="on">🔄 Camera</span>
+      <span id="m_cut">✂ Cut</span>
       <span id="m_pose">✋ Pose&nbsp;Mount</span>
     </div>
+    <span id="m_conn" class="icon on" title="Toggle linker-connection arrows">⇢</span>
     <span id="m_grid" class="icon on" title="Toggle reference grid">▦</span>
   </div>
 
   <div id="sel" class="panel">posing <b>MOUNT</b> (orange) · torso fixed · <b>Esc</b> to release</div>
+  <div id="cutpill" class="panel" style="top:52px;left:12px;display:none;border-color:#ff6b6b">
+    <b style="color:#ff6b6b">✂ Cut</b> — click two <b>torso</b> residues to set the excision span</div>
   <div id="metrics" class="panel"><h4>metrics</h4><div id="metrics_body"></div></div>
   <div id="hud" class="panel">click a residue</div>
 
@@ -99,7 +103,9 @@
     let qAcc = [0, 0, 0, 1], tAcc = [0, 0, 0];   // cumulative mount pose (about centroid)
     let repackList = [];
     let gridOn = true, gridShapes = [], bbox = null;
-    let mode = "cam";
+    let connections = [], connShapes = [], connOn = true;   // linker exit-vector arrows
+    let pendingCut = null;                                  // first scissor click (chain A resi)
+    let mode = "cam";                                       // "cam" | "cut" | "pose"
     const R_SENS = 0.6 * Math.PI / 180;          // rad per px (drag rotate)
     const T_SENS = 0.05;                         // Å per wheel unit (translate)
 
@@ -136,6 +142,25 @@
         allAtoms[j].x = p[0]; allAtoms[j].y = p[1]; allAtoms[j].z = p[2];
       }
     }
+    // Move a connection endpoint by the live pose if it belongs to the mount (torso ends are fixed).
+    const livePt = (p, isM) => isM ? V.add(V.add(qRot(qAcc, V.sub(p, centroid)), centroid), tAcc) : p;
+
+    // Exit-vector arrows: each arrow is a linker connection (torso-cut-end ↔ mount-terminus). They
+    // update live as the mount is posed → drag the mount until both arrows are short + green
+    // (the linker can close the gap). Red = too far for a linker to reach.
+    function drawConnections() {
+      connShapes.forEach(s => viewer.removeShape(s)); connShapes = [];
+      if (!connOn || !connections.length) return;
+      connections.forEach(c => {
+        const a = livePt(c.from, c.fm), b = livePt(c.to, c.tm);
+        const d = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+        const col = d <= 12 ? "0x39d98a" : (d <= 20 ? "0xe0a52b" : "0xff5b5b");
+        connShapes.push(viewer.addArrow({
+          start: { x: a[0], y: a[1], z: a[2] }, end: { x: b[0], y: b[1], z: b[2] },
+          radius: 0.18, color: col, radiusRatio: 2.6,
+        }));
+      });
+    }
 
     // Full-detail styling (Camera mode): cartoon + faint CA click-spheres + repack sticks.
     function styleFull() {
@@ -147,6 +172,7 @@
         viewer.addStyle({ chain: t[0], resi: parseInt(t.slice(1)) },
           { stick: { colorscheme: "yellowCarbon", radius: 0.2 } });
       });
+      drawConnections();
       viewer.render();
     }
     // Cartoon-only (Pose mode): stick/sphere geometry can't follow a live coordinate edit, so we
@@ -155,6 +181,7 @@
       writeMountCoords();
       viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
       viewer.setStyle({ chain: mountChain }, { cartoon: { color: "#ffa64d" } });   // brighter = selected
+      drawConnections();
       viewer.render();
     }
 
@@ -164,6 +191,7 @@
     function renderPose() {
       writeMountCoords();
       viewer.setStyle({ chain: mountChain }, { cartoon: { color: mode === "pose" ? "#ffa64d" : "#e08a2b" } });
+      drawConnections();
       viewer.render();
     }
     function applyPose() {
@@ -184,7 +212,8 @@
       qAcc = [0, 0, 0, 1]; tAcc = [0, 0, 0];
       styleFull();
       viewer.setClickable({}, true, (atom) => {
-        if (mode !== "cam") return;
+        if (mode === "pose") return;                      // Pose mode: the overlay owns the gesture
+        if (mode === "cut") { onCutClick(atom); return; } // Cut mode: scissor two torso residues
         hud("picked <b>" + atom.chain + atom.resi + "</b> (" + atom.resn + ")");
         Streamlit.setValue({ kind: "pick", chain: atom.chain, resi: atom.resi, resn: atom.resn, ts: Date.now() });
       });
@@ -217,22 +246,48 @@
       return { right: qRot(inv, [1, 0, 0]), up: qRot(inv, [0, 1, 0]) };
     }
 
-    // ── mode toggle ─────────────────────────────────────────────────────────────
+    // ── scissor-by-click cuts (Cut mode): click two torso residues → set the excision span ──
+    function markCut(resi) {
+      viewer.addStyle({ chain: "A", resi }, { sphere: { radius: 1.3, color: "0xff5b5b" } });
+      viewer.render();
+    }
+    function onCutClick(atom) {
+      if (atom.chain !== "A") { hud("cut points must be on the <b>torso</b> (grey)", true); return; }
+      if (pendingCut === null) {
+        pendingCut = atom.resi; markCut(atom.resi);
+        hud("cut start <b>A" + atom.resi + "</b> — click the other end", true);
+      } else {
+        const c1 = Math.min(pendingCut, atom.resi), c2 = Math.max(pendingCut, atom.resi);
+        markCut(atom.resi); pendingCut = null;
+        hud("excising <b>A" + c1 + "–A" + c2 + "</b> …", true);
+        Streamlit.setValue({ kind: "cut_span", cut1: c1, cut2: c2, ts: Date.now() });
+      }
+    }
+
+    // ── mode toggle (Camera / Cut / Pose) ────────────────────────────────────────
     function setMode(m) {
-      mode = m;
+      mode = m; pendingCut = null;
       document.getElementById("m_cam").classList.toggle("on", m === "cam");
+      document.getElementById("m_cut").classList.toggle("on", m === "cut");
       document.getElementById("m_pose").classList.toggle("on", m === "pose");
       document.getElementById("overlay").classList.toggle("active", m === "pose");
       document.getElementById("sel").classList.toggle("show", m === "pose");
+      document.getElementById("cutpill").style.display = (m === "cut") ? "block" : "none";
       if (m === "pose") { styleCartoonOnly(); hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true); }
+      else if (m === "cut") { styleFull(); hud("click two <b>torso</b> residues to set the cut", true); }
       else { styleFull(); hud("click a residue", false); }
     }
     document.getElementById("m_cam").onclick = () => setMode("cam");
+    document.getElementById("m_cut").onclick = () => setMode("cut");
     document.getElementById("m_pose").onclick = () => setMode("pose");
     document.getElementById("m_grid").onclick = () => {
       gridOn = !gridOn; document.getElementById("m_grid").classList.toggle("on", gridOn); drawGrid();
     };
-    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && mode === "pose") setMode("cam"); });
+    document.getElementById("m_conn").onclick = () => {
+      connOn = !connOn; document.getElementById("m_conn").classList.toggle("on", connOn);
+      mode === "pose" ? styleCartoonOnly() : styleFull();
+    };
+    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && mode !== "cam") setMode("cam"); });
 
     function sendPose() {
       Streamlit.setValue({ kind: "pose_xform", rot: qToM3(qAcc), tran: tAcc, about: centroid, ts: Date.now() });
@@ -277,7 +332,9 @@
       const pdb = args.pdb || "", h = args.height || 600;
       mountChain = args.mount_chain || "B";
       repackList = args.repack || [];
+      connections = args.connections || [];
       if (pdb !== lastPdb) { lastPdb = pdb; if (pdb) buildModel(pdb); }
+      else { mode === "pose" ? styleCartoonOnly() : styleFull(); }   // refresh arrows on new props
       if (args.reset_ts && args.reset_ts !== lastReset) {   // Python asked to reset the pose
         lastReset = args.reset_ts; qAcc = [0, 0, 0, 1]; tAcc = [0, 0, 0];
         mode === "pose" ? styleCartoonOnly() : styleFull();
