@@ -120,3 +120,34 @@ def test_manual_rotation_is_rigid():
     cas = [r["CA"].coord for r in res if "CA" in r]
     d = np.linalg.norm(np.array(cas[1]) - np.array(cas[0]))
     assert 3.0 < d < 4.5   # consecutive CA distance stays ~3.8 Å (rigid)
+
+
+def test_mount_transform_matches_client_math():
+    # The live-canvas transform (R about `about` + t) must reproduce, atom-for-atom, the exact
+    # coordinates the 3D component applies: new = R·(base − c) + c + t. This is what keeps the
+    # exported/metric geometry identical to what the user posed on screen. Agreement is to PDB
+    # write precision (coords stored to 3 decimals), so the tolerance is ~1e-3 Å.
+    import numpy as np
+    from utils.pdb_utils import get_residues
+    common = dict(torso_pdb=TORSO, mount_pdb=MOUNT, torso_cut=(15, 25), mount_keep=[(1, 20)])
+
+    def mount_coords(pkg):
+        res = [r for r in get_residues(pkg.composite_pdb, chain_id=None) if r.get_parent().id == "B"]
+        return np.array([a.coord for r in res for a in r])
+
+    base = compose_graft(**common)
+    bc = mount_coords(base)
+    c = bc.mean(0)
+    th = np.radians(37.0)
+    R = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1.0]])
+    t = np.array([4.0, -2.0, 3.5])
+    expected = (R @ (bc - c).T).T + c + t
+    posed = compose_graft(**common, mount_transform={
+        "rot": R.flatten().tolist(), "tran": t.tolist(), "about": c.tolist()})
+    assert np.abs(mount_coords(posed) - expected).max() < 2e-3
+    # torso (chain A) is untouched by the mount transform.
+    ta = np.array([a.coord for r in get_residues(base.composite_pdb, chain_id=None)
+                   if r.get_parent().id == "A" for a in r])
+    tb = np.array([a.coord for r in get_residues(posed.composite_pdb, chain_id=None)
+                   if r.get_parent().id == "A" for a in r])
+    assert np.abs(ta - tb).max() < 1e-6

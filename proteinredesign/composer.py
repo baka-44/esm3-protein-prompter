@@ -226,6 +226,8 @@ def compose_graft(
     repose: bool = True,                                # True → snap-to-fit; False → keep input coords
     nudge: tuple[float, float, float] = (0.0, 0.0, 0.0),  # manual translation (Å) on top of the base pose (Phase 2)
     rotate: tuple[float, float, float] = (0.0, 0.0, 0.0),  # manual rotation (deg, about the mount centre) on top
+    mount_transform: dict | None = None,  # {"rot":[9 row-major], "tran":[3], "about":[3]} — a rigid
+    # transform applied to the base-posed mount about `about` (from the live 3D canvas). new = R·(p-c)+c+t.
     linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
     repack_shell: float = 5.0,
     k: int = 5,
@@ -265,6 +267,16 @@ def compose_graft(
     # base pose. Lets the user slide/rotate the mount out of a clash that snap-to-fit couldn't.
     if any(nudge) or any(rotate):
         rot, tran = _apply_manual(rot, tran, mount_res, mount_keep_set, nudge, rotate)
+
+    # Live canvas transform (Phase 2 M2): a rigid rotation R (about point `about`) + translation t,
+    # applied to the base-posed mount. Fold into (rot, tran) the same way _apply_manual does, using
+    # Rm = Rᵀ (client sends a column-vector matrix R with new = R·v; row-vector form is v @ Rᵀ).
+    if mount_transform:
+        R = np.array(mount_transform["rot"], dtype=float).reshape(3, 3)
+        t = np.array(mount_transform["tran"], dtype=float)
+        c1 = np.array(mount_transform["about"], dtype=float)
+        Rm = R.T
+        rot, tran = rot @ Rm, tran @ Rm - c1 @ Rm + c1 + t
 
     torso_struct = parse_pdb(torso_pdb)
     mount_struct = parse_pdb(mount_pdb)
