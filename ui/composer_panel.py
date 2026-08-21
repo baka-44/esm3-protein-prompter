@@ -1,15 +1,19 @@
 """
-ui/composer_panel.py — Borrowed Bodies "Compose Graft" cockpit (Phase-1 cockpit-lite).
+ui/composer_panel.py — Borrowed Bodies "Compose Graft" cockpit (Phase-1 cockpit-lite + Phase-2
+manual pose).
 
-Typed operations (retain / cut) + snap-to-fit pose → compose a graft in a shared 3D frame; a
-right-hand panel shows live metrics with tooltips (CC12) and an export-gated download (CC13).
-The interactive drag/click 3D editor is Phase 2; here the viewer is view-only and manipulation is
-by typed inputs. Exported `.graft` packages import into the RFdiffusion "Borrowed Bodies" preset.
+Layout: a thin top header (grid toggle · engine switch · sign out), a collapsible LEFT inputs
+panel (torso/mount/cut/keep/fan-out), a wide black 3D canvas in the centre, and a collapsible
+RIGHT panel — pose sliders (top) + live metrics & export (bottom). The viewer is view-only
+(drag-in-3D is the Phase-2 custom component); manipulation is by typed inputs + pose sliders.
+Exported `.graft` packages import into the RFdiffusion "Borrowed Bodies" preset.
 """
 
 from __future__ import annotations
 
 import streamlit as st
+
+_BG = "0x0d0d0d"  # near-black canvas
 
 
 def _parse_ranges(s: str) -> list[tuple[int, int]]:
@@ -23,44 +27,7 @@ def _parse_ranges(s: str) -> list[tuple[int, int]]:
     return out
 
 
-def _view_composite(pdb_text: str, repack_tokens: set[str], height: int = 420) -> None:
-    """View-only 3D render of the composite (torso = grey, mount = orange, repack = sticks)."""
-    try:
-        import py3Dmol
-        from streamlit.components.v1 import html as _st_html
-    except Exception:  # noqa: BLE001
-        st.caption("3D viewer unavailable (py3Dmol not installed).")
-        return
-    view = py3Dmol.view(width=560, height=height)
-    view.addModel(pdb_text, "pdb")
-    view.setStyle({"chain": "A"}, {"cartoon": {"color": "#8a8a8a"}})
-    view.setStyle({"chain": "B"}, {"cartoon": {"color": "#e08a2b"}})
-    for tok in repack_tokens:
-        try:
-            view.addStyle({"chain": tok[0], "resi": int(tok[1:])},
-                          {"stick": {"colorscheme": "yellowCarbon", "radius": 0.2}})
-        except ValueError:
-            pass
-    view.zoomTo()
-    _st_html(view._make_html(), height=height + 10, scrolling=False)
-
-
-def _view_structure(pdb_bytes: bytes, color: str, height: int = 260) -> None:
-    """Single-protein preview (uploaded torso or mount, before composing)."""
-    try:
-        import py3Dmol
-        from streamlit.components.v1 import html as _st_html
-    except Exception:  # noqa: BLE001
-        return
-    view = py3Dmol.view(width=560, height=height)
-    view.addModel(pdb_bytes.decode(errors="ignore"), "pdb")
-    view.setStyle({}, {"cartoon": {"color": color}})
-    view.zoomTo()
-    _st_html(view._make_html(), height=height + 10, scrolling=False)
-
-
 def _chain_info(pdb_bytes: bytes) -> str:
-    """Human-readable chain/residue-range summary so users can pick valid cut/keep numbers."""
     from utils.pdb_utils import get_residues
     try:
         residues = get_residues(pdb_bytes, chain_id=None)
@@ -69,136 +36,175 @@ def _chain_info(pdb_bytes: bytes) -> str:
     chains: dict[str, list[int]] = {}
     for r in residues:
         chains.setdefault(r.get_parent().id, []).append(r.id[1])
-    return " · ".join(f"chain **{c}**: residues {min(ns)}–{max(ns)} ({len(ns)} aa)"
-                      for c, ns in chains.items())
+    return " · ".join(f"chain **{c}**: {min(ns)}–{max(ns)} ({len(ns)} aa)" for c, ns in chains.items())
+
+
+def _grid_lines(view, pdb_text: str) -> None:
+    """A thin mild-grey reference grid in the XZ plane under the structure."""
+    try:
+        xs, ys, zs = [], [], []
+        for line in pdb_text.splitlines():
+            if line.startswith(("ATOM", "HETATM")) and line[12:16].strip() == "CA":
+                xs.append(float(line[30:38])); ys.append(float(line[38:46])); zs.append(float(line[46:54]))
+        if not xs:
+            return
+        cx, cz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
+        span = max(max(xs) - min(xs), max(zs) - min(zs), 20.0) / 2 + 15.0
+        y0, step = min(ys) - 5.0, 8.0
+        n = int(span // step)
+        for i in range(-n, n + 1):
+            off = i * step
+            view.addLine({"start": {"x": cx - span, "y": y0, "z": cz + off},
+                          "end": {"x": cx + span, "y": y0, "z": cz + off}, "color": "0x333333"})
+            view.addLine({"start": {"x": cx + off, "y": y0, "z": cz - span},
+                          "end": {"x": cx + off, "y": y0, "z": cz + span}, "color": "0x333333"})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _view(pdb_text: str, *, repack_tokens: set[str] | None = None, single_color: str | None = None,
+          grid: bool = True, height: int = 640) -> None:
+    try:
+        import py3Dmol
+        from streamlit.components.v1 import html as _st_html
+    except Exception:  # noqa: BLE001
+        st.caption("3D viewer unavailable (py3Dmol not installed).")
+        return
+    view = py3Dmol.view(width=1050, height=height)
+    view.setBackgroundColor(_BG)
+    view.addModel(pdb_text, "pdb")
+    if single_color:
+        view.setStyle({}, {"cartoon": {"color": single_color}})
+    else:
+        view.setStyle({"chain": "A"}, {"cartoon": {"color": "#9aa0a6"}})
+        view.setStyle({"chain": "B"}, {"cartoon": {"color": "#e08a2b"}})
+        for tok in (repack_tokens or set()):
+            try:
+                view.addStyle({"chain": tok[0], "resi": int(tok[1:])},
+                              {"stick": {"colorscheme": "yellowCarbon", "radius": 0.2}})
+            except ValueError:
+                pass
+    if grid:
+        _grid_lines(view, pdb_text)
+    view.zoomTo()
+    _st_html(view._make_html(), height=height + 10, scrolling=False)
 
 
 def render_composer(user_email: str) -> None:
-    st.subheader("🧩 Compose Graft — Borrowed Bodies")
-    st.caption(
-        "Graft a catalytic **mount** onto a stable **torso**: keep the mount's functional residues, "
-        "cut the torso open, and pose them together. Export a graft package to run through the "
-        "RFdiffusion **Borrowed Bodies** preset."
-    )
+    st.session_state.setdefault("cmp_grid", True)
+
+    # ── thin top header (nav bar) ──
+    h1, h2, h3, h4 = st.columns([6.0, 1.3, 1.4, 1.4])
+    with h1:
+        st.markdown("🧩 **Compose Graft** — Borrowed Bodies")
+    with h2:
+        if st.button(("▦ Grid" if st.session_state["cmp_grid"] else "▧ Grid"),
+                     key="cmp_grid_btn", use_container_width=True, help="Toggle the canvas grid."):
+            st.session_state["cmp_grid"] = not st.session_state["cmp_grid"]
+            st.rerun()
+    with h3:
+        if st.button("⇄ Engine", key="cmp_switch", use_container_width=True):
+            st.session_state.pop("_engine", None)
+            st.rerun()
+    with h4:
+        if st.button("Sign out", key="cmp_signout", use_container_width=True):
+            st.session_state.pop("_auth_email", None)
+            st.session_state.pop("_auth_name", None)
+            st.rerun()
+    st.divider()
 
     from proteinredesign.composer import compose_graft
     from proteinredesign.graft import to_engine_params
     from proteinredesign.graft_metrics import compute_metrics, critical_failures
 
-    main, panel = st.columns([2, 1], gap="large")
+    left, centre, right = st.columns([2.0, 7.0, 2.4], gap="medium")
 
-    with main:
-        st.markdown("##### 1 · Torso (the stable body)")
-        t_pdb = st.file_uploader("Torso PDB", type=["pdb"], key="cmp_torso")
-        if t_pdb:
-            info = _chain_info(t_pdb.getvalue())
-            if info:
-                st.caption(info)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            t_chain = st.text_input("Chain", placeholder="auto", key="cmp_tchain").strip() or None
-        with c2:
-            cut1 = st.number_input("Cut point 1", min_value=1, value=15, step=1, key="cmp_cut1")
-        with c3:
-            cut2 = st.number_input("Cut point 2", min_value=1, value=30, step=1, key="cmp_cut2")
-        st.caption("The residues **between** the two cut points are excised → TORSO-1 + TORSO-2 (CC5).")
+    # ── LEFT · inputs (collapsible; expander body always runs → values persist) ──
+    with left:
+        with st.expander("◤ Inputs", expanded=True):
+            st.markdown("**Torso** (stable body)")
+            t_pdb = st.file_uploader("Torso PDB", type=["pdb"], key="cmp_torso", label_visibility="collapsed")
+            if t_pdb:
+                st.caption(_chain_info(t_pdb.getvalue()))
+            t_chain = st.text_input("Torso chain", placeholder="auto", key="cmp_tchain").strip() or None
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                cut1 = st.number_input("Cut 1", min_value=1, value=15, step=1, key="cmp_cut1")
+            with cc2:
+                cut2 = st.number_input("Cut 2", min_value=1, value=30, step=1, key="cmp_cut2")
 
-        st.markdown("##### 2 · Mount (the catalytic insert)")
-        m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount")
-        if m_pdb:
-            info = _chain_info(m_pdb.getvalue())
-            if info:
-                st.caption(info)
-        mc1, mc2 = st.columns([1, 3])
-        with mc1:
-            m_chain = st.text_input("Chain", placeholder="auto", key="cmp_mchain").strip() or None
-        with mc2:
-            keep = st.text_input("Residues to keep (with side chains)",
-                                 placeholder="10-18  or  57, 102, 195",
-                                 key="cmp_keep",
-                                 help="Kept as an all-atom rigid motif (catalytic geometry held).")
+            st.markdown("**Mount** (catalytic insert)")
+            m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount", label_visibility="collapsed")
+            if m_pdb:
+                st.caption(_chain_info(m_pdb.getvalue()))
+            m_chain = st.text_input("Mount chain", placeholder="auto", key="cmp_mchain").strip() or None
+            keep = st.text_input("Residues to keep", placeholder="10-18  or  57,102,195", key="cmp_keep")
+            repose = st.checkbox("Re-pose (snap-to-fit)", value=True, key="cmp_repose",
+                                 help="OFF keeps the mount's input coords (same-PDB reinsertion).")
+            kk, mm = st.columns(2)
+            with kk:
+                k = st.slider("K", 1, 10, 4, key="cmp_k")
+            with mm:
+                m = st.slider("M", 1, 10, 2, key="cmp_m")
 
-        st.markdown("##### 3 · Placement & fan-out")
-        repose = st.checkbox(
-            "Re-pose the mount (snap-to-fit)", value=True, key="cmp_repose",
-            help="ON: snap the mount's termini onto the torso cut ends. Turn OFF when the mount is "
-                 "already in the right frame — e.g. reinserting a loop from the SAME PDB — so its "
-                 "native geometry is kept (snap-to-fit would displace it).",
-        )
-        with st.expander("Manual pose adjust (Phase 2) — slide/rotate the mount", expanded=False):
-            st.caption("Nudge the mount on top of the base pose to slide it out of a clash. "
-                       "Watch the metrics on the right update live.")
+    # ── RIGHT (top) · pose sliders — rendered before compose so their values feed it ──
+    with right:
+        with st.expander("◥ Pose — nudge the mount", expanded=True):
             tx = st.slider("Move X (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tx")
             ty = st.slider("Move Y (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_ty")
             tz = st.slider("Move Z (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tz")
             rx = st.slider("Rotate X (°)", -180, 180, 0, 5, key="cmp_rx")
             ry = st.slider("Rotate Y (°)", -180, 180, 0, 5, key="cmp_ry")
             rz = st.slider("Rotate Z (°)", -180, 180, 0, 5, key="cmp_rz")
-        fk, fm = st.columns(2)
-        with fk:
-            k = st.slider("K — backbones", 1, 10, 4, key="cmp_k")
-        with fm:
-            m = st.slider("M — sequences per backbone", 1, 10, 2, key="cmp_m")
 
-        composed = None
-        if t_pdb and m_pdb and keep.strip():
-            try:
-                composed = compose_graft(
-                    torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
-                    torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
-                    torso_chain=t_chain, mount_chain=m_chain, repose=repose,
-                    nudge=(tx, ty, tz), rotate=(float(rx), float(ry), float(rz)), k=k, m=m,
-                )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Could not compose: {e}")
+    composed, err = None, None
+    if t_pdb and m_pdb and keep.strip():
+        try:
+            composed = compose_graft(
+                torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
+                torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
+                torso_chain=t_chain, mount_chain=m_chain, repose=repose,
+                nudge=(tx, ty, tz), rotate=(float(rx), float(ry), float(rz)), k=k, m=m,
+            )
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
 
+    # ── CENTRE · the canvas (max space) ──
+    with centre:
         if composed is not None:
             frags = " → ".join(s.label for s in composed.spec.fragments())
-            st.success(f"Composed (snap-to-fit): **{frags}**  ·  contig "
-                       f"`{to_engine_params(composed)['contig']}`")
-            # Exactly ONE py3Dmol viewer on the page at a time (multiple conflict → blank).
-            choice = st.radio("View", ["Composite", "Torso", "Mount"], horizontal=True,
-                              key="cmp_view", label_visibility="collapsed")
-            if choice == "Composite":
-                repack = {f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues}
-                _view_composite(composed.composite_pdb.decode(errors="ignore"), repack)
-                st.caption("Torso = grey · Mount = orange · Repack shell = yellow sticks (CC9).")
-            elif choice == "Torso" and t_pdb:
-                _view_structure(t_pdb.getvalue(), "#8a8a8a", height=420)
-            elif choice == "Mount" and m_pdb:
-                _view_structure(m_pdb.getvalue(), "#e08a2b", height=420)
-            st.download_button(
-                "⬇️ Download composite PDB", data=composed.composite_pdb,
-                file_name="composite.pdb", mime="chemical/x-pdb", key="cmp_dlpdb",
-                help="If the 3D view is blank, download and open in PyMOL / ChimeraX.",
-            )
-
-    with panel:
-        st.markdown("##### Live metrics")
-        if composed is None:
-            st.info("Upload a torso + mount and list the mount residues to keep. "
-                    "Metrics and export appear here.")
-            return
-
-        metrics = compute_metrics(composed)
-        for mt in metrics:
-            flag = "" if mt.ok else " ⚠️"
-            tip = f"{mt.what}\n\n{mt.meaning}\n\n**Desired:** {mt.desired}"
-            st.metric(mt.label + flag, f"{mt.value:g} {mt.unit}".strip(), help=tip)
-
-        st.divider()
-        crit = critical_failures(metrics)
-        if crit:
-            st.error("Cannot export — fix: " + ", ".join(crit))
-            st.button("⬇️ Export graft package", disabled=True, use_container_width=True,
-                      key="cmp_export_disabled")
+            st.caption(f"{frags} · contig `{to_engine_params(composed)['contig']}` · "
+                       "torso grey · mount orange · repack sticks")
+            repack = {f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues}
+            _view(composed.composite_pdb.decode(errors="ignore"), repack_tokens=repack,
+                  grid=st.session_state["cmp_grid"])
+        elif t_pdb or m_pdb:
+            if err:
+                st.error(f"Could not compose: {err}")
+            src = t_pdb or m_pdb
+            _view(src.getvalue().decode(errors="ignore"),
+                  single_color="#9aa0a6" if t_pdb else "#e08a2b", grid=st.session_state["cmp_grid"])
         else:
-            soft = [mt.label for mt in metrics if not mt.critical and not mt.ok]
-            if soft:
-                st.warning("Exportable, but consider: " + ", ".join(soft))
-            st.download_button(
-                "⬇️ Export graft package", data=composed.to_bytes(),
-                file_name="graft_package.graft", mime="application/zip",
-                use_container_width=True, key="cmp_export",
-                help="Downloads a .graft package — import it in the RFdiffusion Borrowed Bodies preset.",
-            )
+            st.info("In the **Inputs** panel: upload a torso + mount, set the cut points and the "
+                    "mount residues to keep — the composite appears here.")
+
+    # ── RIGHT (bottom) · metrics & export ──
+    with right:
+        with st.expander("◢ Metrics & export", expanded=True):
+            if composed is None:
+                st.caption("Compose a graft to see metrics + export.")
+            else:
+                for mt in compute_metrics(composed):
+                    flag = "" if mt.ok else " ⚠️"
+                    st.metric(mt.label + flag, f"{mt.value:g} {mt.unit}".strip(),
+                              help=f"{mt.what}\n\n{mt.meaning}\n\n**Desired:** {mt.desired}")
+                if critical_failures(compute_metrics(composed)):
+                    st.error("Can't export — resolve the ⚠️ metrics.")
+                    st.button("⬇️ Export graft package", disabled=True, use_container_width=True, key="cmp_exp0")
+                else:
+                    st.download_button("⬇️ Export graft package", data=composed.to_bytes(),
+                                       file_name="graft_package.graft", mime="application/zip",
+                                       use_container_width=True, key="cmp_exp")
+                st.download_button("⬇️ Composite PDB", data=composed.composite_pdb,
+                                   file_name="composite.pdb", mime="chemical/x-pdb",
+                                   use_container_width=True, key="cmp_dlpdb")
