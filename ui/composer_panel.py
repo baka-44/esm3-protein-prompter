@@ -109,8 +109,52 @@ def _handle_component_event(ev) -> None:
             "about": [float(x) for x in ev.get("about", [0, 0, 0])],
         }
         st.rerun()
+    elif kind == "cut_span":
+        # scissor-by-click (M3): two torso clicks set the excision span. Stash in PENDING keys —
+        # the Cut 1/Cut 2 number_inputs already rendered this run, so we apply before they render
+        # next run (see the pending block at the top of render_composer).
+        if st.session_state.get("_cmp_cut_ts") == ev.get("ts"):
+            return
+        st.session_state["_cmp_cut_ts"] = ev.get("ts")
+        st.session_state["_pending_cut1"] = int(ev["cut1"])
+        st.session_state["_pending_cut2"] = int(ev["cut2"])
+        st.rerun()
     else:
         _apply_pick(ev)
+
+
+def _connection_points(base) -> list[dict]:
+    """Exit vectors (M3): for every linker junction, the two OPEN ENDS it will bridge — a fixed
+    fragment's C-end and the next fragment's N-start. Each end carries its CA position and the
+    OUTWARD backbone tangent (the direction the excised loop was flowing), in the base-composite
+    frame. Ends on the mount chain ("B") are flagged `m` so the canvas rotates/moves them with the
+    live pose; the canvas then glows the pair by how well the two arrows point at each other."""
+    from proteinredesign.graft import Fragment, Linker
+    from utils.pdb_utils import get_residues
+    ca: dict[tuple[str, int], list[float]] = {}
+    for r in get_residues(base.composite_pdb, chain_id=None):
+        if "CA" in r:
+            ca[(r.get_parent().id, r.id[1])] = [float(x) for x in r["CA"].coord]
+
+    def end(chain: str, resi: int, neighbor: int, is_mount: bool):
+        """CA at `resi` + outward tangent (CA[resi] - CA[neighbor], pointing away from the body)."""
+        p, q = ca.get((chain, resi)), ca.get((chain, neighbor))
+        if p is None:
+            return None
+        d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]] if q is not None else [0.0, 0.0, 0.0]
+        return {"pos": p, "dir": d, "m": is_mount}
+
+    order = base.spec.chain_order
+    pairs: list[dict] = []
+    for i, seg in enumerate(order):
+        if isinstance(seg, Linker) and 0 < i < len(order) - 1:
+            prev, nxt = order[i - 1], order[i + 1]
+            if isinstance(prev, Fragment) and isinstance(nxt, Fragment):
+                a = end(prev.chain, prev.end, prev.end - 1, prev.chain == "B")     # C-side end
+                b = end(nxt.chain, nxt.start, nxt.start + 1, nxt.chain == "B")     # N-side start
+                if a and b:
+                    pairs.append({"a": a, "b": b})
+    return pairs
 
 
 def _is_identity_xform(x: dict | None) -> bool:
@@ -128,15 +172,17 @@ def _apply_pick(pick) -> None:
     chain, resi, resn = pick.get("chain"), int(pick["resi"]), pick.get("resn")
     st.caption(f"Picked **{chain}{resi}** ({resn}) — apply to:")
     b1, b2, b3 = st.columns(3)
+    # Route through PENDING keys (applied before the widgets render next run) — Streamlit forbids
+    # mutating a widget's key after its widget has already been instantiated this run.
     if b1.button("→ Cut 1", key="cmp_pk_c1", use_container_width=True):
-        st.session_state["cmp_cut1"] = resi
+        st.session_state["_pending_cut1"] = resi
         st.rerun()
     if b2.button("→ Cut 2", key="cmp_pk_c2", use_container_width=True):
-        st.session_state["cmp_cut2"] = resi
+        st.session_state["_pending_cut2"] = resi
         st.rerun()
     if b3.button("+ Keep", key="cmp_pk_keep", use_container_width=True):
         cur = st.session_state.get("cmp_keep", "").strip()
-        st.session_state["cmp_keep"] = f"{cur}, {resi}" if cur else str(resi)
+        st.session_state["_pending_keep"] = f"{cur}, {resi}" if cur else str(resi)
         st.rerun()
 
 
@@ -188,6 +234,13 @@ def render_composer(user_email: str) -> None:
 
     st.markdown(_FULLBLEED_CSS, unsafe_allow_html=True)
 
+    # Apply residue picks / scissor cuts staged by the 3D canvas BEFORE the Cut/Keep widgets
+    # instantiate below (Streamlit forbids mutating a widget's key after its widget renders).
+    for pend, widget in (("_pending_cut1", "cmp_cut1"), ("_pending_cut2", "cmp_cut2"),
+                         ("_pending_keep", "cmp_keep")):
+        if pend in st.session_state:
+            st.session_state[widget] = st.session_state.pop(pend)
+
     # ── compact top nav: logo + title/description on the left, actions on the right ──
     nav_l, nav_r = st.columns([7, 2.2], gap="small")
     with nav_l:
@@ -216,11 +269,12 @@ def render_composer(user_email: str) -> None:
         if t_pdb:
             st.caption(_chain_info(t_pdb.getvalue()))
         t_chain = st.text_input("Torso chain", placeholder="auto", key="cmp_tchain").strip() or None
+        st.caption("**Excision span** — type it, or **✂ Cut** two torso residues on the canvas")
         cc1, cc2 = st.columns(2)
         with cc1:
-            cut1 = st.number_input("Cut 1", min_value=1, value=15, step=1, key="cmp_cut1")
+            cut1 = st.number_input("from", min_value=1, value=15, step=1, key="cmp_cut1")
         with cc2:
-            cut2 = st.number_input("Cut 2", min_value=1, value=30, step=1, key="cmp_cut2")
+            cut2 = st.number_input("to", min_value=1, value=30, step=1, key="cmp_cut2")
 
         st.markdown("**Mount** (catalytic insert · orange · movable)")
         m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount", label_visibility="collapsed")
@@ -295,6 +349,7 @@ def render_composer(user_email: str) -> None:
                        for mt in compute_metrics(posed)]
         ev = mol_viewer(base.composite_pdb.decode(errors="ignore"), repack=repack,
                         metrics=hud_metrics, mount_chain="B",
+                        connections=_connection_points(base),
                         reset_ts=st.session_state.get("cmp_reset_ts"), height=760, key="cmp_mol")
         _handle_component_event(ev)
     elif t_pdb or m_pdb:
@@ -304,6 +359,9 @@ def render_composer(user_email: str) -> None:
     else:
         hint, _ = st.columns([3, 4])
         with hint:
-            st.info("← In the sidebar: upload a **torso** + **mount**, set the cut points and the "
-                    "mount residues to keep. The composite appears here — then click **✋ Pose "
-                    "Mount** on the canvas to drag-rotate / two-finger-scroll the mount into place.")
+            st.info("← In the sidebar: upload a **torso** + **mount** and set the mount residues "
+                    "to keep. On the canvas: **✂ Cut** = click two torso residues to set the "
+                    "excision span, **✋ Pose Mount** = drag-rotate / two-finger-scroll the mount. "
+                    "The **arrows** at each open end show the backbone's exit direction — pose the "
+                    "mount until each pair points head-to-head and glows **green** (a linker can "
+                    "bridge them). Two-finger scroll in **Camera** mode pans the whole scene.")

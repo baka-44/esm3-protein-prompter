@@ -122,6 +122,44 @@ def test_manual_rotation_is_rigid():
     assert 3.0 < d < 4.5   # consecutive CA distance stays ~3.8 Å (rigid)
 
 
+def test_exit_vectors_are_the_two_linker_junctions():
+    # The exit-vector arrows (M3) are one pair per linker: (TORSO-1.end, MOUNT-1.start) and
+    # (MOUNT-last.end, TORSO-2.start). Each open end carries a CA pos + outward backbone tangent,
+    # with the mount-side end flagged `m`. Mirror ui/composer_panel._connection_points.
+    import math
+
+    from proteinredesign.graft import Fragment, Linker
+    from utils.pdb_utils import get_residues
+    base = compose_graft(torso_pdb=TORSO, mount_pdb=MOUNT, torso_cut=(15, 25), mount_keep=[(1, 20)])
+    ca = {(r.get_parent().id, r.id[1]): [float(x) for x in r["CA"].coord]
+          for r in get_residues(base.composite_pdb, chain_id=None) if "CA" in r}
+
+    def end(chain, resi, neighbor, is_mount):
+        p, q = ca.get((chain, resi)), ca.get((chain, neighbor))
+        d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]] if p and q else [0.0, 0.0, 0.0]
+        return {"pos": p, "dir": d, "m": is_mount} if p else None
+
+    order = base.spec.chain_order
+    pairs = []
+    for i, seg in enumerate(order):
+        if isinstance(seg, Linker) and 0 < i < len(order) - 1:
+            prev, nxt = order[i - 1], order[i + 1]
+            if isinstance(prev, Fragment) and isinstance(nxt, Fragment):
+                a = end(prev.chain, prev.end, prev.end - 1, prev.chain == "B")
+                b = end(nxt.chain, nxt.start, nxt.start + 1, nxt.chain == "B")
+                if a and b:
+                    pairs.append((a, b))
+    assert len(pairs) == 2
+    # first junction: torso end → mount end ; second: mount end → torso end.
+    assert (pairs[0][0]["m"], pairs[0][1]["m"]) == (False, True)
+    assert (pairs[1][0]["m"], pairs[1][1]["m"]) == (True, False)
+    # every open end has a real position and a non-degenerate outward tangent.
+    for a, b in pairs:
+        for e in (a, b):
+            assert e["pos"] is not None
+            assert math.hypot(*e["dir"]) > 1e-6
+
+
 def test_mount_transform_matches_client_math():
     # The live-canvas transform (R about `about` + t) must reproduce, atom-for-atom, the exact
     # coordinates the 3D component applies: new = R·(base − c) + c + t. This is what keeps the
