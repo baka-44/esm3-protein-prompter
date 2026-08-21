@@ -124,26 +124,37 @@ def _handle_component_event(ev) -> None:
 
 
 def _connection_points(base) -> list[dict]:
-    """Exit vectors (M3): one arrow per linker — from a fixed fragment's C-end to the next
-    fragment's N-start, in the base-composite frame. Endpoints on the mount chain ("B") are
-    flagged so the canvas moves them with the live pose. Guides the user to a closable gap."""
+    """Exit vectors (M3): for every linker junction, the two OPEN ENDS it will bridge — a fixed
+    fragment's C-end and the next fragment's N-start. Each end carries its CA position and the
+    OUTWARD backbone tangent (the direction the excised loop was flowing), in the base-composite
+    frame. Ends on the mount chain ("B") are flagged `m` so the canvas rotates/moves them with the
+    live pose; the canvas then glows the pair by how well the two arrows point at each other."""
     from proteinredesign.graft import Fragment, Linker
     from utils.pdb_utils import get_residues
     ca: dict[tuple[str, int], list[float]] = {}
     for r in get_residues(base.composite_pdb, chain_id=None):
         if "CA" in r:
             ca[(r.get_parent().id, r.id[1])] = [float(x) for x in r["CA"].coord]
+
+    def end(chain: str, resi: int, neighbor: int, is_mount: bool):
+        """CA at `resi` + outward tangent (CA[resi] - CA[neighbor], pointing away from the body)."""
+        p, q = ca.get((chain, resi)), ca.get((chain, neighbor))
+        if p is None:
+            return None
+        d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]] if q is not None else [0.0, 0.0, 0.0]
+        return {"pos": p, "dir": d, "m": is_mount}
+
     order = base.spec.chain_order
-    conns: list[dict] = []
+    pairs: list[dict] = []
     for i, seg in enumerate(order):
         if isinstance(seg, Linker) and 0 < i < len(order) - 1:
             prev, nxt = order[i - 1], order[i + 1]
             if isinstance(prev, Fragment) and isinstance(nxt, Fragment):
-                a, b = ca.get((prev.chain, prev.end)), ca.get((nxt.chain, nxt.start))
+                a = end(prev.chain, prev.end, prev.end - 1, prev.chain == "B")     # C-side end
+                b = end(nxt.chain, nxt.start, nxt.start + 1, nxt.chain == "B")     # N-side start
                 if a and b:
-                    conns.append({"from": a, "to": b,
-                                  "fm": prev.chain == "B", "tm": nxt.chain == "B"})
-    return conns
+                    pairs.append({"a": a, "b": b})
+    return pairs
 
 
 def _is_identity_xform(x: dict | None) -> bool:
@@ -351,5 +362,6 @@ def render_composer(user_email: str) -> None:
             st.info("← In the sidebar: upload a **torso** + **mount** and set the mount residues "
                     "to keep. On the canvas: **✂ Cut** = click two torso residues to set the "
                     "excision span, **✋ Pose Mount** = drag-rotate / two-finger-scroll the mount. "
-                    "The amber/green **arrows** show each linker connection — pose until they're "
-                    "short and green.")
+                    "The **arrows** at each open end show the backbone's exit direction — pose the "
+                    "mount until each pair points head-to-head and glows **green** (a linker can "
+                    "bridge them). Two-finger scroll in **Camera** mode pans the whole scene.")

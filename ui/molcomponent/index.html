@@ -68,7 +68,10 @@
       sub: (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]],
       add: (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]],
       scale: (a, s) => [a[0]*s, a[1]*s, a[2]*s],
+      dot: (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2],
+      norm: (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; },
     };
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
     function qMul(a, b) { // Hamilton product, quats as [x,y,z,w]
       return [
         a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
@@ -147,20 +150,34 @@
     // Move a connection endpoint by the live pose if it belongs to the mount (torso ends are fixed).
     const livePt = (p, isM) => isM ? V.add(V.add(qRot(qAcc, V.sub(p, centroid)), centroid), tAcc) : p;
 
-    // Exit-vector arrows: each arrow is a linker connection (torso-cut-end ↔ mount-terminus). They
-    // update live as the mount is posed → drag the mount until both arrows are short + green
-    // (the linker can close the gap). Red = too far for a linker to reach.
+    // Exit-vector arrows: at every open end (2 torso + 2 mount) an arrow points the way the
+    // backbone was flowing (the direction the excised loop would have continued). Each linker
+    // pairs one torso end with one mount end; the pair GLOWS by how well the two arrows point at
+    // each other — green ≤5°, yellow ≤20°, dim beyond. Pose the mount until they meet head-to-head
+    // → a linker can bridge them with minimal strain. Mount arrows rotate live with the pose.
+    function liveEnd(e) {
+      const pos = e.m ? V.add(V.add(qRot(qAcc, V.sub(e.pos, centroid)), centroid), tAcc) : e.pos;
+      const dir = V.norm(e.m ? qRot(qAcc, e.dir) : e.dir);
+      return { pos, dir };
+    }
+    function drawArrow(pos, dir, col) {
+      const end = V.add(pos, V.scale(dir, 5.0));
+      connShapes.push(viewer.addArrow({
+        start: { x: pos[0], y: pos[1], z: pos[2] }, end: { x: end[0], y: end[1], z: end[2] },
+        radius: 0.28, color: col, radiusRatio: 2.6,
+      }));
+    }
     function drawConnections() {
       connShapes.forEach(s => viewer.removeShape(s)); connShapes = [];
       if (!connOn || !connections.length) return;
-      connections.forEach(c => {
-        const a = livePt(c.from, c.fm), b = livePt(c.to, c.tm);
-        const d = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
-        const col = d <= 12 ? "0x39d98a" : (d <= 20 ? "0xe0a52b" : "0xff5b5b");
-        connShapes.push(viewer.addArrow({
-          start: { x: a[0], y: a[1], z: a[2] }, end: { x: b[0], y: b[1], z: b[2] },
-          radius: 0.18, color: col, radiusRatio: 2.6,
-        }));
+      connections.forEach(pair => {
+        const A = liveEnd(pair.a), B = liveEnd(pair.b);
+        const axis = V.norm(V.sub(B.pos, A.pos));
+        // each arrow should point toward the other end → align A.dir with axis, B.dir with -axis
+        const ang = Math.max(Math.acos(clamp(V.dot(A.dir, axis), -1, 1)),
+                             Math.acos(clamp(V.dot(B.dir, V.scale(axis, -1)), -1, 1))) * 180 / Math.PI;
+        const col = ang <= 5 ? "0x39d98a" : (ang <= 20 ? "0xffd23f" : "0x9a9a9a");
+        drawArrow(A.pos, A.dir, col); drawArrow(B.pos, B.dir, col);
       });
     }
 
@@ -333,6 +350,19 @@
       clearTimeout(wheelTimer);
       wheelTimer = setTimeout(sendPose, 200);
     }, { passive: false });
+
+    // ── camera pan / zoom (Camera & Cut modes) ──────────────────────────────────
+    // Unify the gesture model with Pose mode: two-finger scroll = PAN the whole scene,
+    // pinch = zoom. Drag stays 3Dmol's orbit. Intercept the wheel in the capture phase before
+    // 3Dmol's canvas handler (which would otherwise zoom on every scroll). In Pose mode the
+    // overlay sits above the viewport and owns the wheel, so this never fires there.
+    document.getElementById("viewport").addEventListener("wheel", (e) => {
+      if (mode === "pose") return;
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (!viewer) return;
+      if (e.ctrlKey) viewer.zoom(Math.pow(1.0016, -e.deltaY), 40);        // pinch → zoom
+      else viewer.translate(e.deltaX, -e.deltaY, 40);                     // two-finger scroll → pan (scene follows fingers)
+    }, { capture: true, passive: false });
 
     function onRender(args) {
       const pdb = args.pdb || "", h = args.height || 600;
