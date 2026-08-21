@@ -118,7 +118,13 @@ def render_composer(user_email: str) -> None:
                                  key="cmp_keep",
                                  help="Kept as an all-atom rigid motif (catalytic geometry held).")
 
-        st.markdown("##### 3 · Fan-out")
+        st.markdown("##### 3 · Placement & fan-out")
+        repose = st.checkbox(
+            "Re-pose the mount (snap-to-fit)", value=True, key="cmp_repose",
+            help="ON: snap the mount's termini onto the torso cut ends. Turn OFF when the mount is "
+                 "already in the right frame — e.g. reinserting a loop from the SAME PDB — so its "
+                 "native geometry is kept (snap-to-fit would displace it).",
+        )
         fk, fm = st.columns(2)
         with fk:
             k = st.slider("K — backbones", 1, 10, 4, key="cmp_k")
@@ -131,7 +137,7 @@ def render_composer(user_email: str) -> None:
                 composed = compose_graft(
                     torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
                     torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
-                    torso_chain=t_chain, mount_chain=m_chain, k=k, m=m,
+                    torso_chain=t_chain, mount_chain=m_chain, repose=repose, k=k, m=m,
                 )
             except Exception as e:  # noqa: BLE001
                 st.error(f"Could not compose: {e}")

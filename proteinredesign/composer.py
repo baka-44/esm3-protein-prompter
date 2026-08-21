@@ -195,7 +195,8 @@ def compose_graft(
     mount_chain: str | None = None,
     mount_fixed_atoms: str = "ALL",
     mount_termini: tuple[int, int] | None = None,     # (N-term num, C-term num); default fragment ends
-    pose: tuple[np.ndarray, np.ndarray] | None = None,  # explicit (rot, tran); None → snap-to-fit
+    pose: tuple[np.ndarray, np.ndarray] | None = None,  # explicit (rot, tran); overrides repose
+    repose: bool = True,                                # True → snap-to-fit; False → keep input coords
     linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
     repack_shell: float = 5.0,
     k: int = 5,
@@ -221,11 +222,15 @@ def compose_graft(
     m_lo, m_hi = mount_blocks[0][0], mount_blocks[-1][1]
     mn, mc = mount_termini or (m_lo, m_hi)
 
-    # Pose: snap-to-fit unless an explicit transform was given.
-    if pose is None:
+    # Pose: explicit transform > snap-to-fit > keep input coords (no re-pose). The last is for
+    # same-frame inputs (e.g. reinserting a loop from the SAME PDB) — snap-to-fit would displace
+    # an already-native mount and break its geometry.
+    if pose is not None:
+        rot, tran = pose
+    elif repose:
         rot, tran = snap_to_fit(torso_res, f1_end, f2_start, mount_res, mn, mc)
     else:
-        rot, tran = pose
+        rot, tran = _IDENTITY
 
     torso_struct = parse_pdb(torso_pdb)
     mount_struct = parse_pdb(mount_pdb)
@@ -257,7 +262,7 @@ def compose_graft(
         provenance={
             "torso_chain": torso_chain, "mount_chain": mount_chain,
             "torso_cut": list(torso_cut), "mount_keep": [list(r) for r in mount_keep],
-            "posed_by": "explicit" if pose is not None else "snap_to_fit",
+            "posed_by": ("explicit" if pose is not None else "snap_to_fit" if repose else "keep_input"),
         },
     )
     return GraftPackage(spec=spec, composite_pdb=composite)
