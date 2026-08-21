@@ -4,52 +4,46 @@
   <meta charset="utf-8" />
   <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
   <style>
-    html, body { margin: 0; padding: 0; background: #0d0d0d; overflow: hidden; }
+    html, body { margin: 0; padding: 0; background: #0d0d0d; overflow: hidden;
+                 font-family: 'Montserrat', system-ui, sans-serif; }
     #viewport { width: 100%; height: 100vh; position: relative; }
-    #hud {
-      position: absolute; top: 8px; right: 10px; z-index: 5;
-      font: 12px/1.4 'Montserrat', system-ui, sans-serif; color: #cfcfcf;
-      background: rgba(20,20,20,0.6); border: 1px solid #333; border-radius: 6px;
-      padding: 4px 8px; user-select: none;
-    }
+    #overlay { position: absolute; inset: 0; z-index: 3; display: none; cursor: grab; }
+    #overlay.active { display: block; }
+    .chip { position: absolute; z-index: 5; font-size: 12px; color: #cfcfcf;
+            background: rgba(20,20,20,0.65); border: 1px solid #333; border-radius: 6px;
+            padding: 3px 8px; user-select: none; cursor: pointer; }
+    .chip.on { border-color: #e08a2b; color: #e08a2b; }
+    #modes { top: 8px; left: 10px; display: flex; gap: 6px; }
+    #hud { top: 8px; right: 10px; }
     #hud b { color: #e08a2b; }
-    #gridbtn {
-      position: absolute; top: 8px; left: 10px; z-index: 5; cursor: pointer;
-      font: 13px 'Montserrat', system-ui, sans-serif; color: #cfcfcf;
-      background: rgba(20,20,20,0.6); border: 1px solid #333; border-radius: 6px;
-      padding: 3px 8px; user-select: none;
-    }
   </style>
 </head>
 <body>
   <div id="viewport"></div>
-  <div id="gridbtn" title="Toggle grid">▦</div>
-  <div id="hud">click a residue</div>
+  <div id="overlay"></div>
+  <div id="modes" class="chip" style="background:none;border:none;padding:0">
+    <span id="m_cam" class="chip on">🔄 Camera</span>
+    <span id="m_move" class="chip">✋ Move</span>
+    <span id="m_rot" class="chip">🔃 Rotate</span>
+    <span id="m_grid" class="chip">▦</span>
+  </div>
+  <div id="hud" class="chip" style="cursor:default">click a residue</div>
 
   <script>
-    // ── Bare Streamlit component protocol (no npm build) ─────────────────────
     const Streamlit = {
-      _ready: false,
-      ready() {
-        window.parent.postMessage(
-          { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
-        this._ready = true;
-      },
-      setFrameHeight(h) {
-        window.parent.postMessage(
-          { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
-      },
-      setValue(v) {
-        window.parent.postMessage(
-          { isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*");
-      },
+      ready() { window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*"); },
+      setFrameHeight(h) { window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*"); },
+      setValue(v) { window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*"); },
     };
 
     let viewer = null, lastPdb = null, gridOn = true, gridShapes = [], lastCoords = null;
+    let mode = "cam";                       // "cam" | "move" | "rot"
+    const T_SENS = 0.09, R_SENS = 0.6;      // Å/px, deg/px
+
+    function hud(s) { document.getElementById("hud").innerHTML = s; }
 
     function drawGrid() {
-      gridShapes.forEach(s => viewer.removeShape(s));
-      gridShapes = [];
+      gridShapes.forEach(s => viewer.removeShape(s)); gridShapes = [];
       if (!gridOn || !lastCoords || !lastCoords.length) { viewer.render(); return; }
       const xs = lastCoords.map(c => c[0]), ys = lastCoords.map(c => c[1]), zs = lastCoords.map(c => c[2]);
       const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cz = (Math.min(...zs) + Math.max(...zs)) / 2;
@@ -69,36 +63,64 @@
       viewer.addModel(pdb, "pdb");
       viewer.setStyle({ chain: "A" }, { cartoon: { color: "#9aa0a6" } });
       viewer.setStyle({ chain: "B" }, { cartoon: { color: "#e08a2b" } });
+      // Faint CA spheres → a large, reliable click target on every residue (click-reliability fix).
+      viewer.addStyle({ atom: "CA" }, { sphere: { radius: 0.7, opacity: 0.14, color: "0xbbbbbb" } });
       (repackSet || []).forEach(t => {
         viewer.addStyle({ chain: t[0], resi: parseInt(t.slice(1)) },
           { stick: { colorscheme: "yellowCarbon", radius: 0.2 } });
       });
-      // click-to-pick: report the atom's residue back to Python
       viewer.setClickable({}, true, (atom) => {
-        document.getElementById("hud").innerHTML = "picked <b>" + atom.chain + atom.resi + "</b> (" + atom.resn + ")";
-        Streamlit.setValue({ chain: atom.chain, resi: atom.resi, resn: atom.resn, ts: Date.now() });
+        hud("picked <b>" + atom.chain + atom.resi + "</b> (" + atom.resn + ")");
+        Streamlit.setValue({ kind: "pick", chain: atom.chain, resi: atom.resi, resn: atom.resn, ts: Date.now() });
       });
-      // collect CA coords for the grid
       lastCoords = [];
-      const atoms = viewer.getModel().selectedAtoms({ atom: "CA" });
-      atoms.forEach(a => lastCoords.push([a.x, a.y, a.z]));
+      viewer.getModel().selectedAtoms({ atom: "CA" }).forEach(a => lastCoords.push([a.x, a.y, a.z]));
       viewer.zoomTo();
       drawGrid();
     }
 
-    document.getElementById("gridbtn").onclick = () => { gridOn = !gridOn; drawGrid(); };
+    // ── mode switching ──────────────────────────────────────────────────────
+    function setMode(m) {
+      mode = m;
+      document.getElementById("m_cam").classList.toggle("on", m === "cam");
+      document.getElementById("m_move").classList.toggle("on", m === "move");
+      document.getElementById("m_rot").classList.toggle("on", m === "rot");
+      // In move/rotate mode an overlay captures drags (so 3Dmol doesn't rotate the camera).
+      document.getElementById("overlay").classList.toggle("active", m !== "cam");
+      hud(m === "cam" ? "click a residue" : (m === "move" ? "drag to MOVE the mount" : "drag to ROTATE the mount"));
+    }
+    document.getElementById("m_cam").onclick = () => setMode("cam");
+    document.getElementById("m_move").onclick = () => setMode("move");
+    document.getElementById("m_rot").onclick = () => setMode("rot");
+    document.getElementById("m_grid").onclick = () => { gridOn = !gridOn; document.getElementById("m_grid").classList.toggle("on", gridOn); drawGrid(); };
+
+    // ── drag-to-pose (mount) via the overlay ───────────────────────────────────
+    const ov = document.getElementById("overlay");
+    let dragging = false, sx = 0, sy = 0, accX = 0, accY = 0;
+    ov.addEventListener("mousedown", (e) => { dragging = true; sx = e.clientX; sy = e.clientY; accX = 0; accY = 0; ov.style.cursor = "grabbing"; });
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      accX = e.clientX - sx; accY = e.clientY - sy;
+      if (mode === "move") hud("move Δ <b>" + (accX * T_SENS).toFixed(1) + ", " + (-accY * T_SENS).toFixed(1) + "</b> Å (release to apply)");
+      else hud("rotate Δ <b>" + (accX * R_SENS).toFixed(0) + "°, " + (accY * R_SENS).toFixed(0) + "°</b> (release to apply)");
+    });
+    window.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false; ov.style.cursor = "grab";
+      if (Math.abs(accX) < 2 && Math.abs(accY) < 2) return;   // ignore tiny drags / clicks
+      if (mode === "move")
+        Streamlit.setValue({ kind: "pose", dnudge: [accX * T_SENS, -accY * T_SENS, 0], drotate: [0, 0, 0], ts: Date.now() });
+      else if (mode === "rot")
+        Streamlit.setValue({ kind: "pose", dnudge: [0, 0, 0], drotate: [accY * R_SENS, accX * R_SENS, 0], ts: Date.now() });
+    });
 
     function onRender(args) {
-      const pdb = args.pdb || "";
-      const h = args.height || 600;
+      const pdb = args.pdb || "", h = args.height || 600;
       if (pdb !== lastPdb) { lastPdb = pdb; if (pdb) buildModel(pdb, args.repack || []); }
       document.getElementById("viewport").style.height = h + "px";
       Streamlit.setFrameHeight(h + 4);
     }
-
-    window.addEventListener("message", (e) => {
-      if (e.data && e.data.type === "streamlit:render") onRender(e.data.args);
-    });
+    window.addEventListener("message", (e) => { if (e.data && e.data.type === "streamlit:render") onRender(e.data.args); });
     Streamlit.ready();
     Streamlit.setFrameHeight(640);
   </script>

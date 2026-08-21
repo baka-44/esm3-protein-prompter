@@ -90,6 +90,30 @@ def _view(pdb_text: str, *, repack_tokens: set[str] | None = None, single_color:
     _st_html(view._make_html(), height=height + 10, scrolling=False)
 
 
+def _handle_component_event(ev) -> None:
+    """Dispatch a value from the 3D component: a residue pick (M1) or a drag-pose delta (M2)."""
+    if not isinstance(ev, dict):
+        return
+    kind = ev.get("kind")
+    if kind == "pose":
+        # Ignore already-applied events (the component returns the same value until a new drag).
+        if st.session_state.get("_cmp_pose_ts") == ev.get("ts"):
+            return
+        st.session_state["_cmp_pose_ts"] = ev.get("ts")
+        dn, dr = ev.get("dnudge", [0, 0, 0]), ev.get("drotate", [0, 0, 0])
+        for k, v in zip(("cmp_dnx", "cmp_dny", "cmp_dnz"), dn):
+            st.session_state[k] = _clamp(st.session_state.get(k, 0.0) + float(v), -60.0, 60.0)
+        for k, v in zip(("cmp_drx", "cmp_dry", "cmp_drz"), dr):
+            st.session_state[k] = _clamp(st.session_state.get(k, 0.0) + float(v), -360.0, 360.0)
+        st.rerun()
+    else:
+        _apply_pick(ev)
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
 def _apply_pick(pick) -> None:
     """Show the last picked residue (from the interactive viewer) + apply it to cut/keep (M1)."""
     if not isinstance(pick, dict) or pick.get("resi") is None:
@@ -167,9 +191,24 @@ def render_composer(user_email: str) -> None:
             with mm:
                 m = st.slider("M", 1, 10, 2, key="cmp_m")
 
-    # ── RIGHT (top) · pose sliders — rendered before compose so their values feed it ──
+    # Drag-to-pose accumulator (plain session keys, NOT widget keys — the 3D canvas drag adds to
+    # these; the sliders are an additional fine offset. Kept separate to avoid Streamlit's
+    # "can't modify a widget's state after it's created" error).
+    for _dk in ("cmp_dnx", "cmp_dny", "cmp_dnz", "cmp_drx", "cmp_dry", "cmp_drz"):
+        st.session_state.setdefault(_dk, 0.0)
+    dnx, dny, dnz = (st.session_state[k] for k in ("cmp_dnx", "cmp_dny", "cmp_dnz"))
+    drx, dry, drz = (st.session_state[k] for k in ("cmp_drx", "cmp_dry", "cmp_drz"))
+
+    # ── RIGHT (top) · pose — drag on the canvas (Move/Rotate) or fine-tune here ──
     with right:
-        with st.expander("◥ Pose — nudge the mount", expanded=True):
+        with st.expander("◥ Pose — drag on canvas or nudge", expanded=True):
+            if any(abs(v) > 1e-6 for v in (dnx, dny, dnz, drx, dry, drz)):
+                st.caption(f"drag: ({dnx:+.1f}, {dny:+.1f}, {dnz:+.1f}) Å · "
+                           f"({drx:+.0f}, {dry:+.0f}, {drz:+.0f})°")
+                if st.button("↺ Reset drag", key="cmp_reset_drag", use_container_width=True):
+                    for _dk in ("cmp_dnx", "cmp_dny", "cmp_dnz", "cmp_drx", "cmp_dry", "cmp_drz"):
+                        st.session_state[_dk] = 0.0
+                    st.rerun()
             tx = st.slider("Move X (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tx")
             ty = st.slider("Move Y (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_ty")
             tz = st.slider("Move Z (Å)", -25.0, 25.0, 0.0, 0.5, key="cmp_tz")
@@ -184,7 +223,8 @@ def render_composer(user_email: str) -> None:
                 torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
                 torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
                 torso_chain=t_chain, mount_chain=m_chain, repose=repose,
-                nudge=(tx, ty, tz), rotate=(float(rx), float(ry), float(rz)), k=k, m=m,
+                nudge=(tx + dnx, ty + dny, tz + dnz),
+                rotate=(float(rx) + drx, float(ry) + dry, float(rz) + drz), k=k, m=m,
             )
         except Exception as e:  # noqa: BLE001
             err = str(e)
@@ -197,7 +237,7 @@ def render_composer(user_email: str) -> None:
                        "torso grey · mount orange · repack sticks · **click a residue to pick it**")
             repack = [f"{r['chain']}{r['author_num']}" for r in composed.spec.repack_residues]
             pick = mol_viewer(composed.composite_pdb.decode(errors="ignore"), repack=repack, key="cmp_mol")
-            _apply_pick(pick)
+            _handle_component_event(pick)
         elif t_pdb or m_pdb:
             if err:
                 st.error(f"Could not compose: {err}")
@@ -205,7 +245,7 @@ def render_composer(user_email: str) -> None:
             st.caption(("Torso" if t_pdb else "Mount") + " · **click a residue to pick it** "
                        "(→ set cut points / add to keep)")
             pick = mol_viewer(src.getvalue().decode(errors="ignore"), key="cmp_mol")
-            _apply_pick(pick)
+            _handle_component_event(pick)
         else:
             st.info("In the **Inputs** panel: upload a torso + mount, set the cut points and the "
                     "mount residues to keep — the composite appears here.")
