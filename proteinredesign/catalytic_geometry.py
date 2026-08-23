@@ -78,7 +78,12 @@ class Finding:
 
 
 class Structure:
-    """Thin wrapper: residue lookup + per-residue confidence from the B-factor column."""
+    """Thin wrapper: residue lookup + per-residue confidence from the B-factor column.
+
+    Confidence scale is normalised to 0-100. AlphaFold writes pLDDT as 0-100, but ESMFold
+    (transformers `output_to_pdb`) writes it as 0-1 — reporting those raw would make a
+    perfectly good model look like a catastrophic one, so the scale is detected on load.
+    """
 
     def __init__(self, path: str):
         from Bio.PDB import PDBParser
@@ -90,6 +95,9 @@ class Structure:
                 for r in chain:
                     self._res[(chain.id, r.id[1])] = r
             break  # first model only
+        bs = [a.get_bfactor() for r in self._res.values() for a in r]
+        # 0-1 scale (ESMFold) vs 0-100 (AlphaFold). An all-zero B-factor column stays as-is.
+        self._conf_scale = 100.0 if (bs and 0 < max(bs) <= 1.0) else 1.0
 
     def residue(self, key):
         return self._res.get(key)
@@ -113,7 +121,7 @@ class Structure:
         if r is None:
             return None
         b = [a.get_bfactor() for a in r]
-        return float(np.mean(b)) if b else None
+        return float(np.mean(b)) * self._conf_scale if b else None
 
     def mean_confidence(self, lo: int = None, hi: int = None, chain: str = None) -> Optional[float]:
         vals = []
@@ -125,7 +133,7 @@ class Structure:
             if hi is not None and i > hi:
                 continue
             vals.extend(a.get_bfactor() for a in r)
-        return float(np.mean(vals)) if vals else None
+        return float(np.mean(vals)) * self._conf_scale if vals else None
 
     def coordinating_atom(self, key) -> Optional[np.ndarray]:
         """Best guess at the metal-coordinating atom for a residue."""

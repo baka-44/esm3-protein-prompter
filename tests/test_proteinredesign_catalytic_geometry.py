@@ -96,3 +96,12 @@ def test_metal_cluster_spread_flags_collapsed_site(tmp_path):
     fs = measure(Structure(str(p)), site)
     metal = [f for f in fs if "metal site" in f.label]
     assert metal and not metal[0].ok
+
+
+def test_esmfold_0_to_1_confidence_is_normalised_to_0_100(tmp_path):
+    """ESMFold writes pLDDT as 0-1; AlphaFold as 0-100. Both must report on the same scale."""
+    esm = Structure(_triad_pdb(tmp_path / "esm.pdb", b=0.87))
+    af = Structure(_triad_pdb(tmp_path / "af.pdb", b=87.0))
+    assert site_confidence(esm, SITE)["nucleophile"] == pytest.approx(87.0, abs=1e-6)
+    assert site_confidence(af, SITE)["nucleophile"] == pytest.approx(87.0, abs=1e-6)
+    assert esm.mean_confidence() == pytest.approx(af.mean_confidence(), abs=1e-6)
