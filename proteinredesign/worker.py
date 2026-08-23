@@ -772,6 +772,110 @@ def _generate_motif_candidates(
     return candidates
 
 
+# ── Fold-only preset: ESMFold + catalytic-geometry QC, no design ──────────────
+# Purpose: answer "does this construct still fold, and does its active site survive?"
+# for a handful of hand-specified sequences (e.g. domain-deletion / re-bodying variants)
+# without running a design campaign. Runs on the rf3-worker because ESMFold + GPU live there.
+
+def _renumber_pdb(pdb_text: str, offset: int, chain: str = "A") -> str:
+    """Shift residue numbers by `offset` so the model uses the caller's reference frame.
+
+    ESMFold numbers its output 1..N for whatever construct it was given. When that construct
+    is a slice of a larger protein (say Kex2 114-453), every downstream spec — catalytic
+    residues, metal ligands, literature positions — is in the PARENT numbering. Renumbering
+    here means the emitted PDB is directly comparable to the reference structure and to any
+    site spec, instead of forcing every consumer to do the arithmetic.
+    """
+    if not offset:
+        return pdb_text
+    out = []
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 26:
+            try:
+                n = int(line[22:26]) + offset
+                line = f"{line[:21]}{chain}{n:>4}{line[26:]}"
+            except ValueError:
+                pass
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _catalytic_site_from_spec(name: str, spec: dict):
+    """Build a CatalyticSite from the JSON form carried in manifest params."""
+    from proteinredesign.catalytic_geometry import CatalyticSite
+
+    def key(v):
+        return (v[0], int(v[1]))
+    return CatalyticSite(
+        name=name,
+        nucleophile=key(spec["nucleophile"]),
+        base=key(spec["base"]),
+        acid=key(spec["acid"]) if spec.get("acid") else None,
+        oxyanion=[key(v) for v in spec.get("oxyanion", [])],
+        metal_sites={m: [key(v) for v in ligs] for m, ligs in spec.get("metal_sites", {}).items()},
+    )
+
+
+def _run_fold_sequences(manifest, workdir: str, jobstore, storage) -> dict:
+    """
+    Fold each named sequence with ESMFold and report fold quality + active-site integrity.
+
+    params:
+      sequences        {name: "SEQ..."}                  (required)
+      offsets          {name: int}                       residue-number offset per construct
+      catalytic_sites  {name: {...CatalyticSite JSON}}   optional per-construct site spec
+    """
+    from proteinredesign.catalytic_geometry import Structure, measure, site_confidence, verdict
+
+    job_id = manifest.job_id
+    seqs: dict = manifest.params.get("sequences") or {}
+    offsets: dict = manifest.params.get("offsets") or {}
+    sites: dict = manifest.params.get("catalytic_sites") or {}
+    if not seqs:
+        raise ValueError("fold_sequences requires params['sequences']")
+
+    records, n = [], len(seqs)
+    for i, (name, seq) in enumerate(seqs.items(), 1):
+        jobstore.update_job(job_id, stage=f"Folding {name} ({i}/{n})", progress=0.05 + 0.85 * (i - 1) / n)
+        pdb_text, plddt = run_esmfold(seq)
+        pdb_text = _renumber_pdb(pdb_text, int(offsets.get(name, 0)))
+        pdb_name = f"{name}.pdb"
+        storage.write_output(job_id, pdb_name, pdb_text.encode(), content_type="chemical/x-pdb")
+
+        rec = {"name": name, "length": len(seq), "mean_plddt": round(float(plddt), 2),
+               "offset": int(offsets.get(name, 0)), "pdb": pdb_name,
+               "geometry": None, "geometry_pass": None, "min_catalytic_plddt": None}
+
+        if name in sites:
+            local = os.path.join(workdir, pdb_name)
+            with open(local, "w") as fh:
+                fh.write(pdb_text)
+            try:
+                struct = Structure(local)
+                site = _catalytic_site_from_spec(name, sites[name])
+                findings = measure(struct, site)
+                ok, fails = verdict(findings)
+                conf = {k: v for k, v in site_confidence(struct, site).items() if v is not None}
+                rec["geometry"] = [{"label": f.label, "value": f.value, "unit": f.unit, "ok": f.ok}
+                                   for f in findings]
+                rec["geometry_pass"] = ok
+                rec["geometry_failures"] = fails
+                rec["catalytic_plddt"] = {k: round(v, 1) for k, v in conf.items()}
+                rec["min_catalytic_plddt"] = round(min(conf.values()), 1) if conf else None
+            except Exception as e:  # noqa: BLE001 — a geometry failure must not lose the fold
+                rec["geometry_error"] = f"{type(e).__name__}: {e}"
+        records.append(rec)
+
+    jobstore.update_job(job_id, stage="Writing results", progress=0.95)
+    results = {"job_id": job_id, "preset": manifest.preset.value,
+               "count": len(records), "folds": records, "params": manifest.params}
+    results_uri = storage.write_output(job_id, "results.json",
+                                       json.dumps(results, indent=2).encode(),
+                                       content_type="application/json")
+    results["results_uri"] = results_uri
+    return results
+
+
 def run_pipeline(manifest, workdir: str) -> dict:
     """
     Execute preset #1 end-to-end and return a results dict (also written to GCS).
@@ -794,6 +898,11 @@ def run_pipeline(manifest, workdir: str) -> dict:
     # Motif scaffolding (#3) and Borrowed Bodies both run the indexed multi-segment path.
     is_motif = manifest.preset in (Preset.MOTIF_SCAFFOLDING, Preset.BORROWED_BODIES)
     has_motif_qc = is_enzyme or is_motif  # motif-RMSD fidelity check applies
+
+    # Fold-only preset: no input backbone, no design — fold the given sequences and QC them.
+    if manifest.preset == Preset.FOLD_SEQUENCES:
+        jobstore.update_job(job_id, status=JobStatus.RUNNING.value, stage="Folding", progress=0.05)
+        return _run_fold_sequences(manifest, workdir, jobstore, storage)
 
     # 0. Fetch the input PDB.
     jobstore.update_job(job_id, status=JobStatus.RUNNING.value, stage="Preparing inputs", progress=0.05)

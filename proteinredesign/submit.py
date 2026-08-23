@@ -307,11 +307,61 @@ def submit_borrowed_bodies(*, package_bytes: bytes, user_email: str):
     return rec, params
 
 
+def submit_fold(*, sequences: dict, user_email: str, offsets: dict | None = None,
+                catalytic_sites: dict | None = None, title: str | None = None):
+    """
+    Fold a set of named sequences with ESMFold and QC their active sites — no design step.
+
+    This is the cheap structural experiment: "does this construct still fold, and does its
+    catalytic machinery survive?" Used for domain-deletion / re-bodying variants where you
+    want the answer before committing to a design campaign or to gene synthesis.
+
+    Args:
+        sequences:       {name: "SEQUENCE"} — one fold per entry.
+        offsets:         {name: int} — residue-number offset so the emitted PDB uses the parent
+                         protein's numbering (e.g. 113 for a construct starting at residue 114).
+        catalytic_sites: {name: {"nucleophile": ["A", 385], "base": ["A", 213],
+                                 "acid": ["A", 175], "oxyanion": [["A", 314]],
+                                 "metal_sites": {"Ca1": [["A", 135], ...]}}}
+                         Positions are in the SAME frame as `offsets` (i.e. parent numbering).
+
+    Returns the JobRecord. Runs on the rf3-worker, where ESMFold and the GPU live.
+    """
+    if not sequences:
+        raise ValueError("submit_fold requires at least one sequence")
+    bad = [n for n, s in sequences.items() if not s or not str(s).strip()]
+    if bad:
+        raise ValueError(f"empty sequence(s): {', '.join(bad)}")
+
+    manifest = JobManifest(
+        preset=Preset.FOLD_SEQUENCES,
+        user_email=user_email,
+        pdb_uri="",                      # fold-only: driven by sequences, no input backbone
+        params={
+            "sequences": {k: str(v).strip().upper() for k, v in sequences.items()},
+            "offsets": offsets or {},
+            "catalytic_sites": catalytic_sites or {},
+        },
+        num_outputs=len(sequences),
+    )
+
+    from proteinredesign import jobstore, storage
+
+    manifest_uri = storage.write_manifest(manifest.job_id, manifest.to_json())
+    rec = jobstore.create_job(
+        manifest, manifest_uri=manifest_uri,
+        title=title or f"Fold + geometry QC · {len(sequences)} construct(s)",
+    )
+    _trigger_job(manifest_uri, preset=manifest.preset)
+    return rec
+
+
 def _job_name_for_preset(preset: "Preset") -> str:
     """
     Route a preset to its Cloud Run Job (D11: two images / two jobs).
     - MPNN-only presets (#1/#2) → the Python-3.10 `mpnn-worker` job (default).
-    - RF3 presets (#8, later #3/#6) → the Python-3.12 `rf3-worker` job.
+    - RF3 presets (#8, #3, #6, Borrowed Bodies) and fold-only → the Python-3.12 `rf3-worker`
+      job (ESMFold + GPU live in that image).
     A Cloud Run Job's image is fixed in its template, so routing lives here.
     """
     if preset in MPNN_ONLY_PRESETS:
