@@ -21,9 +21,13 @@ Usage (needs GCP credentials + the proteinredesign env):
     python3 scripts/submit_kex2_fold.py you@phyx44.com
 """
 
+import os
 import sys
 
 import requests
+
+# Run from anywhere: the repo root must be importable for `proteinredesign`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 UNIPROT = "https://rest.uniprot.org/uniprotkb/{}.fasta"
 
