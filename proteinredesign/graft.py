@@ -74,6 +74,10 @@ class GraftSpec:
     m: int = 3
     provenance: dict = field(default_factory=dict)
     metrics: dict = field(default_factory=dict)
+    # OPTIONAL active-site spec (CatalyticSite JSON). When present the worker reports
+    # catalytic geometry per generated candidate; when absent that reporting is simply
+    # skipped. It is never required — a graft without one designs exactly as before.
+    catalytic_site: dict = field(default_factory=dict)
     version: str = VERSION
 
     # ── serialisation ─────────────────────────────────────────────────────────
@@ -91,6 +95,7 @@ class GraftSpec:
             "k": self.k, "m": self.m,
             "provenance": self.provenance,
             "metrics": self.metrics,
+            "catalytic_site": self.catalytic_site,
         }
 
     @classmethod
@@ -113,6 +118,7 @@ class GraftSpec:
             repack_residues=d.get("repack_residues", []),
             k=int(d.get("k", 5)), m=int(d.get("m", 3)),
             provenance=d.get("provenance", {}), metrics=d.get("metrics", {}),
+            catalytic_site=d.get("catalytic_site") or {},
             version=d.get("version", VERSION),
         )
 
@@ -201,10 +207,15 @@ def to_engine_params(package: GraftPackage) -> dict:
 
     repack_tokens = [f"{r['chain']}{r['author_num']}" for r in spec.repack_residues]
 
-    return {
+    params = {
         "contig": contig,
         "select_fixed_atoms": select_fixed_atoms or None,
         "motif_residues": motif_residues,
         "repack_residues": repack_tokens,
         "k": spec.k, "m": spec.m,
     }
+    # Optional: carried through only when the package defines one. Absent => the worker
+    # skips geometry reporting entirely; the key is not even present in params.
+    if spec.catalytic_site:
+        params["catalytic_site"] = spec.catalytic_site
+    return params
