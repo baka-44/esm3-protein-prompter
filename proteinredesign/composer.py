@@ -212,6 +212,65 @@ def _auto_repack(composite_pdb: bytes, torso_chain: str, mount_chain: str,
     return [{"chain": c, "author_num": n} for c, n in sorted(repack)]
 
 
+
+def _normalise_residue_refs(refs, default_chain: str) -> set[tuple[str, int]]:
+    """Accept the several shapes a caller may reasonably use for a residue list.
+
+    "B280" | ("B", 280) | {"chain": "B", "author_num": 280} | 280 (-> default_chain).
+    Plain integers default to the MOUNT output chain, because that is where redesign lists
+    almost always live (the enzyme's own surface).
+    """
+    out: set[tuple[str, int]] = set()
+    for ref in refs or []:
+        if isinstance(ref, dict):
+            out.add((str(ref["chain"]), int(ref["author_num"])))
+        elif isinstance(ref, (tuple, list)) and len(ref) == 2:
+            out.add((str(ref[0]), int(ref[1])))
+        elif isinstance(ref, int):
+            out.add((default_chain, ref))
+        elif isinstance(ref, str):
+            s = ref.strip()
+            if not s:
+                continue
+            if s[0].isalpha():
+                out.add((s[0], int(s[1:])))
+            else:
+                out.add((default_chain, int(s)))
+        else:
+            raise ValueError(f"Unrecognised residue reference: {ref!r}")
+    return out
+
+
+def _apply_residue_overrides(auto_repack: list[dict], composite_pdb: bytes,
+                             extra_repack, extra_fixed, default_chain: str) -> list[dict]:
+    """Merge caller-supplied repack/fixed overrides into the automatic contact shell.
+
+    Why this is not optional: `_auto_repack` only selects residues within the contact shell of
+    the OTHER body, plus junctions. A surface that was buried by a domain you deleted is not in
+    contact with anything — so the residues that most need redesigning are exactly the ones the
+    automatic rule cannot see. Without an explicit list they would stay untouched.
+
+    `extra_fixed` wins over `extra_repack`: a residue cannot be both, and pinning is the safer
+    interpretation of a conflicting instruction.
+    """
+    present = {(r.get_parent().id, r.id[1]) for r in get_residues(composite_pdb, chain_id=None)}
+    add = _normalise_residue_refs(extra_repack, default_chain)
+    pin = _normalise_residue_refs(extra_fixed, default_chain)
+
+    unknown = sorted((add | pin) - present)
+    if unknown:
+        raise ValueError(
+            "Residue override(s) not present in the composite: "
+            + ", ".join(f"{c}{n}" for c, n in unknown[:8])
+            + (" …" if len(unknown) > 8 else "")
+            + ". Check the chain letter — the composite relabels torso→A, mount→B."
+        )
+
+    repack = {(r["chain"], r["author_num"]) for r in auto_repack} | add
+    repack -= pin
+    return [{"chain": c, "author_num": n} for c, n in sorted(repack)]
+
+
 def compose_graft(
     *,
     torso_pdb: bytes,
@@ -230,6 +289,8 @@ def compose_graft(
     # transform applied to the base-posed mount about `about` (from the live 3D canvas). new = R·(p-c)+c+t.
     linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
     repack_shell: float = 5.0,
+    extra_repack: list | None = None,   # residues MPNN should re-identify beyond the contact shell
+    extra_fixed: list | None = None,    # residues to pin even if the shell would repack them
     k: int = 5,
     m: int = 3,
 ) -> GraftPackage:
@@ -299,7 +360,10 @@ def compose_graft(
     chain_order.append(Fragment("TORSO-2", "torso", OUT_T, f2_start, f2_end, "BKBN"))
     junctions.append((OUT_T, f2_start))
 
-    repack = _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell)
+    repack = _apply_residue_overrides(
+        _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell),
+        composite, extra_repack, extra_fixed, OUT_M,
+    )
 
     spec = GraftSpec(
         chain_order=chain_order,
@@ -309,6 +373,140 @@ def compose_graft(
             "torso_chain": torso_chain, "mount_chain": mount_chain,
             "torso_cut": list(torso_cut), "mount_keep": [list(r) for r in mount_keep],
             "posed_by": ("explicit" if pose is not None else "snap_to_fit" if repose else "keep_input"),
+        },
+    )
+    return GraftPackage(spec=spec, composite_pdb=composite)
+
+
+# ── Simple fusion compose (no excision) ───────────────────────────────────────
+
+def compose_fusion(
+    *,
+    mount_pdb: bytes,
+    torso_pdb: bytes,
+    mount_chain: str | None = None,
+    torso_chain: str | None = None,
+    mount_keep: list[tuple[int, int]] | None = None,   # default: the whole chain
+    torso_keep: list[tuple[int, int]] | None = None,   # default: the whole chain
+    chassis_terminus: str = "C",        # "C" → MOUNT–linker–TORSO; "N" → TORSO–linker–MOUNT
+    mount_fixed_atoms: str = "ALL",
+    nudge: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rotate: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    mount_transform: dict | None = None,
+    auto_separate: bool = True,         # sane non-clashing starting pose when none is given
+    linker_length: tuple[int, int] = (4, 12),
+    repack_shell: float = 5.0,
+    extra_repack: list | None = None,   # residues MPNN should re-identify beyond the contact shell
+    extra_fixed: list | None = None,    # residues to pin even if the shell would repack them
+    k: int = 5,
+    m: int = 3,
+    catalytic_site: dict | None = None,
+) -> GraftPackage:
+    """
+    Fuse two intact bodies end-to-end and let RF3 design only the connection between them.
+
+    Unlike compose_graft this performs NO excision and NO insertion: both chains are kept whole,
+    the user places them relative to one another, and the engine fills the single gap while
+    holding both bodies fixed.
+
+    Why this mode exists: an enzyme whose maturation depends on an N-terminal propeptide cannot
+    be loop-inserted. The propeptide's autocatalytic cleavage would sever the chain, dropping the
+    whole upstream flank — including half the chassis — as a separate polypeptide. Such enzymes
+    must carry the chassis on a terminus, and (for an N-terminal propeptide) specifically the
+    C-terminus, so that autoprocessing releases the propeptide and leaves mount+chassis intact.
+    Hence `chassis_terminus="C"` is the default.
+
+    This is a weaker topological claim than insertion, so the design work has to earn its keep at
+    the interface: judge the output on buried surface area and compactness, not merely on whether
+    the linker closed.
+    """
+    OUT_T, OUT_M = "A", "B"
+    if chassis_terminus not in ("C", "N"):
+        raise ValueError("chassis_terminus must be 'C' (mount first) or 'N' (torso first)")
+
+    torso_res, torso_chain = _chain_residues(torso_pdb, torso_chain)
+    mount_res, mount_chain = _chain_residues(mount_pdb, mount_chain)
+
+    def _whole(residues, keep):
+        nums = [r.id[1] for r in residues]
+        return _range_set(keep) if keep else set(nums)
+
+    mount_keep_set = _whole(mount_res, mount_keep)
+    torso_keep_set = _whole(torso_res, torso_keep)
+    m_blocks = _contiguous_blocks([n for n in (r.id[1] for r in mount_res) if n in mount_keep_set])
+    t_blocks = _contiguous_blocks([n for n in (r.id[1] for r in torso_res) if n in torso_keep_set])
+    if not m_blocks or not t_blocks:
+        raise ValueError("Both bodies must retain at least one residue.")
+    if len(m_blocks) > 1 or len(t_blocks) > 1:
+        raise ValueError("Fusion mode expects one contiguous block per body; use compose_graft "
+                         "for multi-segment grafts.")
+    (m_lo, m_hi), (t_lo, t_hi) = m_blocks[0], t_blocks[0]
+
+    # Starting pose: no snap-to-fit (there is no cavity to snap into). What matters for a fusion
+    # is the distance between the two JUNCTION TERMINI — the ends the linker has to bridge — not
+    # the separation of the centroids. Placing by centroid puts elongated bodies absurdly far
+    # apart at the junction, so translate along the terminus-to-terminus axis to a span the
+    # linker can actually close, then back off only as far as needed to clear a clash.
+    rot, tran = _IDENTITY
+    if auto_separate and not (mount_transform or any(nudge) or any(rotate)):
+        m_junc_num = m_hi if chassis_terminus == "C" else m_lo
+        t_junc_num = t_lo if chassis_terminus == "C" else t_hi
+        m_j = _ca(mount_res, m_junc_num)
+        t_j = _ca(torso_res, t_junc_num)
+        if m_j is not None and t_j is not None:
+            m_atoms = np.array([a.coord for r in mount_res if r.id[1] in mount_keep_set for a in r])
+            t_atoms = np.array([a.coord for r in torso_res if r.id[1] in torso_keep_set for a in r])
+            axis = m_j - t_j
+            n = np.linalg.norm(axis)
+            axis = axis / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
+            target = max(6.0, linker_length[1] * 2.5)     # a span the longest linker can close
+            for _ in range(40):                            # nudge outward until no steric overlap
+                cand = (t_j + axis * target) - m_j
+                moved = m_atoms + cand
+                d = np.linalg.norm(moved[:, None, :] - t_atoms[None, :, :], axis=-1).min() \
+                    if (len(moved) * len(t_atoms) <= 4_000_000) else 99.0
+                if d >= 3.2:
+                    break
+                target += 2.0
+            tran = (t_j + axis * target) - m_j
+
+    if any(nudge) or any(rotate):
+        rot, tran = _apply_manual(rot, tran, mount_res, mount_keep_set, nudge, rotate)
+    if mount_transform:
+        R = np.array(mount_transform["rot"], dtype=float).reshape(3, 3)
+        tt = np.array(mount_transform["tran"], dtype=float)
+        c1 = np.array(mount_transform["about"], dtype=float)
+        Rm = R.T
+        rot, tran = rot @ Rm, tran @ Rm - c1 @ Rm + c1 + tt
+
+    composite = _write_composite(
+        parse_pdb(torso_pdb), torso_keep_set, torso_chain,
+        parse_pdb(mount_pdb), mount_keep_set, mount_chain,
+        rot, tran, OUT_T, OUT_M,
+    )
+
+    mount_frag = Fragment("MOUNT-1", "mount", OUT_M, m_lo, m_hi, mount_fixed_atoms)
+    torso_frag = Fragment("TORSO-1", "torso", OUT_T, t_lo, t_hi, "BKBN")
+    if chassis_terminus == "C":       # MOUNT — linker — TORSO (chassis C-terminal)
+        chain_order = [mount_frag, Linker(*linker_length), torso_frag]
+        junctions = [(OUT_M, m_hi), (OUT_T, t_lo)]
+    else:                             # TORSO — linker — MOUNT
+        chain_order = [torso_frag, Linker(*linker_length), mount_frag]
+        junctions = [(OUT_T, t_hi), (OUT_M, m_lo)]
+
+    spec = GraftSpec(
+        chain_order=chain_order,
+        repack_residues=_apply_residue_overrides(
+            _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell),
+            composite, extra_repack, extra_fixed, OUT_M,
+        ),
+        k=k, m=m,
+        catalytic_site=catalytic_site or {},
+        provenance={
+            "mode": "fusion", "chassis_terminus": chassis_terminus,
+            "torso_chain": torso_chain, "mount_chain": mount_chain,
+            "posed_by": "manual" if (mount_transform or any(nudge) or any(rotate))
+                        else ("auto_separate" if auto_separate else "keep_input"),
         },
     )
     return GraftPackage(spec=spec, composite_pdb=composite)

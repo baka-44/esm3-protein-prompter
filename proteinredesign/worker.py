@@ -63,6 +63,7 @@ class Candidate:
     mpnn_scores: dict[str, float] = field(default_factory=dict)  # {checkpoint: score}
     esm2_score: float = 0.0
     plddt: float = 0.0
+    geometry: dict = field(default_factory=dict)   # optional catalytic-geometry report
     rmsd_to_design: float = float("inf")
     pdb: str = ""              # ESMFold-predicted structure (PDB text)
     composite_score: float = 0.0
@@ -772,6 +773,211 @@ def _generate_motif_candidates(
     return candidates
 
 
+# ── Fold-only preset: ESMFold + catalytic-geometry QC, no design ──────────────
+# Purpose: answer "does this construct still fold, and does its active site survive?"
+# for a handful of hand-specified sequences (e.g. domain-deletion / re-bodying variants)
+# without running a design campaign. Runs on the rf3-worker because ESMFold + GPU live there.
+
+def _renumber_pdb(pdb_text: str, offset: int, chain: str = "A") -> str:
+    """Shift residue numbers by `offset` so the model uses the caller's reference frame.
+
+    ESMFold numbers its output 1..N for whatever construct it was given. When that construct
+    is a slice of a larger protein (say Kex2 114-453), every downstream spec — catalytic
+    residues, metal ligands, literature positions — is in the PARENT numbering. Renumbering
+    here means the emitted PDB is directly comparable to the reference structure and to any
+    site spec, instead of forcing every consumer to do the arithmetic.
+    """
+    if not offset:
+        return pdb_text
+    out = []
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 26:
+            try:
+                n = int(line[22:26]) + offset
+                line = f"{line[:21]}{chain}{n:>4}{line[26:]}"
+            except ValueError:
+                pass
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _catalytic_site_from_spec(name: str, spec: dict):
+    """Build a CatalyticSite from the JSON form carried in manifest params."""
+    from proteinredesign.catalytic_geometry import CatalyticSite
+
+    def key(v):
+        return (v[0], int(v[1]))
+    return CatalyticSite(
+        name=name,
+        nucleophile=key(spec["nucleophile"]),
+        base=key(spec["base"]),
+        acid=key(spec["acid"]) if spec.get("acid") else None,
+        oxyanion=[key(v) for v in spec.get("oxyanion", [])],
+        metal_sites={m: [key(v) for v in ligs] for m, ligs in spec.get("metal_sites", {}).items()},
+    )
+
+
+def _run_fold_sequences(manifest, workdir: str, jobstore, storage) -> dict:
+    """
+    Fold each named sequence with ESMFold and report fold quality + active-site integrity.
+
+    params:
+      sequences        {name: "SEQ..."}                  (required)
+      offsets          {name: int}                       residue-number offset per construct
+      catalytic_sites  {name: {...CatalyticSite JSON}}   optional per-construct site spec
+    """
+    from proteinredesign.catalytic_geometry import Structure, measure, site_confidence, verdict
+
+    job_id = manifest.job_id
+    seqs: dict = manifest.params.get("sequences") or {}
+    offsets: dict = manifest.params.get("offsets") or {}
+    sites: dict = manifest.params.get("catalytic_sites") or {}
+    if not seqs:
+        raise ValueError("fold_sequences requires params['sequences']")
+
+    records, n = [], len(seqs)
+    for i, (name, seq) in enumerate(seqs.items(), 1):
+        jobstore.update_job(job_id, stage=f"Folding {name} ({i}/{n})", progress=0.05 + 0.85 * (i - 1) / n)
+        pdb_text, plddt = run_esmfold(seq)
+        pdb_text = _renumber_pdb(pdb_text, int(offsets.get(name, 0)))
+        pdb_name = f"{name}.pdb"
+        storage.write_output(job_id, pdb_name, pdb_text.encode(), content_type="chemical/x-pdb")
+
+        rec = {"name": name, "length": len(seq), "mean_plddt": round(float(plddt), 2),
+               "offset": int(offsets.get(name, 0)), "pdb": pdb_name,
+               "geometry": None, "geometry_pass": None, "min_catalytic_plddt": None}
+
+        if name in sites:
+            local = os.path.join(workdir, pdb_name)
+            with open(local, "w") as fh:
+                fh.write(pdb_text)
+            try:
+                struct = Structure(local)
+                site = _catalytic_site_from_spec(name, sites[name])
+                findings = measure(struct, site)
+                ok, fails = verdict(findings)
+                conf = {k: v for k, v in site_confidence(struct, site).items() if v is not None}
+                rec["geometry"] = [{"label": f.label, "value": f.value, "unit": f.unit, "ok": f.ok}
+                                   for f in findings]
+                rec["geometry_pass"] = ok
+                rec["geometry_failures"] = fails
+                rec["catalytic_plddt"] = {k: round(v, 1) for k, v in conf.items()}
+                rec["min_catalytic_plddt"] = round(min(conf.values()), 1) if conf else None
+            except Exception as e:  # noqa: BLE001 — a geometry failure must not lose the fold
+                rec["geometry_error"] = f"{type(e).__name__}: {e}"
+        records.append(rec)
+
+    jobstore.update_job(job_id, stage="Writing results", progress=0.95)
+    results = {"job_id": job_id, "preset": manifest.preset.value,
+               "count": len(records), "folds": records, "params": manifest.params}
+    results_uri = storage.write_output(job_id, "results.json",
+                                       json.dumps(results, indent=2).encode(),
+                                       content_type="application/json")
+    results["results_uri"] = results_uri
+    return results
+
+
+# ── Optional catalytic-geometry reporting on generated candidates ─────────────
+# Entirely opt-in: driven by params["catalytic_site"], which the Composer bundles into the
+# graft package only when the user defined one. With no spec these functions are no-ops and
+# the pipeline behaves exactly as before. Nothing here can fail a job — every path is guarded,
+# because a QC read-out must never destroy a design run that otherwise succeeded.
+#
+# Design note: we REPORT, we do not filter. Each metric is emitted with its measured value, the
+# reference value measured on the job's own input composite, the deviation, and the acceptable
+# band. Filtering on a single axis hides good multi-objective compromises, and you cannot
+# calibrate a gate you never see the distribution of.
+
+def _site_from_params(spec: dict, name: str = "site"):
+    from proteinredesign.catalytic_geometry import CatalyticSite
+    k = lambda v: (v[0], int(v[1]))                                        # noqa: E731
+    return CatalyticSite(
+        name=name,
+        nucleophile=k(spec["nucleophile"]), base=k(spec["base"]),
+        acid=k(spec["acid"]) if spec.get("acid") else None,
+        oxyanion=[k(v) for v in spec.get("oxyanion", [])],
+        metal_sites={m: [k(v) for v in ligs] for m, ligs in spec.get("metal_sites", {}).items()},
+    )
+
+
+def _reference_geometry(site_spec: dict, composite_pdb_path: str) -> dict:
+    """Measure the site on the job's INPUT composite — the 'as-designed' reference every
+    candidate is compared against. Deviation from the parent is a sharper signal than an
+    absolute band, because it asks 'does this still look like the real enzyme?'."""
+    try:
+        from proteinredesign.catalytic_geometry import Structure, measure
+        fs = measure(Structure(composite_pdb_path), _site_from_params(site_spec, "reference"))
+        return {f.label: f.value for f in fs if f.value is not None}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _remap_site(site_spec: dict, motif_keys: list, pred_positions: list) -> dict | None:
+    """Rewrite the site's residue numbers from composite numbering into the CANDIDATE's.
+
+    RF3 renumbers its output, so the parent's A175/A213/A385 are somewhere else in the design.
+    `pred_positions` is aligned to `motif_keys` (0 = unmapped), so we look each catalytic
+    residue up by its parent key. Returns None if any REQUIRED residue failed to map — a
+    partially-mapped site would silently measure the wrong atoms.
+    """
+    index = {key: pos for key, pos in zip(motif_keys, pred_positions) if pos}
+    def m(v):
+        pos = index.get((v[0], int(v[1])))
+        return ["A", int(pos)] if pos else None          # ESMFold emits a single chain A, 1..N
+    out = {}
+    for fld in ("nucleophile", "base", "acid"):
+        if site_spec.get(fld):
+            mapped = m(site_spec[fld])
+            if mapped is None:
+                return None                              # required residue unmapped => give up
+            out[fld] = mapped
+    out["oxyanion"] = [x for x in (m(v) for v in site_spec.get("oxyanion", [])) if x]
+    metals = {}
+    for name, ligs in (site_spec.get("metal_sites") or {}).items():
+        mapped = [m(v) for v in ligs]
+        if all(mapped):                                  # only score complete metal sites
+            metals[name] = mapped
+    out["metal_sites"] = metals
+    return out
+
+
+def _candidate_geometry(candidate, site_spec: dict, motif_keys: list, reference: dict,
+                        workdir: str) -> dict:
+    """Measure catalytic geometry on one candidate. Returns {} on any problem (never raises)."""
+    if not site_spec or not candidate.pdb:
+        return {}
+    try:
+        from proteinredesign.catalytic_geometry import Structure, measure, site_confidence
+        mapped = _remap_site(site_spec, motif_keys, candidate.catalytic_pred_positions or [])
+        if mapped is None:
+            return {"note": "catalytic residues could not be mapped into the design"}
+        path = os.path.join(workdir, f"geom_cand_{candidate.rank or id(candidate)}.pdb")
+        with open(path, "w") as fh:
+            fh.write(candidate.pdb)
+        struct = Structure(path)
+        site = _site_from_params(mapped, "candidate")
+        findings = measure(struct, site)
+        conf = {k: v for k, v in site_confidence(struct, site).items() if v is not None}
+        metrics, devs = [], []
+        for f in findings:
+            ref = reference.get(f.label)
+            dev = (abs(f.value - ref) if (f.value is not None and ref is not None) else None)
+            if dev is not None:
+                devs.append(dev)
+            metrics.append({"label": f.label, "value": f.value, "unit": f.unit,
+                            "reference": ref, "deviation": dev,
+                            "within_band": f.ok, "desired": f.desired})
+        return {
+            "metrics": metrics,
+            "all_within_band": all(f.ok for f in findings) if findings else None,
+            # single scalar for RANKING (not gating): mean |candidate - parent| across metrics
+            "geometry_deviation": (sum(devs) / len(devs)) if devs else None,
+            "min_catalytic_plddt": round(min(conf.values()), 1) if conf else None,
+        }
+    except Exception as e:  # noqa: BLE001 — reporting must never fail a design job
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def run_pipeline(manifest, workdir: str) -> dict:
     """
     Execute preset #1 end-to-end and return a results dict (also written to GCS).
@@ -794,6 +1000,11 @@ def run_pipeline(manifest, workdir: str) -> dict:
     # Motif scaffolding (#3) and Borrowed Bodies both run the indexed multi-segment path.
     is_motif = manifest.preset in (Preset.MOTIF_SCAFFOLDING, Preset.BORROWED_BODIES)
     has_motif_qc = is_enzyme or is_motif  # motif-RMSD fidelity check applies
+
+    # Fold-only preset: no input backbone, no design — fold the given sequences and QC them.
+    if manifest.preset == Preset.FOLD_SEQUENCES:
+        jobstore.update_job(job_id, status=JobStatus.RUNNING.value, stage="Folding", progress=0.05)
+        return _run_fold_sequences(manifest, workdir, jobstore, storage)
 
     # 0. Fetch the input PDB.
     jobstore.update_job(job_id, status=JobStatus.RUNNING.value, stage="Preparing inputs", progress=0.05)
@@ -851,6 +1062,11 @@ def run_pipeline(manifest, workdir: str) -> dict:
         (r["chain_id"], r["author_num"])
         for r in (params.get("catalytic_residues") or params.get("motif_residues") or [])
     ]
+    # Optional geometry reporting (opt-in via params["catalytic_site"]); reference measured
+    # once on the input composite. Absent spec => site_spec is {} and every call is a no-op.
+    site_spec = params.get("catalytic_site") or {}
+    geom_reference = _reference_geometry(site_spec, pdb_path) if site_spec else {}
+
     for c in candidates:
         c.pdb, c.plddt = run_esmfold(c.sequence)
         ref_path = c.parent_backbone_path or pdb_path
@@ -866,6 +1082,8 @@ def run_pipeline(manifest, workdir: str) -> dict:
             c.motif_rmsd = compute_motif_rmsd(
                 c.pdb, pdb_path, c.catalytic_pred_positions, motif_keys, ref_chain=chain_id
             )
+        if site_spec:
+            c.geometry = _candidate_geometry(c, site_spec, motif_keys, geom_reference, workdir)
 
     # 5. Gate + rank + trim to N. Motif-RMSD fidelity gate: tight (1.5 Å) for enzyme active-site
     # scaffolding (small catalytic motif); looser (2.5 Å) for motif scaffolding / Borrowed Bodies
@@ -909,6 +1127,7 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
             "esm2_score": c.esm2_score, "plddt": c.plddt, "rmsd_to_design": c.rmsd_to_design,
             "diversity_from_input": c.diversity_from_input, "motif_rmsd": c.motif_rmsd,
             "mpnn_scores": c.mpnn_scores, "pdb": pdb_name if c.pdb else None,
+            **({"geometry": c.geometry} if c.geometry else {}),
         })
     storage.write_output(job_id, "candidates.fasta", ("\n".join(fasta_lines) + "\n").encode())
     results = {"job_id": job_id, "preset": manifest.preset.value, "count": len(top),

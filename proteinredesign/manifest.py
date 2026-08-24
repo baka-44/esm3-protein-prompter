@@ -28,6 +28,7 @@ class Preset(str, Enum):
     ENZYME_ACTIVE_SITE = "enzyme_active_site"               # #6  RF3-all-atom
     SCAFFOLD_DIVERSIFICATION = "scaffold_diversification"   # #8  RF3 partial diffusion
     BORROWED_BODIES = "borrowed_bodies"                     # Composer graft → RF3 multi-segment
+    FOLD_SEQUENCES = "fold_sequences"                       # ESMFold-only: fold + geometry QC, no design
 
 
 class JobStatus(str, Enum):
@@ -43,6 +44,9 @@ class JobStatus(str, Enum):
 MPNN_ONLY_PRESETS: frozenset[Preset] = frozenset(
     {Preset.FIXED_BACKBONE_REDESIGN, Preset.LIGAND_AWARE_REDESIGN}
 )
+
+# Presets that take sequences rather than an input backbone, so there is no PDB to upload.
+NO_INPUT_PDB_PRESETS: frozenset[Preset] = frozenset({Preset.FOLD_SEQUENCES})
 
 
 @dataclass
@@ -98,4 +102,8 @@ class JobManifest:
         return f"jobs/{self.job_id}"
 
     def requires_rfdiffusion(self) -> bool:
-        return self.preset not in MPNN_ONLY_PRESETS
+        return self.preset not in MPNN_ONLY_PRESETS | NO_INPUT_PDB_PRESETS
+
+    def requires_input_pdb(self) -> bool:
+        """Fold-only jobs are driven by sequences in params; there is no input backbone."""
+        return self.preset not in NO_INPUT_PDB_PRESETS
