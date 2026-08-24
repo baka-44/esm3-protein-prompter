@@ -212,6 +212,65 @@ def _auto_repack(composite_pdb: bytes, torso_chain: str, mount_chain: str,
     return [{"chain": c, "author_num": n} for c, n in sorted(repack)]
 
 
+
+def _normalise_residue_refs(refs, default_chain: str) -> set[tuple[str, int]]:
+    """Accept the several shapes a caller may reasonably use for a residue list.
+
+    "B280" | ("B", 280) | {"chain": "B", "author_num": 280} | 280 (-> default_chain).
+    Plain integers default to the MOUNT output chain, because that is where redesign lists
+    almost always live (the enzyme's own surface).
+    """
+    out: set[tuple[str, int]] = set()
+    for ref in refs or []:
+        if isinstance(ref, dict):
+            out.add((str(ref["chain"]), int(ref["author_num"])))
+        elif isinstance(ref, (tuple, list)) and len(ref) == 2:
+            out.add((str(ref[0]), int(ref[1])))
+        elif isinstance(ref, int):
+            out.add((default_chain, ref))
+        elif isinstance(ref, str):
+            s = ref.strip()
+            if not s:
+                continue
+            if s[0].isalpha():
+                out.add((s[0], int(s[1:])))
+            else:
+                out.add((default_chain, int(s)))
+        else:
+            raise ValueError(f"Unrecognised residue reference: {ref!r}")
+    return out
+
+
+def _apply_residue_overrides(auto_repack: list[dict], composite_pdb: bytes,
+                             extra_repack, extra_fixed, default_chain: str) -> list[dict]:
+    """Merge caller-supplied repack/fixed overrides into the automatic contact shell.
+
+    Why this is not optional: `_auto_repack` only selects residues within the contact shell of
+    the OTHER body, plus junctions. A surface that was buried by a domain you deleted is not in
+    contact with anything — so the residues that most need redesigning are exactly the ones the
+    automatic rule cannot see. Without an explicit list they would stay untouched.
+
+    `extra_fixed` wins over `extra_repack`: a residue cannot be both, and pinning is the safer
+    interpretation of a conflicting instruction.
+    """
+    present = {(r.get_parent().id, r.id[1]) for r in get_residues(composite_pdb, chain_id=None)}
+    add = _normalise_residue_refs(extra_repack, default_chain)
+    pin = _normalise_residue_refs(extra_fixed, default_chain)
+
+    unknown = sorted((add | pin) - present)
+    if unknown:
+        raise ValueError(
+            "Residue override(s) not present in the composite: "
+            + ", ".join(f"{c}{n}" for c, n in unknown[:8])
+            + (" …" if len(unknown) > 8 else "")
+            + ". Check the chain letter — the composite relabels torso→A, mount→B."
+        )
+
+    repack = {(r["chain"], r["author_num"]) for r in auto_repack} | add
+    repack -= pin
+    return [{"chain": c, "author_num": n} for c, n in sorted(repack)]
+
+
 def compose_graft(
     *,
     torso_pdb: bytes,
@@ -230,6 +289,8 @@ def compose_graft(
     # transform applied to the base-posed mount about `about` (from the live 3D canvas). new = R·(p-c)+c+t.
     linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
     repack_shell: float = 5.0,
+    extra_repack: list | None = None,   # residues MPNN should re-identify beyond the contact shell
+    extra_fixed: list | None = None,    # residues to pin even if the shell would repack them
     k: int = 5,
     m: int = 3,
 ) -> GraftPackage:
@@ -299,7 +360,10 @@ def compose_graft(
     chain_order.append(Fragment("TORSO-2", "torso", OUT_T, f2_start, f2_end, "BKBN"))
     junctions.append((OUT_T, f2_start))
 
-    repack = _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell)
+    repack = _apply_residue_overrides(
+        _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell),
+        composite, extra_repack, extra_fixed, OUT_M,
+    )
 
     spec = GraftSpec(
         chain_order=chain_order,
@@ -332,6 +396,8 @@ def compose_fusion(
     auto_separate: bool = True,         # sane non-clashing starting pose when none is given
     linker_length: tuple[int, int] = (4, 12),
     repack_shell: float = 5.0,
+    extra_repack: list | None = None,   # residues MPNN should re-identify beyond the contact shell
+    extra_fixed: list | None = None,    # residues to pin even if the shell would repack them
     k: int = 5,
     m: int = 3,
     catalytic_site: dict | None = None,
@@ -430,7 +496,10 @@ def compose_fusion(
 
     spec = GraftSpec(
         chain_order=chain_order,
-        repack_residues=_auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell),
+        repack_residues=_apply_residue_overrides(
+            _auto_repack(composite, OUT_T, OUT_M, junctions, repack_shell),
+            composite, extra_repack, extra_fixed, OUT_M,
+        ),
         k=k, m=m,
         catalytic_site=catalytic_site or {},
         provenance={
