@@ -16,7 +16,7 @@ import os
 import streamlit as st
 
 st.set_page_config(
-    page_title="Phyx44 Guided Protein Design Tool",
+    page_title="Phyx44 Protein Foundry",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -303,10 +303,12 @@ st.markdown(
              alt="PHYX44" />
         <div class="phyx-divider"></div>
         <div class="phyx-text">
-            <div class="phyx-title">Guided Protein Design Tool</div>
+            <div class="phyx-title">Protein Foundry</div>
             <div class="phyx-desc">
-                Design novel proteins — conversational sequence generation, or structure-based
-                backbone design with folding-based quality control.
+                Design novel proteins from scratch. Modify existing proteins in a constrained
+                space. Build bespoke proteins for target function.<br>
+                Evaluate fold and fitness. Test functional characteristics &amp; activity
+                potential. Validate expressibility &amp; stability.
             </div>
         </div>
     </div>
