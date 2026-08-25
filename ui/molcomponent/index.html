@@ -9,6 +9,17 @@
     #viewport { width: 100%; height: 100vh; position: relative; }
     /* Overlay captures gestures in Pose mode so 3Dmol doesn't orbit the camera. */
     #overlay { position: absolute; inset: 0; z-index: 3; display: none; cursor: grab; }
+    /* Rotation gizmo: screen-space rings, so the axes match what the user sees — X is the
+       horizontal screen edge, Y the vertical, Z straight into the screen. Sits above the
+       drag overlay; the overlay still handles free rotation anywhere off a ring. */
+    #gizmo { position: absolute; inset: 0; z-index: 4; display: none; pointer-events: none; }
+    #gizmo.active { display: block; }
+    #gizmo .ring { fill: none; stroke-width: 2.5; opacity: .55; pointer-events: stroke;
+                   cursor: grab; transition: opacity .12s, stroke-width .12s; }
+    #gizmo .ring:hover, #gizmo .ring.hot { opacity: 1; stroke-width: 5; }
+    #gizmo .hub { fill: #0d0d0d; stroke: #3a3d42; stroke-width: 1; opacity: .75; }
+    #gizmo text { font-family: 'Montserrat', system-ui, sans-serif; font-size: 11px;
+                  font-weight: 600; pointer-events: none; }
     #overlay.active { display: block; }
 
     .panel { position: absolute; z-index: 5; color: #cfcfcf; font-size: 12px;
@@ -38,6 +49,7 @@
 <body>
   <div id="viewport"></div>
   <div id="overlay"></div>
+  <svg id="gizmo" aria-hidden="true"></svg>
 
   <div id="tools" class="panel">
     <div class="seg">
@@ -292,9 +304,10 @@
       document.getElementById("overlay").classList.toggle("active", m === "pose");
       document.getElementById("sel").classList.toggle("show", m === "pose");
       document.getElementById("cutpill").style.display = (m === "cut") ? "block" : "none";
-      if (m === "pose") { styleCartoonOnly(); hud("<b>drag</b> rotate · <b>two-finger scroll</b> move · <b>Esc</b> done", true); }
-      else if (m === "cut") { styleFull(); hud("click two <b>torso</b> residues to set the cut", true); }
-      else { styleFull(); hud("click a residue", false); }
+      if (m === "pose") { styleCartoonOnly(); drawGizmo();
+        hud("<b>drag a ring</b> to rotate on one axis · <b>drag free</b> for coarse · <b>two-finger scroll</b> move", true); }
+      else if (m === "cut") { styleFull(); drawGizmo(); hud("click two <b>torso</b> residues to set the cut", true); }
+      else { styleFull(); drawGizmo(); hud("click a residue", false); }
     }
     document.getElementById("m_cam").onclick = () => setMode("cam");
     document.getElementById("m_cut").onclick = () => setMode("cut");
@@ -312,6 +325,91 @@
     };
     window.addEventListener("keydown", (e) => { if (e.key === "Escape" && mode !== "cam") setMode("cam"); });
 
+    // ── rotation gizmo ───────────────────────────────────────────────────────────
+    // Three rings in SCREEN space: the user thinks in screen axes (X = the horizontal edge of
+    // the laptop, Y = vertical, Z = into the screen), so the gizmo is drawn and hit-tested in
+    // 2D and only converted to world axes at the moment of rotation, via the camera basis.
+    // Free drag anywhere off a ring is unchanged — the gizmo adds constraint, it does not
+    // replace the coarse control.
+    const GIZ = document.getElementById("gizmo");
+    const GIZ_R = 92;                 // ring radius in px
+    const GIZ_FLAT = 0.34;            // foreshortening of the two edge-on rings
+    const GIZ_AXES = [
+      { id: "z", color: "#5ba3f5", rx: GIZ_R,            ry: GIZ_R,            label: "Z" },
+      { id: "y", color: "#39d98a", rx: GIZ_R * GIZ_FLAT, ry: GIZ_R,            label: "Y" },
+      { id: "x", color: "#ff6b6b", rx: GIZ_R,            ry: GIZ_R * GIZ_FLAT, label: "X" },
+    ];
+    let gizAxis = null;               // axis currently being dragged
+    let gizCentre = [0, 0];
+
+    function gizmoCentre() {
+      // Prefer the mount's own projected centroid so the gizmo sits on what it rotates;
+      // fall back to the viewport centre if the viewer exposes no projection.
+      const vp = document.getElementById("viewport");
+      const w = vp.clientWidth, h = vp.clientHeight;
+      try {
+        if (viewer && typeof viewer.modelToScreen === "function") {
+          const c = V.add(centroid, tAcc);
+          const s = viewer.modelToScreen({ x: c[0], y: c[1], z: c[2] });
+          if (s && isFinite(s.x) && isFinite(s.y)) return [s.x, s.y];
+        }
+      } catch (e) { /* fall through */ }
+      return [w / 2, h / 2];
+    }
+
+    function drawGizmo() {
+      if (mode !== "pose") { GIZ.classList.remove("active"); return; }
+      GIZ.classList.add("active");
+      const [cx, cy] = gizCentre = gizmoCentre();
+      GIZ.setAttribute("viewBox", `0 0 ${GIZ.clientWidth} ${GIZ.clientHeight}`);
+      GIZ.innerHTML =
+        GIZ_AXES.map(a =>
+          `<ellipse class="ring${gizAxis === a.id ? " hot" : ""}" data-axis="${a.id}" ` +
+          `cx="${cx}" cy="${cy}" rx="${a.rx}" ry="${a.ry}" stroke="${a.color}"></ellipse>`).join("") +
+        `<circle class="hub" cx="${cx}" cy="${cy}" r="4"></circle>` +
+        GIZ_AXES.map(a => {
+          const lx = cx + (a.id === "y" ? 0 : a.rx + 12);
+          const ly = cy + (a.id === "y" ? -(a.ry + 10) : (a.id === "x" ? 4 : 4));
+          return `<text x="${lx}" y="${ly}" fill="${a.color}">${a.label}</text>`;
+        }).join("");
+      GIZ.querySelectorAll(".ring").forEach(el => {
+        el.addEventListener("mousedown", (e) => startGizmoDrag(e, el.dataset.axis));
+      });
+    }
+
+    function gizmoWorldAxis(id) {
+      const b = camBasis();
+      if (id === "y") return b.up;                     // yaw   — about the vertical screen edge
+      if (id === "x") return b.right;                  // pitch — about the horizontal screen edge
+      return [                                         // roll  — straight into the screen
+        b.right[1] * b.up[2] - b.right[2] * b.up[1],
+        b.right[2] * b.up[0] - b.right[0] * b.up[2],
+        b.right[0] * b.up[1] - b.right[1] * b.up[0],
+      ];
+    }
+
+    function startGizmoDrag(e, axis) {
+      e.preventDefault(); e.stopPropagation();
+      gizAxis = axis; px = e.clientX; py = e.clientY;
+      dragging = false;                                // gizmo drag, not free drag
+      drawGizmo();
+      hud(`rotating about <b>${axis.toUpperCase()}</b> — release to apply`, true);
+    }
+
+    function gizmoDelta(axis, e, rect) {
+      // Z reads the angle swept around the hub; X and Y read the drag component perpendicular
+      // to their ring, which is what the ring's shape already suggests to the user.
+      if (axis === "z") {
+        const cx = rect.left + gizCentre[0], cy = rect.top + gizCentre[1];
+        const a0 = Math.atan2(py - cy, px - cx), a1 = Math.atan2(e.clientY - cy, e.clientX - cx);
+        let d = a1 - a0;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d < -Math.PI) d += 2 * Math.PI;
+        return -d;
+      }
+      return (axis === "y" ? (e.clientX - px) : (e.clientY - py)) * R_SENS;
+    }
+
     function sendPose() {
       Streamlit.setValue({ kind: "pose_xform", rot: qToM3(qAcc), tran: tAcc, about: centroid, ts: Date.now() });
     }
@@ -321,6 +419,13 @@
     let dragging = false, px = 0, py = 0;
     ov.addEventListener("mousedown", (e) => { dragging = true; px = e.clientX; py = e.clientY; ov.style.cursor = "grabbing"; });
     window.addEventListener("mousemove", (e) => {
+      if (gizAxis) {                                   // constrained: one axis only
+        const ang = gizmoDelta(gizAxis, e, GIZ.getBoundingClientRect());
+        px = e.clientX; py = e.clientY;
+        qAcc = qMul(qFromAxisAngle(gizmoWorldAxis(gizAxis), ang), qAcc);
+        applyPose(); drawGizmo();
+        return;
+      }
       if (!dragging) return;
       const dx = e.clientX - px, dy = e.clientY - py; px = e.clientX; py = e.clientY;
       const b = camBasis();
@@ -328,10 +433,15 @@
       let q = qFromAxisAngle(b.up, dx * R_SENS);
       q = qMul(qFromAxisAngle(b.right, dy * R_SENS), q);
       qAcc = qMul(q, qAcc);
-      applyPose();
+      applyPose(); drawGizmo();
       hud("rotating mount — release to apply", true);
     });
     window.addEventListener("mouseup", () => {
+      if (gizAxis) {
+        gizAxis = null; sendPose(); drawGizmo();
+        hud("<b>drag a ring</b> to rotate on one axis · <b>drag free</b> for coarse · <b>Esc</b> done", true);
+        return;
+      }
       if (!dragging) return;
       dragging = false; ov.style.cursor = "grab";
       sendPose();

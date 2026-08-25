@@ -81,8 +81,29 @@ def _render_results(job) -> None:
 
     cands = results.get("candidates", [])
     if not cands:
-        st.warning("No candidates passed QC. Try loosening constraints or increasing outputs.")
+        st.warning("This run produced no candidates at all — check the job logs.")
         return
+
+    # Candidates below the QC gate are returned flagged rather than withheld. The gates are not
+    # user-adjustable, so hiding the output would leave nothing to act on but "generate more and
+    # hope"; the structures and sequences are still worth inspecting, and seeing how far off they
+    # were is the only way to judge whether the design or the gate is the problem.
+    n_pass = results.get("passed_qc")
+    n_below = results.get("reported_below_gate") or 0
+    if n_pass == 0 and n_below:
+        reasons: dict[str, int] = {}
+        for c in cands:
+            for f in c.get("gate_failures", []):
+                reasons[f.split()[0]] = reasons.get(f.split()[0], 0) + 1
+        summary = ", ".join(f"{k} ({v})" for k, v in sorted(reasons.items(), key=lambda x: -x[1]))
+        st.warning(
+            f"**No candidate passed QC** — all {n_below} are shown below for inspection, "
+            f"with structures and sequences downloadable as usual.\n\n"
+            f"Most common shortfall: {summary or 'n/a'}. The per-candidate reason is in the "
+            f"**QC** column."
+        )
+    elif n_below:
+        st.info(f"{n_pass} passed QC; {n_below} shown below the gate for inspection.")
 
     # "Diversity" (RF3 drift-from-input, Å) is only meaningful for RF3 presets
     # (scaffold diversification) — show the column only when candidates carry it.
@@ -95,6 +116,8 @@ def _render_results(job) -> None:
     def _row(c: dict) -> dict:
         row = {
             "Rank": c["rank"],
+            "QC": ("pass" if c.get("passed_gate", True)
+                   else "; ".join(c.get("gate_failures", [])) or "below gate"),
             "Score": round(c.get("composite_score", 0.0), 3),
             "ESM2": round(c.get("esm2_score", 0.0), 3),
             "pLDDT": round(c.get("plddt", 0.0), 1),

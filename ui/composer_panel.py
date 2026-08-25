@@ -18,14 +18,103 @@ import streamlit as st
 _BG = "0x0d0d0d"  # near-black canvas
 
 
+class ResidueInputError(ValueError):
+    """A residue field could not be parsed — shown to the user, never as a traceback."""
+
+
 def _parse_ranges(s: str) -> list[tuple[int, int]]:
+    """Parse "10-18, 57, 102" into inclusive ranges.
+
+    Anything unparseable raises ResidueInputError with the offending token, because the caller
+    renders it as a message. Previously a stray word (someone typing "all") escaped as a raw
+    ValueError and crashed the whole panel with a traceback.
+    """
     out: list[tuple[int, int]] = []
     for tok in (t.strip() for t in s.split(",") if t.strip()):
-        if "-" in tok:
-            a, b = tok.split("-", 1)
-            out.append((int(a), int(b)))
+        try:
+            if "-" in tok:
+                a, b = tok.split("-", 1)
+                lo, hi = int(a), int(b)
+                if lo > hi:
+                    lo, hi = hi, lo
+                out.append((lo, hi))
+            else:
+                out.append((int(tok), int(tok)))
+        except ValueError:
+            raise ResidueInputError(
+                f"Could not read {tok!r} as a residue number. Use numbers and ranges, "
+                f"e.g. 10-18, 57, 102."
+            ) from None
+    return out
+
+
+def _metrics_for(pkg):
+    """compute_metrics once per package per run — it is called from both the export panel and
+    the canvas HUD, and recomputing it for the second reader is pure waste."""
+    from proteinredesign.graft_metrics import compute_metrics
+    cache = st.session_state.setdefault("_cmp_metrics_cache", {})
+    key = id(pkg)
+    if key not in cache:
+        cache.clear()                      # only ever one live package per run
+        cache[key] = compute_metrics(pkg)
+    return cache[key]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _compose_base(mode: str, mount_bytes: bytes, torso_bytes: bytes, mount_chain, torso_chain,
+                  cut, keep, repose: bool, chassis_terminus: str, k: int, m: int,
+                  repack: tuple, fixed: tuple):
+    """The composite WITHOUT the live pose — cached because it does not change while posing.
+
+    Every pose release triggers a Streamlit rerun, and the base compose is the expensive half
+    (PDB parsing, the contact shell, and for fusion the clash-avoidance separation search — well
+    over a second). Its inputs are identical across those reruns, so recomputing it made the
+    canvas sit under Streamlit's rerun overlay far longer than the work required. Only the posed
+    composite genuinely depends on the transform.
+
+    All arguments are primitives/tuples so they hash; the transform is deliberately NOT one.
+    """
+    from proteinredesign.composer import compose_fusion, compose_graft
+    overrides = dict(extra_repack=list(repack), extra_fixed=list(fixed))
+    if mode == "Fusion":
+        return compose_fusion(
+            mount_pdb=mount_bytes, torso_pdb=torso_bytes,
+            mount_chain=mount_chain, torso_chain=torso_chain,
+            chassis_terminus=chassis_terminus, k=k, m=m, **overrides)
+    return compose_graft(
+        torso_pdb=torso_bytes, mount_pdb=mount_bytes,
+        torso_cut=cut, mount_keep=list(keep),
+        torso_chain=torso_chain, mount_chain=mount_chain,
+        repose=repose, k=k, m=m, **overrides)
+
+
+def _parse_residue_list(s: str) -> list:
+    """Parse a user-typed residue list into refs the composer accepts.
+
+    Accepts "280, 282 323" or chain-qualified "B280 A42", and expands "407-412" ranges, because
+    a 23-residue redesign list is painful to type one number at a time.
+    """
+    out: list = []
+    for tok in (x for x in s.replace(",", " ").split() if x.strip()):
+        chain = tok[0] if tok[0].isalpha() else None
+        body = tok[1:] if chain else tok
+        if "-" in body:
+            try:
+                a, b = (int(x) for x in body.split("-", 1))
+            except ValueError:
+                raise ResidueInputError(
+                    f"Could not read {tok!r} as a residue range. Use e.g. 407-412 or B276-279."
+                ) from None
+            for n in range(min(a, b), max(a, b) + 1):
+                out.append(f"{chain}{n}" if chain else n)
         else:
-            out.append((int(tok), int(tok)))
+            try:
+                out.append(f"{chain}{int(body)}" if chain else int(body))
+            except ValueError:
+                raise ResidueInputError(
+                    f"Could not read {tok!r} as a residue. Use numbers, ranges (407-412), "
+                    f"or chain-qualified tokens (B280)."
+                ) from None
     return out
 
 
@@ -171,6 +260,22 @@ def _apply_pick(pick) -> None:
         return
     chain, resi, resn = pick.get("chain"), int(pick["resi"]), pick.get("resn")
     st.caption(f"Picked **{chain}{resi}** ({resn}) — apply to:")
+    # Tier actions are always available; cut points only make sense when excising.
+    fusion = st.session_state.get("cmp_mode", "Insertion") == "Fusion"
+    tok = f"{chain}{resi}"
+    t1, t2 = st.columns(2)
+    if t1.button("+ Redesign", key="cmp_pk_rep", use_container_width=True,
+                 help="MPNN may re-identify this residue (backbone stays fixed)."):
+        cur = st.session_state.get("cmp_repack_list", "").strip()
+        st.session_state["_pending_repack"] = f"{cur} {tok}".strip()
+        st.rerun()
+    if t2.button("+ Pin", key="cmp_pk_fix", use_container_width=True,
+                 help="Hold this residue's identity AND backbone."):
+        cur = st.session_state.get("cmp_fixed_list", "").strip()
+        st.session_state["_pending_fixed"] = f"{cur} {tok}".strip()
+        st.rerun()
+    if fusion:
+        return
     b1, b2, b3 = st.columns(3)
     # Route through PENDING keys (applied before the widgets render next run) — Streamlit forbids
     # mutating a widget's key after its widget has already been instantiated this run.
@@ -250,7 +355,7 @@ _FULLBLEED_CSS = """
 
 def render_composer(user_email: str) -> None:
     from ui.mol_component import mol_viewer
-    from proteinredesign.composer import compose_graft
+    from proteinredesign.composer import compose_fusion, compose_graft
     from proteinredesign.graft import to_engine_params
     from proteinredesign.graft_metrics import compute_metrics, critical_failures
 
@@ -259,7 +364,9 @@ def render_composer(user_email: str) -> None:
     # Apply residue picks / scissor cuts staged by the 3D canvas BEFORE the Cut/Keep widgets
     # instantiate below (Streamlit forbids mutating a widget's key after its widget renders).
     for pend, widget in (("_pending_cut1", "cmp_cut1"), ("_pending_cut2", "cmp_cut2"),
-                         ("_pending_keep", "cmp_keep")):
+                         ("_pending_keep", "cmp_keep"),
+                         ("_pending_repack", "cmp_repack_list"),
+                         ("_pending_fixed", "cmp_fixed_list")):
         if pend in st.session_state:
             st.session_state[widget] = st.session_state.pop(pend)
 
@@ -286,26 +393,71 @@ def render_composer(user_email: str) -> None:
     #    whole screen. (Streamlit has no native right sidebar; the pose/selection/metrics
     #    read-outs live as overlays inside the canvas instead.) ──
     with st.sidebar:
-        st.markdown("**Torso** (stable body · grey)")
+        mode = st.radio(
+            "Mode", ["Insertion", "Fusion"], key="cmp_mode", horizontal=True,
+            help="Insertion cuts a torso loop and drops the mount inside it. Fusion keeps BOTH "
+                 "bodies whole and designs only the connection between them - required for an "
+                 "enzyme whose N-terminal propeptide must be cleaved off, because autoprocessing "
+                 "inside an insertion would sever the chain and drop half the chassis.",
+        )
+        fusion = mode == "Fusion"
+
+        st.markdown("**Torso** (stable body - grey)")
         t_pdb = st.file_uploader("Torso PDB", type=["pdb"], key="cmp_torso", label_visibility="collapsed")
         if t_pdb:
             st.caption(_chain_info(t_pdb.getvalue()))
         t_chain = st.text_input("Torso chain", placeholder="auto", key="cmp_tchain").strip() or None
-        st.caption("**Excision span** — type it, or **✂ Cut** two torso residues on the canvas")
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            cut1 = st.number_input("from", min_value=1, value=15, step=1, key="cmp_cut1")
-        with cc2:
-            cut2 = st.number_input("to", min_value=1, value=30, step=1, key="cmp_cut2")
 
-        st.markdown("**Mount** (catalytic insert · orange · movable)")
+        cut1 = cut2 = None
+        chassis_terminus = "C"
+        if fusion:
+            chassis_terminus = st.radio(
+                "Chassis sits on the mount's", ["C", "N"], key="cmp_term", horizontal=True,
+                help="C-terminal is the safe default: an N-terminal propeptide is released by "
+                     "autoprocessing, which would take an N-terminal chassis with it.",
+            )
+        else:
+            st.caption("**Excision span** - type it, or **Cut** two torso residues on the canvas")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                cut1 = st.number_input("from", min_value=1, value=15, step=1, key="cmp_cut1")
+            with cc2:
+                cut2 = st.number_input("to", min_value=1, value=30, step=1, key="cmp_cut2")
+
+        st.markdown("**Mount** (catalytic insert - orange - movable)")
         m_pdb = st.file_uploader("Mount PDB", type=["pdb"], key="cmp_mount", label_visibility="collapsed")
         if m_pdb:
             st.caption(_chain_info(m_pdb.getvalue()))
         m_chain = st.text_input("Mount chain", placeholder="auto", key="cmp_mchain").strip() or None
-        keep = st.text_input("Residues to keep", placeholder="10-18  or  57,102,195", key="cmp_keep")
-        repose = st.checkbox("Re-pose (snap-to-fit)", value=True, key="cmp_repose",
-                             help="OFF keeps the mount's input coords (same-PDB reinsertion).")
+
+        keep, repose = "", False
+        if fusion:
+            st.caption("Both bodies are kept whole - no excision, no retain list.")
+        else:
+            keep = st.text_input("Residues to keep", placeholder="10-18  or  57,102,195", key="cmp_keep")
+            repose = st.checkbox("Re-pose (snap-to-fit)", value=True, key="cmp_repose",
+                                 help="OFF keeps the mount's input coords (same-PDB reinsertion).")
+
+        # Residue tiers. The automatic repack shell only sees residues within contact distance of
+        # the OTHER body - a surface exposed by deleting a domain contacts nothing, so the
+        # residues that most need redesigning are exactly the ones it misses.
+        with st.expander("Residue tiers", expanded=False):
+            st.caption("Numbers are **composite** numbering - torso = **A**, mount = **B**. "
+                       "Bare numbers mean the mount. Ranges like `407-412` expand.")
+            repack_list = st.text_area(
+                "Redesign (repack)", key="cmp_repack_list", height=68,
+                placeholder="280 282 323 324  or  B407-412",
+                help="MPNN may re-identify these; the backbone stays fixed. Use this for a "
+                     "hydrophobic face left exposed by a deleted domain.")
+            fixed_list = st.text_area(
+                "Pin (fixed)", key="cmp_fixed_list", height=68,
+                placeholder="175 213 385 314  or  B276-279",
+                help="Hold identity AND backbone - catalytic residues, metal ligands and the "
+                     "loops carrying them. Pinning wins if a residue appears in both lists.")
+            n_rep, n_fix = len(_parse_residue_list(repack_list)), len(_parse_residue_list(fixed_list))
+            if n_rep or n_fix:
+                st.caption(f"-> {n_rep} to redesign - {n_fix} pinned")
+
         kk, mm = st.columns(2)
         with kk:
             k = st.slider("K", 1, 10, 4, key="cmp_k")
@@ -314,11 +466,13 @@ def render_composer(user_email: str) -> None:
 
     # Reset the live pose whenever the inputs that define the base composite change (a new base
     # means the client rebuilds and its pose resets — keep Python's stored transform in step).
+    ready = bool(t_pdb and m_pdb and (fusion or keep.strip()))
     sig = None
-    if t_pdb and m_pdb and keep.strip():
+    if ready:
         sig = hashlib.md5(
             t_pdb.getvalue() + m_pdb.getvalue()
-            + f"|{cut1}|{cut2}|{keep}|{t_chain}|{m_chain}|{repose}".encode()
+            + (f"|{mode}|{cut1}|{cut2}|{keep}|{t_chain}|{m_chain}|{repose}"
+               f"|{chassis_terminus}|{repack_list}|{fixed_list}").encode()
         ).hexdigest()
     if sig != st.session_state.get("_cmp_sig"):
         st.session_state["_cmp_sig"] = sig
@@ -329,15 +483,41 @@ def render_composer(user_email: str) -> None:
     # base = snapped composite WITHOUT the live transform (stable → the canvas never rebuilds while
     # posing). posed = same + the live mount transform → drives metrics + export only.
     base, posed, err = None, None, None
-    if t_pdb and m_pdb and keep.strip():
-        common = dict(
-            torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
-            torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
-            torso_chain=t_chain, mount_chain=m_chain, repose=repose, k=k, m=m,
-        )
+    if ready:
         try:
-            base = compose_graft(**common)
-            posed = base if _is_identity_xform(xform) else compose_graft(**common, mount_transform=xform)
+            overrides = dict(extra_repack=_parse_residue_list(repack_list),
+                             extra_fixed=_parse_residue_list(fixed_list))
+            keep_ranges = _parse_ranges(keep) if not fusion else []
+        except ResidueInputError as e:
+            with st.sidebar:
+                st.error(str(e))
+            ready = False
+            overrides, keep_ranges = {"extra_repack": [], "extra_fixed": []}, []
+    if ready:
+        if fusion:
+            compose = compose_fusion
+            common = dict(
+                mount_pdb=m_pdb.getvalue(), torso_pdb=t_pdb.getvalue(),
+                mount_chain=m_chain, torso_chain=t_chain,
+                chassis_terminus=chassis_terminus, k=k, m=m, **overrides,
+            )
+        else:
+            compose = compose_graft
+            common = dict(
+                torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
+                torso_cut=(int(cut1), int(cut2)), mount_keep=keep_ranges,
+                torso_chain=t_chain, mount_chain=m_chain, repose=repose, k=k, m=m, **overrides,
+            )
+        try:
+            # base is cached (unchanged while posing); only the posed composite needs recomputing
+            base = _compose_base(
+                mode, m_pdb.getvalue(), t_pdb.getvalue(), m_chain, t_chain,
+                (int(cut1), int(cut2)) if not fusion else None,
+                tuple(keep_ranges) if not fusion else (),
+                repose, chassis_terminus, k, m,
+                tuple(overrides["extra_repack"]), tuple(overrides["extra_fixed"]),
+            )
+            posed = base if _is_identity_xform(xform) else compose(**common, mount_transform=xform)
         except Exception as e:  # noqa: BLE001
             err = str(e)
 
@@ -350,7 +530,7 @@ def render_composer(user_email: str) -> None:
                     st.session_state.pop("cmp_xform", None)
                     st.session_state["cmp_reset_ts"] = time.time()
                     st.rerun()
-            metrics = compute_metrics(posed)
+            metrics = _metrics_for(posed)
             if critical_failures(metrics):
                 st.error("Can't export — resolve the ⚠️ metrics.")
                 st.button("⬇️ Export graft package", disabled=True, use_container_width=True, key="cmp_exp0")
@@ -368,7 +548,7 @@ def render_composer(user_email: str) -> None:
     if base is not None:
         repack = [f"{r['chain']}{r['author_num']}" for r in base.spec.repack_residues]
         hud_metrics = [{"label": mt.label, "value": f"{mt.value:g}", "unit": mt.unit, "ok": mt.ok}
-                       for mt in compute_metrics(posed)]
+                       for mt in _metrics_for(posed)]
         ev = mol_viewer(base.composite_pdb.decode(errors="ignore"), repack=repack,
                         metrics=hud_metrics, mount_chain="B",
                         connections=_connection_points(base),
@@ -381,9 +561,11 @@ def render_composer(user_email: str) -> None:
     else:
         hint, _ = st.columns([3, 4])
         with hint:
-            st.info("← In the sidebar: upload a **torso** + **mount** and set the mount residues "
-                    "to keep. On the canvas: **✂ Cut** = click two torso residues to set the "
-                    "excision span, **✋ Pose Mount** = drag-rotate / two-finger-scroll the mount. "
-                    "The **arrows** at each open end show the backbone's exit direction — pose the "
-                    "mount until each pair points head-to-head and glows **green** (a linker can "
-                    "bridge them). Two-finger scroll in **Camera** mode pans the whole scene.")
+            st.info(
+                "← In the sidebar: pick a **Mode**, then upload a **torso** + **mount**.\n\n"
+                "**Insertion** cuts a torso loop and drops the mount inside it — set the excision "
+                "span (or **✂ Cut** two torso residues on the canvas) and the mount residues to "
+                "keep. **Fusion** keeps both bodies whole and designs only the connection.\n\n"
+                "On the canvas: **✋ Pose Mount** = drag-rotate / two-finger-scroll. The **arrows** "
+                "at each open end show the backbone's exit direction — pose until each pair points "
+                "head-to-head and glows **green**. Two-finger scroll in **Camera** mode pans.")

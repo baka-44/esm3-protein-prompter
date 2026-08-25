@@ -64,6 +64,8 @@ class Candidate:
     esm2_score: float = 0.0
     plddt: float = 0.0
     geometry: dict = field(default_factory=dict)   # optional catalytic-geometry report
+    passed_gate: bool = True                       # False = reported for inspection, not QC-clean
+    gate_failures: list = field(default_factory=list)
     rmsd_to_design: float = float("inf")
     pdb: str = ""              # ESMFold-predicted structure (PDB text)
     composite_score: float = 0.0
@@ -136,12 +138,30 @@ def select_top_candidates(
         (lambda c: True) if motif_rmsd_gate == float("inf")
         else (lambda c: c.motif_rmsd == c.motif_rmsd and c.motif_rmsd <= motif_rmsd_gate)
     )
-    passed = [
-        c for c in candidates
-        if c.plddt >= plddt_gate and c.rmsd_to_design <= rmsd_gate and motif_ok(c)
-    ]
-    if not passed:
-        return []
+    def failures(c) -> list:
+        out = []
+        if not c.plddt >= plddt_gate:
+            out.append(f"pLDDT {c.plddt:.1f} < {plddt_gate}")
+        if not c.rmsd_to_design <= rmsd_gate:
+            out.append(f"RMSD-to-design {c.rmsd_to_design:.2f} > {rmsd_gate}")
+        if not motif_ok(c):
+            mr = "n/a" if c.motif_rmsd != c.motif_rmsd else f"{c.motif_rmsd:.2f}"
+            out.append(f"motif-RMSD {mr} > {motif_rmsd_gate}")
+        return out
+
+    for c in candidates:
+        c.gate_failures = failures(c)
+        c.passed_gate = not c.gate_failures
+
+    passed = [c for c in candidates if c.passed_gate]
+
+    # Never return nothing. If every candidate misses the gate, rank them anyway and hand them
+    # back flagged: an empty result tells you only that something failed, not how badly or on
+    # which axis — and you cannot calibrate a gate whose distribution you never see. The flag
+    # and the per-candidate reasons keep "inspect this" clearly distinct from "this is QC-clean".
+    fallback = not passed
+    if fallback:
+        passed = list(candidates)
 
     # Soft floor — only prune the tail when we have headroom over the request.
     if esm2_drop_fraction > 0 and len(passed) > num_outputs:
@@ -617,6 +637,27 @@ def _rf3_diffused_index_map(design_pdb_path: str) -> dict[str, str]:
         return {}
 
 
+def _map_refs_to_output(refs: list[str], design_pdb_path: str) -> list[str]:
+    """
+    Translate parent-numbered residue refs ("B114") into the RF3 design's OUTPUT numbering
+    ("A67") via `diffused_index_map`.
+
+    RF3 emits a SINGLE chain renumbered 1..N, so parent refs are meaningless downstream.
+    `repack_residues` are authored in parent space (the composer writes "<chain><author_num>")
+    while `--fixed_residues` is written in output space, and diffing the two directly drops
+    nothing for cross-chain refs and drops the WRONG residue wherever the numbers collide —
+    e.g. job 3b1d4fa7b70a intended to repack parent A67 (output A51) and instead unfixed
+    output A67, which is parent B114. 44 of its 60 repack residues matched nothing at all.
+
+    Refs absent from the map were never fixed, so dropping them is a no-op. An empty map
+    means the design is identity-numbered (no RF3 renumbering), so refs pass through.
+    """
+    idx_map = _rf3_diffused_index_map(design_pdb_path)
+    if not idx_map:
+        return list(refs)
+    return [idx_map[r] for r in refs if r in idx_map]
+
+
 def _rf3_enzyme_output_mapping(
     design_pdb_path: str,
     motif_keys: list[tuple[str, int]],
@@ -716,7 +757,7 @@ def _generate_enzyme_candidates(
         # unindexed motif) — from the design's diffused_index_map. Same map gives the
         # sequence positions used for motif-RMSD.
         out_refs, cat_positions = _rf3_enzyme_output_mapping(design_pdb, catalytic_keys)
-        fixed_tokens = _mpnn_fixed_tokens(out_refs, repack)
+        fixed_tokens = _mpnn_fixed_tokens(out_refs, _map_refs_to_output(repack, design_pdb))
         designed = run_proteinmpnn(design_pdb, fixed_tokens, n_seqs=m, checkpoint=checkpoint)
         for seq, score in designed:
             candidates.append(Candidate(
@@ -763,7 +804,7 @@ def _generate_motif_candidates(
         out_refs, motif_positions = _rf3_enzyme_output_mapping(
             design_pdb, motif_keys, identity_fallback=True
         )
-        fixed_tokens = _mpnn_fixed_tokens(out_refs, repack)
+        fixed_tokens = _mpnn_fixed_tokens(out_refs, _map_refs_to_output(repack, design_pdb))
         designed = run_proteinmpnn(design_pdb, fixed_tokens, n_seqs=m, checkpoint=checkpoint)
         for seq, score in designed:
             candidates.append(Candidate(
@@ -1118,6 +1159,9 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
             header += f" diversity={c.diversity_from_input:.2f}"
         if c.motif_rmsd == c.motif_rmsd:  # not NaN → enzyme scaffolding
             header += f" motif_rmsd={c.motif_rmsd:.2f}"
+        # Stamp the verdict into the FASTA so a downloaded file is self-describing — someone
+        # opening it later should not have to guess whether it cleared QC.
+        header += " QC=PASS" if c.passed_gate else f" QC=FAIL[{'; '.join(c.gate_failures)}]"
         fasta_lines.append(f">{header}\n{c.sequence}")
         pdb_name = f"candidate_{c.rank}.pdb"
         if c.pdb:
@@ -1127,10 +1171,13 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
             "esm2_score": c.esm2_score, "plddt": c.plddt, "rmsd_to_design": c.rmsd_to_design,
             "diversity_from_input": c.diversity_from_input, "motif_rmsd": c.motif_rmsd,
             "mpnn_scores": c.mpnn_scores, "pdb": pdb_name if c.pdb else None,
+            "passed_gate": c.passed_gate, "gate_failures": c.gate_failures,
             **({"geometry": c.geometry} if c.geometry else {}),
         })
     storage.write_output(job_id, "candidates.fasta", ("\n".join(fasta_lines) + "\n").encode())
+    n_pass = sum(1 for c in top if c.passed_gate)
     results = {"job_id": job_id, "preset": manifest.preset.value, "count": len(top),
+               "passed_qc": n_pass, "reported_below_gate": len(top) - n_pass,
                "candidates": records, "params": manifest.params}
     results_uri = storage.write_output(job_id, "results.json", json.dumps(results, indent=2).encode(),
                                        content_type="application/json")
