@@ -30,3 +30,10 @@ google-auth>=2.28.0
 google-cloud-storage==3.13.1
 google-cloud-firestore==2.28.1
 google-cloud-run==0.16.1
+# Transitive deps pinned too: pinning google-cloud-firestore alone was NOT enough — the request
+# is built by api-core and serialised by protobuf, and a rebuild moved those instead
+# (api-core 2.34->2.35, protobuf 7.34->7.36) while Firestore commits started failing with
+# '400 Invalid database id (default)'. These exact versions are verified to commit to
+# projects/phyx44-proteinredesign-v1/databases/(default).
+google-api-core==2.34.0
+protobuf==7.34.1
