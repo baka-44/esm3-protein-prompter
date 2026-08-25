@@ -637,6 +637,55 @@ def _rf3_diffused_index_map(design_pdb_path: str) -> dict[str, str]:
         return {}
 
 
+def _align_design_to_input(design_pdb_path: str, input_pdb_path: str) -> str:
+    """
+    Rewrite an RF3 design into the INPUT's coordinate frame, in place.
+
+    RF3 emits designs in its own frame: on job fe1e7863f08d the backbone sat 25.6 Å from the
+    composite it was built from, even though it matched that composite to 0.04 Å once
+    superimposed. Opening the design and the composite together then shows two structures that
+    do not overlay — precisely the confusion this artefact exists to remove.
+
+    Every downstream metric superimposes before measuring (Kabsch), so re-framing changes no
+    reported number. Best-effort: any failure leaves the file untouched.
+    """
+    try:
+        from Bio.PDB import PDBIO, PDBParser, Superimposer
+
+        from utils.pdb_utils import get_residues
+
+        idx_map = _rf3_diffused_index_map(design_pdb_path)
+        if not idx_map:
+            return design_pdb_path
+
+        structure = PDBParser(QUIET=True).get_structure("design", design_pdb_path)
+        des = {(ch.id, r.id[1]): r for mdl in structure for ch in mdl for r in ch}
+        inp = {(r.get_parent().id, r.id[1]): r
+               for r in get_residues(input_pdb_path, chain_id=None)}
+
+        fixed, moving = [], []
+        for in_ref, out_ref in idx_map.items():
+            ri = inp.get(_parse_residue_ref(in_ref) or ())
+            ro = des.get(_parse_residue_ref(out_ref) or ())
+            if ri is not None and ro is not None and "CA" in ri and "CA" in ro:
+                fixed.append(ri["CA"])
+                moving.append(ro["CA"])
+        if len(fixed) < 3:
+            return design_pdb_path
+
+        sup = Superimposer()
+        sup.set_atoms(fixed, moving)
+        sup.apply(list(structure.get_atoms()))
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(design_pdb_path)
+        _log(f"INFO: aligned {os.path.basename(design_pdb_path)} to the input frame "
+             f"({len(fixed)} anchors, {sup.rms:.3f} Å)")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN: could not align design to the input frame: {exc}")
+    return design_pdb_path
+
+
 def _map_refs_to_output(refs: list[str], design_pdb_path: str) -> list[str]:
     """
     Translate parent-numbered residue refs ("B114") into the RF3 design's OUTPUT numbering
@@ -744,6 +793,9 @@ def _generate_enzyme_candidates(
     jobstore.update_job(job_id, stage="RF3 all-atom scaffolding", progress=0.15)
     rf3_dir = os.path.join(workdir, "rf3")
     designs = run_rf3_design(spec, num_designs=k, out_dir=rf3_dir, run_name="enzyme")
+    # Put the designs in the input's frame so a downloaded backbone overlays the composite
+    # it was built from without the user having to superimpose anything.
+    designs = [_align_design_to_input(d, input_pdb_path) for d in designs]
     from proteinredesign import storage as _storage
     _persist_rf3_outputs(job_id, rf3_dir, _storage)  # save all-atom scaffolds + motif annotations
 
@@ -792,6 +844,9 @@ def _generate_motif_candidates(
     jobstore.update_job(job_id, stage="RF3 inpainting (bridges)", progress=0.15)
     rf3_dir = os.path.join(workdir, "rf3")
     designs = run_rf3_design(spec, num_designs=k, out_dir=rf3_dir, run_name="motif")
+    # Put the designs in the input's frame so a downloaded backbone overlays the composite
+    # it was built from without the user having to superimpose anything.
+    designs = [_align_design_to_input(d, input_pdb_path) for d in designs]
     from proteinredesign import storage as _storage
     _persist_rf3_outputs(job_id, rf3_dir, _storage)
 
@@ -1152,6 +1207,27 @@ def run_pipeline(manifest, workdir: str) -> dict:
 
 def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
     fasta_lines, records = [], []
+
+    # Persist the DESIGNED backbone alongside the ESMFold refold. These are not the same
+    # artefact and conflating them is misleading: the RF3 backbone holds the composed pose
+    # exactly (motif residues to ~0.04 Å, torso-vs-mount placement to ~0.01 Å), whereas
+    # candidate_N.pdb is re-predicted from the sequence alone and never sees the pose — on a
+    # two-domain graft ESMFold routinely pivots one domain tens of Å away. The backbone is the
+    # design; the refold is the QC measurement of it. `m` candidates share one backbone, so
+    # each is uploaded once and referenced by name.
+    design_names: dict[str, str] = {}
+    for c in top:
+        path = c.parent_backbone_path
+        if not path or path in design_names or not os.path.exists(path):
+            continue
+        name = f"design_{len(design_names) + 1}.pdb"
+        try:
+            storage.write_output(job_id, name, open(path, "rb").read(),
+                                 content_type="chemical/x-pdb")
+            design_names[path] = name
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN: could not persist designed backbone {path}: {exc}")
+
     for c in top:
         header = (f"candidate_{c.rank} score={c.composite_score:.3f} "
                   f"esm2={c.esm2_score:.3f} pLDDT={c.plddt:.1f} rmsd={c.rmsd_to_design:.2f}")
@@ -1171,6 +1247,9 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
             "esm2_score": c.esm2_score, "plddt": c.plddt, "rmsd_to_design": c.rmsd_to_design,
             "diversity_from_input": c.diversity_from_input, "motif_rmsd": c.motif_rmsd,
             "mpnn_scores": c.mpnn_scores, "pdb": pdb_name if c.pdb else None,
+            # The generated backbone this sequence was designed on (None for non-RF3 presets,
+            # where the input backbone is held fixed and IS the design).
+            "design_pdb": design_names.get(c.parent_backbone_path),
             "passed_gate": c.passed_gate, "gate_failures": c.gate_failures,
             **({"geometry": c.geometry} if c.geometry else {}),
         })
