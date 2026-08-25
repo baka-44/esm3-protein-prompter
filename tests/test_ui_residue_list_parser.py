@@ -41,3 +41,22 @@ def test_malformed_token_raises_rather_than_silently_dropping():
     # a silently-ignored residue list would look like success while designing nothing
     with pytest.raises(ValueError):
         _parse_residue_list("28O")     # letter O, not a zero
+
+
+def test_unparseable_token_raises_the_typed_error_not_a_bare_valueerror():
+    """A user typing a word must produce a message, not a panel-wide traceback."""
+    from ui.composer_panel import ResidueInputError, _parse_ranges
+    for bad in ("all", "abc", "1-x"):
+        with pytest.raises(ResidueInputError):
+            _parse_ranges(bad)
+
+
+def test_reversed_ranges_are_normalised():
+    from ui.composer_panel import _parse_ranges
+    assert _parse_ranges("18-10") == [(10, 18)]
+
+
+def test_residue_list_range_errors_are_typed_too():
+    from ui.composer_panel import ResidueInputError
+    with pytest.raises(ResidueInputError):
+        _parse_residue_list("B407-xyz")

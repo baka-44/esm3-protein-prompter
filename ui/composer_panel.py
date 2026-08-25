@@ -18,14 +18,33 @@ import streamlit as st
 _BG = "0x0d0d0d"  # near-black canvas
 
 
+class ResidueInputError(ValueError):
+    """A residue field could not be parsed — shown to the user, never as a traceback."""
+
+
 def _parse_ranges(s: str) -> list[tuple[int, int]]:
+    """Parse "10-18, 57, 102" into inclusive ranges.
+
+    Anything unparseable raises ResidueInputError with the offending token, because the caller
+    renders it as a message. Previously a stray word (someone typing "all") escaped as a raw
+    ValueError and crashed the whole panel with a traceback.
+    """
     out: list[tuple[int, int]] = []
     for tok in (t.strip() for t in s.split(",") if t.strip()):
-        if "-" in tok:
-            a, b = tok.split("-", 1)
-            out.append((int(a), int(b)))
-        else:
-            out.append((int(tok), int(tok)))
+        try:
+            if "-" in tok:
+                a, b = tok.split("-", 1)
+                lo, hi = int(a), int(b)
+                if lo > hi:
+                    lo, hi = hi, lo
+                out.append((lo, hi))
+            else:
+                out.append((int(tok), int(tok)))
+        except ValueError:
+            raise ResidueInputError(
+                f"Could not read {tok!r} as a residue number. Use numbers and ranges, "
+                f"e.g. 10-18, 57, 102."
+            ) from None
     return out
 
 
@@ -80,11 +99,22 @@ def _parse_residue_list(s: str) -> list:
         chain = tok[0] if tok[0].isalpha() else None
         body = tok[1:] if chain else tok
         if "-" in body:
-            a, b = body.split("-", 1)
-            for n in range(int(a), int(b) + 1):
+            try:
+                a, b = (int(x) for x in body.split("-", 1))
+            except ValueError:
+                raise ResidueInputError(
+                    f"Could not read {tok!r} as a residue range. Use e.g. 407-412 or B276-279."
+                ) from None
+            for n in range(min(a, b), max(a, b) + 1):
                 out.append(f"{chain}{n}" if chain else n)
         else:
-            out.append(f"{chain}{int(body)}" if chain else int(body))
+            try:
+                out.append(f"{chain}{int(body)}" if chain else int(body))
+            except ValueError:
+                raise ResidueInputError(
+                    f"Could not read {tok!r} as a residue. Use numbers, ranges (407-412), "
+                    f"or chain-qualified tokens (B280)."
+                ) from None
     return out
 
 
@@ -454,8 +484,16 @@ def render_composer(user_email: str) -> None:
     # posing). posed = same + the live mount transform → drives metrics + export only.
     base, posed, err = None, None, None
     if ready:
-        overrides = dict(extra_repack=_parse_residue_list(repack_list),
-                         extra_fixed=_parse_residue_list(fixed_list))
+        try:
+            overrides = dict(extra_repack=_parse_residue_list(repack_list),
+                             extra_fixed=_parse_residue_list(fixed_list))
+            keep_ranges = _parse_ranges(keep) if not fusion else []
+        except ResidueInputError as e:
+            with st.sidebar:
+                st.error(str(e))
+            ready = False
+            overrides, keep_ranges = {"extra_repack": [], "extra_fixed": []}, []
+    if ready:
         if fusion:
             compose = compose_fusion
             common = dict(
@@ -467,7 +505,7 @@ def render_composer(user_email: str) -> None:
             compose = compose_graft
             common = dict(
                 torso_pdb=t_pdb.getvalue(), mount_pdb=m_pdb.getvalue(),
-                torso_cut=(int(cut1), int(cut2)), mount_keep=_parse_ranges(keep),
+                torso_cut=(int(cut1), int(cut2)), mount_keep=keep_ranges,
                 torso_chain=t_chain, mount_chain=m_chain, repose=repose, k=k, m=m, **overrides,
             )
         try:
@@ -475,7 +513,7 @@ def render_composer(user_email: str) -> None:
             base = _compose_base(
                 mode, m_pdb.getvalue(), t_pdb.getvalue(), m_chain, t_chain,
                 (int(cut1), int(cut2)) if not fusion else None,
-                tuple(_parse_ranges(keep)) if not fusion else (),
+                tuple(keep_ranges) if not fusion else (),
                 repose, chassis_terminus, k, m,
                 tuple(overrides["extra_repack"]), tuple(overrides["extra_fixed"]),
             )

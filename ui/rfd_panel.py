@@ -8,6 +8,8 @@ and shows the persistent job dashboard below.
 
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
 
 from ui.job_dashboard import render_job_dashboard
@@ -123,6 +125,9 @@ def _render_preset1_form(user_email: str) -> None:
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001
+            # Log the full traceback: showing only str(e) made a Firestore failure impossible
+            # to diagnose from Cloud Run logs, because nothing was ever written there.
+            logging.exception("Job submission failed")
             st.error(f"Submission failed: {e}")
 
 
@@ -212,6 +217,9 @@ def _render_preset2_form(user_email: str) -> None:
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001
+            # Log the full traceback: showing only str(e) made a Firestore failure impossible
+            # to diagnose from Cloud Run logs, because nothing was ever written there.
+            logging.exception("Job submission failed")
             st.error(f"Submission failed: {e}")
 
 
@@ -293,6 +301,9 @@ def _render_preset5_form(user_email: str) -> None:
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001
+            # Log the full traceback: showing only str(e) made a Firestore failure impossible
+            # to diagnose from Cloud Run logs, because nothing was ever written there.
+            logging.exception("Job submission failed")
             st.error(f"Submission failed: {e}")
 
 
@@ -363,6 +374,9 @@ def _render_preset3_form(user_email: str) -> None:
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001
+            # Log the full traceback: showing only str(e) made a Firestore failure impossible
+            # to diagnose from Cloud Run logs, because nothing was ever written there.
+            logging.exception("Job submission failed")
             st.error(f"Submission failed: {e}")
 
 
@@ -472,6 +486,9 @@ def _render_preset6_form(user_email: str) -> None:
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001
+            # Log the full traceback: showing only str(e) made a Firestore failure impossible
+            # to diagnose from Cloud Run logs, because nothing was ever written there.
+            logging.exception("Job submission failed")
             st.error(f"Submission failed: {e}")
 
 
@@ -512,6 +529,9 @@ def _render_borrowed_bodies_form(user_email: str) -> None:
             st.success(f"Submitted job `{rec.job_id}` — it will appear in the dashboard below.")
             st.rerun()
         except Exception as e:  # noqa: BLE001
+            # Log the full traceback: showing only str(e) made a Firestore failure impossible
+            # to diagnose from Cloud Run logs, because nothing was ever written there.
+            logging.exception("Job submission failed")
             st.error(f"Submission failed: {e}")
 
 
