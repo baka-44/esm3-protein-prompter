@@ -637,6 +637,27 @@ def _rf3_diffused_index_map(design_pdb_path: str) -> dict[str, str]:
         return {}
 
 
+def _map_refs_to_output(refs: list[str], design_pdb_path: str) -> list[str]:
+    """
+    Translate parent-numbered residue refs ("B114") into the RF3 design's OUTPUT numbering
+    ("A67") via `diffused_index_map`.
+
+    RF3 emits a SINGLE chain renumbered 1..N, so parent refs are meaningless downstream.
+    `repack_residues` are authored in parent space (the composer writes "<chain><author_num>")
+    while `--fixed_residues` is written in output space, and diffing the two directly drops
+    nothing for cross-chain refs and drops the WRONG residue wherever the numbers collide —
+    e.g. job 3b1d4fa7b70a intended to repack parent A67 (output A51) and instead unfixed
+    output A67, which is parent B114. 44 of its 60 repack residues matched nothing at all.
+
+    Refs absent from the map were never fixed, so dropping them is a no-op. An empty map
+    means the design is identity-numbered (no RF3 renumbering), so refs pass through.
+    """
+    idx_map = _rf3_diffused_index_map(design_pdb_path)
+    if not idx_map:
+        return list(refs)
+    return [idx_map[r] for r in refs if r in idx_map]
+
+
 def _rf3_enzyme_output_mapping(
     design_pdb_path: str,
     motif_keys: list[tuple[str, int]],
@@ -736,7 +757,7 @@ def _generate_enzyme_candidates(
         # unindexed motif) — from the design's diffused_index_map. Same map gives the
         # sequence positions used for motif-RMSD.
         out_refs, cat_positions = _rf3_enzyme_output_mapping(design_pdb, catalytic_keys)
-        fixed_tokens = _mpnn_fixed_tokens(out_refs, repack)
+        fixed_tokens = _mpnn_fixed_tokens(out_refs, _map_refs_to_output(repack, design_pdb))
         designed = run_proteinmpnn(design_pdb, fixed_tokens, n_seqs=m, checkpoint=checkpoint)
         for seq, score in designed:
             candidates.append(Candidate(
@@ -783,7 +804,7 @@ def _generate_motif_candidates(
         out_refs, motif_positions = _rf3_enzyme_output_mapping(
             design_pdb, motif_keys, identity_fallback=True
         )
-        fixed_tokens = _mpnn_fixed_tokens(out_refs, repack)
+        fixed_tokens = _mpnn_fixed_tokens(out_refs, _map_refs_to_output(repack, design_pdb))
         designed = run_proteinmpnn(design_pdb, fixed_tokens, n_seqs=m, checkpoint=checkpoint)
         for seq, score in designed:
             candidates.append(Candidate(

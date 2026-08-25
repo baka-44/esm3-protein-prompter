@@ -14,6 +14,8 @@ directly).
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from proteinredesign.graft import Fragment, GraftPackage, GraftSpec, Linker
@@ -44,6 +46,52 @@ def _range_set(ranges: list[tuple[int, int]]) -> set[int]:
     for a, b in ranges:
         out.update(range(a, b + 1))
     return out
+
+
+# ── Linker sizing (CC18) ────────────────────────────────────────────────────────
+# A linker of L residues spans L+1 virtual Cα–Cα bonds of at most CA_CA_MAX Å, so the
+# shortest one that can reach a gap at all is ceil(gap/CA_CA_MAX) − 1 — and that one is
+# fully extended. A taut linker has no conformational freedom, and a folding model relaxes
+# it by hinging the whole flanking domain away rather than by stretching it: job
+# 3b1d4fa7b70a asked a 3-mer to cover 13.7 Å (90% extension) and every candidate came back
+# with the torso rotated ~160° and 53 Å off its designed position. So size linkers from the
+# gap the pose actually leaves, with slack, and hand the generator a range to choose from.
+CA_CA_MAX = 3.8      # Å, virtual Cα–Cα bond in a fully extended chain
+LINKER_SLACK = 2     # residues beyond the taut minimum → lands near half extension
+LINKER_RANGE = 5     # width of the range offered to the generator
+LINKER_FLOOR = 3     # never ask for fewer than this
+# Hard ceiling. Past ~20 residues ((GGGGS)x4, the standard long flexible linker) you are
+# tethering two proteins, not grafting one into another. The cap also keeps the closure
+# metric meaningful: without it, auto-sizing would hand every pose a linker long enough to
+# reach, so no pose could ever be reported infeasible.
+LINKER_CAP = 20
+
+
+def linker_span(gap_a: float) -> tuple[int, int]:
+    """
+    (min, max) linker length able to bridge a Cα–Cα gap of `gap_a` Å with slack.
+
+    Capped at LINKER_CAP: a gap too wide for that is left deliberately unbridgeable so the
+    closure-feasibility metric fails it (CC13) instead of the pose being papered over.
+    """
+    if not math.isfinite(gap_a) or gap_a <= 0:
+        return LINKER_FLOOR, LINKER_FLOOR + LINKER_RANGE
+    lo = max(LINKER_FLOOR, math.ceil(gap_a / CA_CA_MAX) + LINKER_SLACK)
+    lo = min(lo, LINKER_CAP)
+    return lo, min(lo + LINKER_RANGE, LINKER_CAP)
+
+
+def _ca_gap(composite_pdb: bytes, a: tuple[str, int], b: tuple[str, int]) -> float:
+    """Cα–Cα distance between two composite residues; inf when either is missing."""
+    want = {a, b}
+    found: dict[tuple[str, int], np.ndarray] = {}
+    for r in get_residues(composite_pdb, chain_id=None):
+        key = (r.get_parent().id, r.id[1])
+        if key in want and "CA" in r:
+            found[key] = r["CA"].get_coord()
+    if len(found) != 2:
+        return float("inf")
+    return float(np.linalg.norm(found[a] - found[b]))
 
 
 def _contiguous_blocks(nums: list[int]) -> list[tuple[int, int]]:
@@ -287,7 +335,7 @@ def compose_graft(
     rotate: tuple[float, float, float] = (0.0, 0.0, 0.0),  # manual rotation (deg, about the mount centre) on top
     mount_transform: dict | None = None,  # {"rot":[9 row-major], "tran":[3], "about":[3]} — a rigid
     # transform applied to the base-posed mount about `about` (from the live 3D canvas). new = R·(p-c)+c+t.
-    linker_lengths: tuple[tuple[int, int], tuple[int, int]] = ((3, 8), (3, 8)),
+    linker_lengths: tuple[tuple[int, int], tuple[int, int]] | None = None,  # None → size from the posed gaps
     repack_shell: float = 5.0,
     extra_repack: list | None = None,   # residues MPNN should re-identify beyond the contact shell
     extra_fixed: list | None = None,    # residues to pin even if the shell would repack them
@@ -348,15 +396,26 @@ def compose_graft(
 
     # N→C order (CC7): TORSO-1 / L1 / MOUNT(s) / L2 / TORSO-2. Multiple mount blocks become
     # multiple MOUNT-i fragments joined by short designed connectors (schema-ready — CC17).
+    # Linker lengths come from the gaps the chosen pose actually leaves (CC18), unless the
+    # caller pinned them. Measured on the composite, so any manual nudge/rotate is accounted for.
+    gaps = {
+        "J1": _ca_gap(composite, (OUT_T, f1_end), (OUT_M, mount_blocks[0][0])),
+        "J2": _ca_gap(composite, (OUT_M, mount_blocks[-1][1]), (OUT_T, f2_start)),
+    }
+    l1 = linker_lengths[0] if linker_lengths else linker_span(gaps["J1"])
+    l2 = linker_lengths[1] if linker_lengths else linker_span(gaps["J2"])
+
     chain_order: list = [Fragment("TORSO-1", "torso", OUT_T, f1_start, f1_end, "BKBN")]
     junctions: list[tuple[str, int]] = [(OUT_T, f1_end)]
-    chain_order.append(Linker(*linker_lengths[0]))
+    chain_order.append(Linker(*l1))
     for i, (b_lo, b_hi) in enumerate(mount_blocks, start=1):
-        if i > 1:
-            chain_order.append(Linker(3, 8))  # intra-mount connector between kept blocks
+        if i > 1:  # intra-mount connector between kept blocks — sized the same way
+            g = _ca_gap(composite, (OUT_M, mount_blocks[i - 2][1]), (OUT_M, b_lo))
+            gaps[f"M{i - 1}-M{i}"] = g
+            chain_order.append(Linker(*linker_span(g)))
         chain_order.append(Fragment(f"MOUNT-{i}", "mount", OUT_M, b_lo, b_hi, mount_fixed_atoms))
         junctions += [(OUT_M, b_lo), (OUT_M, b_hi)]
-    chain_order.append(Linker(*linker_lengths[1]))
+    chain_order.append(Linker(*l2))
     chain_order.append(Fragment("TORSO-2", "torso", OUT_T, f2_start, f2_end, "BKBN"))
     junctions.append((OUT_T, f2_start))
 
@@ -373,6 +432,9 @@ def compose_graft(
             "torso_chain": torso_chain, "mount_chain": mount_chain,
             "torso_cut": list(torso_cut), "mount_keep": [list(r) for r in mount_keep],
             "posed_by": ("explicit" if pose is not None else "snap_to_fit" if repose else "keep_input"),
+            "linker_sizing": "explicit" if linker_lengths else "auto",
+            "linker_gaps_a": {k: (None if not math.isfinite(v) else round(v, 2))
+                              for k, v in gaps.items()},
         },
     )
     return GraftPackage(spec=spec, composite_pdb=composite)
@@ -394,7 +456,7 @@ def compose_fusion(
     rotate: tuple[float, float, float] = (0.0, 0.0, 0.0),
     mount_transform: dict | None = None,
     auto_separate: bool = True,         # sane non-clashing starting pose when none is given
-    linker_length: tuple[int, int] = (4, 12),
+    linker_length: tuple[int, int] | None = None,  # None → size from the posed gap
     repack_shell: float = 5.0,
     extra_repack: list | None = None,   # residues MPNN should re-identify beyond the contact shell
     extra_fixed: list | None = None,    # residues to pin even if the shell would repack them
@@ -459,7 +521,9 @@ def compose_fusion(
             axis = m_j - t_j
             n = np.linalg.norm(axis)
             axis = axis / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
-            target = max(6.0, linker_length[1] * 2.5)     # a span the longest linker can close
+            # auto_separate picks the separation first; the linker is then sized to the gap
+            # it leaves (below). Use a nominal reach here so the two don't chase each other.
+            target = max(6.0, (linker_length[1] if linker_length else 12) * 2.5)
             for _ in range(40):                            # nudge outward until no steric overlap
                 cand = (t_j + axis * target) - m_j
                 moved = m_atoms + cand
@@ -488,11 +552,13 @@ def compose_fusion(
     mount_frag = Fragment("MOUNT-1", "mount", OUT_M, m_lo, m_hi, mount_fixed_atoms)
     torso_frag = Fragment("TORSO-1", "torso", OUT_T, t_lo, t_hi, "BKBN")
     if chassis_terminus == "C":       # MOUNT — linker — TORSO (chassis C-terminal)
-        chain_order = [mount_frag, Linker(*linker_length), torso_frag]
         junctions = [(OUT_M, m_hi), (OUT_T, t_lo)]
     else:                             # TORSO — linker — MOUNT
-        chain_order = [torso_frag, Linker(*linker_length), mount_frag]
         junctions = [(OUT_T, t_hi), (OUT_M, m_lo)]
+    gap = _ca_gap(composite, junctions[0], junctions[1])     # CC18, measured on the posed composite
+    lk = Linker(*(linker_length if linker_length else linker_span(gap)))
+    chain_order = ([mount_frag, lk, torso_frag] if chassis_terminus == "C"
+                   else [torso_frag, lk, mount_frag])
 
     spec = GraftSpec(
         chain_order=chain_order,
@@ -507,6 +573,8 @@ def compose_fusion(
             "torso_chain": torso_chain, "mount_chain": mount_chain,
             "posed_by": "manual" if (mount_transform or any(nudge) or any(rotate))
                         else ("auto_separate" if auto_separate else "keep_input"),
+            "linker_sizing": "explicit" if linker_length else "auto",
+            "linker_gaps_a": {"J1": None if not math.isfinite(gap) else round(gap, 2)},
         },
     )
     return GraftPackage(spec=spec, composite_pdb=composite)
