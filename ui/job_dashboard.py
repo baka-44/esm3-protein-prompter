@@ -112,6 +112,8 @@ def _render_results(job) -> None:
 
     has_diversity = any(_is_num(c.get("diversity_from_input")) for c in cands)
     has_motif = any(_is_num(c.get("motif_rmsd")) for c in cands)
+    design_names = tuple(dict.fromkeys(c["design_pdb"] for c in cands if c.get("design_pdb")))
+    has_design = bool(design_names)
 
     def _row(c: dict) -> dict:
         row = {
@@ -129,6 +131,11 @@ def _render_results(job) -> None:
         if has_motif:
             mr = c.get("motif_rmsd")
             row["Motif Å"] = round(mr, 2) if _is_num(mr) else "—"
+        if has_design:
+            # m candidates share one backbone; showing it makes that grouping visible, so a
+            # cluster of similar RMSDs reads as "same backbone" rather than as a coincidence.
+            d = c.get("design_pdb")
+            row["Backbone"] = d.replace("design_", "#").replace(".pdb", "") if d else "—"
         row["Length"] = len(c.get("sequence", ""))
         row["Sequence (preview)"] = c.get("sequence", "")[:40] + ("…" if len(c.get("sequence", "")) > 40 else "")
         return row
@@ -142,10 +149,25 @@ def _render_results(job) -> None:
                    "**Motif Å** = catalytic-geometry fidelity vs the parent enzyme (lower = better).")
     st.dataframe(df, hide_index=True, use_container_width=True)
 
-    # Bulk downloads — FASTA (sequences) and a zip of every candidate's ESMFold
-    # structure (both already persisted to GCS by the worker).
+    if has_design:
+        # Without this, the ESMFold refold is the only structure on offer and reads as "the
+        # candidate" — so a design gets judged by a prediction that never saw its pose.
+        st.info(
+            "**Two structures per candidate — they are not interchangeable.**\n\n"
+            "**Designed backbone** is what RFdiffusion actually built. It holds your composed "
+            "pose exactly, including the torso-to-mount placement you set by hand. "
+            "*This is the design — evaluate it, and superimpose it on your composite.*\n\n"
+            "**ESMFold prediction** is re-folded from the sequence alone and never sees the "
+            "pose. On multi-domain grafts it often places the domains far from where they were "
+            "designed, so it is a QC measurement (pLDDT, the RMSD gates) rather than the design "
+            "itself."
+        )
+
+    # Bulk downloads — sequences, the DESIGNED backbones, and the ESMFold refolds
+    # (all already persisted to GCS by the worker).
     pdb_names = tuple(c["pdb"] for c in cands if c.get("pdb"))
-    col_fasta, col_pdb = st.columns(2)
+    cols = st.columns(3 if has_design else 2)
+    col_fasta, col_pdb = cols[0], cols[-1]
 
     with col_fasta:
         try:
@@ -159,14 +181,32 @@ def _render_results(job) -> None:
         except Exception:
             pass
 
+    if has_design:
+        with cols[1]:
+            try:
+                st.download_button(
+                    "⬇️ Designed backbones (.zip)",
+                    data=_build_pdb_zip(job.job_id, design_names),
+                    file_name=f"{job.job_id}_designed_backbones.zip", mime="application/zip",
+                    key=f"dl_designzip_{job.job_id}", use_container_width=True,
+                    help="What RFdiffusion built — holds your composed pose. Start here.",
+                )
+            except Exception:
+                pass
+
     with col_pdb:
         if pdb_names:
             try:
                 zip_bytes = _build_pdb_zip(job.job_id, pdb_names)
                 st.download_button(
-                    "⬇️ Download all PDBs (.zip)", data=zip_bytes,
-                    file_name=f"{job.job_id}_pdbs.zip", mime="application/zip",
+                    "⬇️ ESMFold predictions (.zip)" if has_design else "⬇️ Download all PDBs (.zip)",
+                    data=zip_bytes,
+                    file_name=f"{job.job_id}_esmfold_predictions.zip" if has_design
+                              else f"{job.job_id}_pdbs.zip",
+                    mime="application/zip",
                     key=f"dl_pdbzip_{job.job_id}", use_container_width=True,
+                    help="QC refolds from sequence alone — these do not carry the composed pose."
+                         if has_design else None,
                 )
             except Exception:
                 pass
@@ -175,7 +215,8 @@ def _render_results(job) -> None:
 @st.cache_data(show_spinner=False)
 def _build_pdb_zip(job_id: str, pdb_names: tuple[str, ...]) -> bytes:
     """
-    Fetch each candidate's ESMFold PDB from GCS and bundle them into a zip.
+    Fetch each named PDB from GCS and bundle them into a zip — used for both the
+    designed backbones and the ESMFold refolds.
     Cached by (job_id, pdb_names) so the GCS reads happen once per job rather
     than on every dashboard re-render/poll.
     """
