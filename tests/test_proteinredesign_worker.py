@@ -30,9 +30,32 @@ def test_structural_gate_filters():
     assert [c.sequence for c in out] == ["AAA"]
 
 
-def test_empty_when_none_pass():
+def test_failing_candidates_are_reported_flagged_not_discarded():
+    """An empty result tells you only that something failed — not how badly, or on which axis.
+
+    When nothing clears the gate the candidates come back ranked and flagged, so the run is
+    still inspectable and the gate's distribution is visible enough to calibrate.
+    """
     out = select_top_candidates([_c("X", plddt=10, rmsd=9.0)], num_outputs=10)
-    assert out == []
+    assert len(out) == 1
+    c = out[0]
+    assert c.passed_gate is False
+    assert any("pLDDT" in f for f in c.gate_failures)
+    assert any("RMSD-to-design" in f for f in c.gate_failures)
+    assert c.rank == 1                      # still ranked, so "best of a bad set" is readable
+
+
+def test_passing_candidates_are_marked_clean():
+    out = select_top_candidates([_c("OK", plddt=90, rmsd=1.0)], num_outputs=10)
+    assert out[0].passed_gate is True and out[0].gate_failures == []
+
+
+def test_a_passing_candidate_is_preferred_over_failing_ones():
+    good = _c("GOOD", plddt=90, rmsd=1.0)
+    bad = _c("BAD", plddt=10, rmsd=9.0)
+    out = select_top_candidates([bad, good], num_outputs=10)
+    # the gate still selects: only the clean one is returned when one exists
+    assert [c.sequence for c in out] == ["GOOD"]
 
 
 def test_caps_at_num_outputs_and_assigns_ranks():

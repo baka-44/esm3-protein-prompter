@@ -64,6 +64,8 @@ class Candidate:
     esm2_score: float = 0.0
     plddt: float = 0.0
     geometry: dict = field(default_factory=dict)   # optional catalytic-geometry report
+    passed_gate: bool = True                       # False = reported for inspection, not QC-clean
+    gate_failures: list = field(default_factory=list)
     rmsd_to_design: float = float("inf")
     pdb: str = ""              # ESMFold-predicted structure (PDB text)
     composite_score: float = 0.0
@@ -136,12 +138,30 @@ def select_top_candidates(
         (lambda c: True) if motif_rmsd_gate == float("inf")
         else (lambda c: c.motif_rmsd == c.motif_rmsd and c.motif_rmsd <= motif_rmsd_gate)
     )
-    passed = [
-        c for c in candidates
-        if c.plddt >= plddt_gate and c.rmsd_to_design <= rmsd_gate and motif_ok(c)
-    ]
-    if not passed:
-        return []
+    def failures(c) -> list:
+        out = []
+        if not c.plddt >= plddt_gate:
+            out.append(f"pLDDT {c.plddt:.1f} < {plddt_gate}")
+        if not c.rmsd_to_design <= rmsd_gate:
+            out.append(f"RMSD-to-design {c.rmsd_to_design:.2f} > {rmsd_gate}")
+        if not motif_ok(c):
+            mr = "n/a" if c.motif_rmsd != c.motif_rmsd else f"{c.motif_rmsd:.2f}"
+            out.append(f"motif-RMSD {mr} > {motif_rmsd_gate}")
+        return out
+
+    for c in candidates:
+        c.gate_failures = failures(c)
+        c.passed_gate = not c.gate_failures
+
+    passed = [c for c in candidates if c.passed_gate]
+
+    # Never return nothing. If every candidate misses the gate, rank them anyway and hand them
+    # back flagged: an empty result tells you only that something failed, not how badly or on
+    # which axis — and you cannot calibrate a gate whose distribution you never see. The flag
+    # and the per-candidate reasons keep "inspect this" clearly distinct from "this is QC-clean".
+    fallback = not passed
+    if fallback:
+        passed = list(candidates)
 
     # Soft floor — only prune the tail when we have headroom over the request.
     if esm2_drop_fraction > 0 and len(passed) > num_outputs:
@@ -1127,10 +1147,13 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
             "esm2_score": c.esm2_score, "plddt": c.plddt, "rmsd_to_design": c.rmsd_to_design,
             "diversity_from_input": c.diversity_from_input, "motif_rmsd": c.motif_rmsd,
             "mpnn_scores": c.mpnn_scores, "pdb": pdb_name if c.pdb else None,
+            "passed_gate": c.passed_gate, "gate_failures": c.gate_failures,
             **({"geometry": c.geometry} if c.geometry else {}),
         })
     storage.write_output(job_id, "candidates.fasta", ("\n".join(fasta_lines) + "\n").encode())
+    n_pass = sum(1 for c in top if c.passed_gate)
     results = {"job_id": job_id, "preset": manifest.preset.value, "count": len(top),
+               "passed_qc": n_pass, "reported_below_gate": len(top) - n_pass,
                "candidates": records, "params": manifest.params}
     results_uri = storage.write_output(job_id, "results.json", json.dumps(results, indent=2).encode(),
                                        content_type="application/json")
