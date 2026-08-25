@@ -144,3 +144,46 @@ def test_end_to_end_the_right_residue_gets_unfixed(tmp_path):
 
     naive = _mpnn_fixed_tokens(fixed_out, ["A67"]).split()   # the old behaviour
     assert "A67" not in naive and "A51" in naive             # exactly backwards
+
+
+# ── resizing packages exported before CC18 ─────────────────────────────────────
+
+def _load_resize():
+    import importlib.util
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "scripts", "resize_graft_linkers.py")
+    spec = importlib.util.spec_from_file_location("resize_graft_linkers", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.resize
+
+
+def test_resize_rewrites_stale_linkers_from_the_composite():
+    """
+    The contig is built from the package's stored chain_order at submit time, so a package
+    exported with the old fixed (3, 8) re-runs with (3, 8) even on a fixed backend. Resizing
+    must read the gaps out of the package's own composite.
+    """
+    resize = _load_resize()
+    pkg = compose_fusion(mount_pdb=MOUNT, torso_pdb=TORSO)
+    gap = pkg.spec.provenance["linker_gaps_a"]["J1"]
+
+    stale = pkg.spec.to_dict()
+    for seg in stale["chain_order"]:
+        if seg.get("kind") == "linker":
+            seg["length_min"], seg["length_max"] = 3, 8          # what old exports carry
+
+    fixed, changes = resize(stale, pkg.composite_pdb)
+    assert len(changes) == 1
+    lk = next(s for s in fixed["chain_order"] if s.get("kind") == "linker")
+    assert (lk["length_min"], lk["length_max"]) == linker_span(gap)
+    assert fixed["provenance"]["linker_sizing"].startswith("auto")
+
+
+def test_resize_is_idempotent():
+    resize = _load_resize()
+    pkg = compose_fusion(mount_pdb=MOUNT, torso_pdb=TORSO)
+    once, changes = resize(pkg.spec.to_dict(), pkg.composite_pdb)
+    assert changes == []                                          # already auto-sized
+    twice, again = resize(once, pkg.composite_pdb)
+    assert again == [] and twice == once
