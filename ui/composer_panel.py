@@ -29,6 +29,46 @@ def _parse_ranges(s: str) -> list[tuple[int, int]]:
     return out
 
 
+def _metrics_for(pkg):
+    """compute_metrics once per package per run — it is called from both the export panel and
+    the canvas HUD, and recomputing it for the second reader is pure waste."""
+    from proteinredesign.graft_metrics import compute_metrics
+    cache = st.session_state.setdefault("_cmp_metrics_cache", {})
+    key = id(pkg)
+    if key not in cache:
+        cache.clear()                      # only ever one live package per run
+        cache[key] = compute_metrics(pkg)
+    return cache[key]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _compose_base(mode: str, mount_bytes: bytes, torso_bytes: bytes, mount_chain, torso_chain,
+                  cut, keep, repose: bool, chassis_terminus: str, k: int, m: int,
+                  repack: tuple, fixed: tuple):
+    """The composite WITHOUT the live pose — cached because it does not change while posing.
+
+    Every pose release triggers a Streamlit rerun, and the base compose is the expensive half
+    (PDB parsing, the contact shell, and for fusion the clash-avoidance separation search — well
+    over a second). Its inputs are identical across those reruns, so recomputing it made the
+    canvas sit under Streamlit's rerun overlay far longer than the work required. Only the posed
+    composite genuinely depends on the transform.
+
+    All arguments are primitives/tuples so they hash; the transform is deliberately NOT one.
+    """
+    from proteinredesign.composer import compose_fusion, compose_graft
+    overrides = dict(extra_repack=list(repack), extra_fixed=list(fixed))
+    if mode == "Fusion":
+        return compose_fusion(
+            mount_pdb=mount_bytes, torso_pdb=torso_bytes,
+            mount_chain=mount_chain, torso_chain=torso_chain,
+            chassis_terminus=chassis_terminus, k=k, m=m, **overrides)
+    return compose_graft(
+        torso_pdb=torso_bytes, mount_pdb=mount_bytes,
+        torso_cut=cut, mount_keep=list(keep),
+        torso_chain=torso_chain, mount_chain=mount_chain,
+        repose=repose, k=k, m=m, **overrides)
+
+
 def _parse_residue_list(s: str) -> list:
     """Parse a user-typed residue list into refs the composer accepts.
 
@@ -431,7 +471,14 @@ def render_composer(user_email: str) -> None:
                 torso_chain=t_chain, mount_chain=m_chain, repose=repose, k=k, m=m, **overrides,
             )
         try:
-            base = compose(**common)
+            # base is cached (unchanged while posing); only the posed composite needs recomputing
+            base = _compose_base(
+                mode, m_pdb.getvalue(), t_pdb.getvalue(), m_chain, t_chain,
+                (int(cut1), int(cut2)) if not fusion else None,
+                tuple(_parse_ranges(keep)) if not fusion else (),
+                repose, chassis_terminus, k, m,
+                tuple(overrides["extra_repack"]), tuple(overrides["extra_fixed"]),
+            )
             posed = base if _is_identity_xform(xform) else compose(**common, mount_transform=xform)
         except Exception as e:  # noqa: BLE001
             err = str(e)
@@ -445,7 +492,7 @@ def render_composer(user_email: str) -> None:
                     st.session_state.pop("cmp_xform", None)
                     st.session_state["cmp_reset_ts"] = time.time()
                     st.rerun()
-            metrics = compute_metrics(posed)
+            metrics = _metrics_for(posed)
             if critical_failures(metrics):
                 st.error("Can't export — resolve the ⚠️ metrics.")
                 st.button("⬇️ Export graft package", disabled=True, use_container_width=True, key="cmp_exp0")
@@ -463,7 +510,7 @@ def render_composer(user_email: str) -> None:
     if base is not None:
         repack = [f"{r['chain']}{r['author_num']}" for r in base.spec.repack_residues]
         hud_metrics = [{"label": mt.label, "value": f"{mt.value:g}", "unit": mt.unit, "ok": mt.ok}
-                       for mt in compute_metrics(posed)]
+                       for mt in _metrics_for(posed)]
         ev = mol_viewer(base.composite_pdb.decode(errors="ignore"), repack=repack,
                         metrics=hud_metrics, mount_chain="B",
                         connections=_connection_points(base),
