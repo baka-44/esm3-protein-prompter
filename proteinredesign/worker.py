@@ -1138,6 +1138,9 @@ def _write_results(job_id, manifest, top: list[Candidate], storage) -> dict:
             header += f" diversity={c.diversity_from_input:.2f}"
         if c.motif_rmsd == c.motif_rmsd:  # not NaN → enzyme scaffolding
             header += f" motif_rmsd={c.motif_rmsd:.2f}"
+        # Stamp the verdict into the FASTA so a downloaded file is self-describing — someone
+        # opening it later should not have to guess whether it cleared QC.
+        header += " QC=PASS" if c.passed_gate else f" QC=FAIL[{'; '.join(c.gate_failures)}]"
         fasta_lines.append(f">{header}\n{c.sequence}")
         pdb_name = f"candidate_{c.rank}.pdb"
         if c.pdb:
