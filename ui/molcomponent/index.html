@@ -14,9 +14,14 @@
        drag overlay; the overlay still handles free rotation anywhere off a ring. */
     #gizmo { position: absolute; inset: 0; z-index: 4; display: none; pointer-events: none; }
     #gizmo.active { display: block; }
-    #gizmo .ring { fill: none; stroke-width: 2.5; opacity: .55; pointer-events: stroke;
-                   cursor: grab; transition: opacity .12s, stroke-width .12s; }
-    #gizmo .ring:hover, #gizmo .ring.hot { opacity: 1; stroke-width: 5; }
+    /* Every element is pointer-events:none — the overlay owns the pointer and hit-tests the
+       rings by distance (see gizmoHit). SVG stroke hit-testing would make the grab target as
+       thin as the stroke, and would resolve overlaps by DOM order rather than by proximity. */
+    #gizmo .ring { fill: none; stroke-width: 3; opacity: .5; pointer-events: none;
+                   transition: opacity .1s, stroke-width .1s; }
+    #gizmo .ring.hot { opacity: 1; stroke-width: 6; }
+    /* Shows the grab tolerance, so "how close do I need to be" is visible rather than guessed. */
+    #gizmo .halo { fill: none; pointer-events: none; opacity: .16; }
     #gizmo .hub { fill: #0d0d0d; stroke: #3a3d42; stroke-width: 1; opacity: .75; }
     #gizmo text { font-family: 'Montserrat', system-ui, sans-serif; font-size: 11px;
                   font-weight: 600; pointer-events: none; }
@@ -332,15 +337,55 @@
     // Free drag anywhere off a ring is unchanged — the gizmo adds constraint, it does not
     // replace the coarse control.
     const GIZ = document.getElementById("gizmo");
-    const GIZ_R = 92;                 // ring radius in px
     const GIZ_FLAT = 0.34;            // foreshortening of the two edge-on rings
+    const GIZ_GRAB = 10;              // px: how far off a ring still grabs it
+    const GIZ_SAMPLES = 96;           // ring polyline resolution for hit-testing
+    // Radii are fractions of a viewport-relative base, so the gizmo stays comfortably
+    // grabbable on a laptop and doesn't swamp the mount on a large display.
     const GIZ_AXES = [
-      { id: "z", color: "#5ba3f5", rx: GIZ_R,            ry: GIZ_R,            label: "Z" },
-      { id: "y", color: "#39d98a", rx: GIZ_R * GIZ_FLAT, ry: GIZ_R,            label: "Y" },
-      { id: "x", color: "#ff6b6b", rx: GIZ_R,            ry: GIZ_R * GIZ_FLAT, label: "X" },
+      { id: "z", color: "#5ba3f5", fx: 1,         fy: 1,         label: "Z" },
+      { id: "y", color: "#39d98a", fx: GIZ_FLAT,  fy: 1,         label: "Y" },
+      { id: "x", color: "#ff6b6b", fx: 1,         fy: GIZ_FLAT,  label: "X" },
     ];
-    let gizAxis = null;               // axis currently being dragged
+    function gizmoRadius() {
+      const vp = document.getElementById("viewport");
+      return Math.max(96, Math.min(160, Math.min(vp.clientWidth, vp.clientHeight) * 0.17));
+    }
+    let gizAxis = null;               // axis currently being DRAGGED
+    let gizHot = null;                // axis currently under the pointer (within GIZ_GRAB)
     let gizCentre = [0, 0];
+    let gizPaths = [];                // [{id, pts:[[x,y],…]}] — cached for hit-testing
+
+    // Distance from a point to a SEGMENT of the sampled ring. Measuring to the sample points
+    // instead would leave up to half a chord (~3.9 px at 96 samples on a 118 px ring) of slack,
+    // so the real tolerance would sag between samples and the ring would feel inconsistent.
+    function segDist2(x, y, ax, ay, bx, by) {
+      const vx = bx - ax, vy = by - ay, wx = x - ax, wy = y - ay;
+      const vv = vx * vx + vy * vy;
+      let t = vv > 0 ? (wx * vx + wy * vy) / vv : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const dx = wx - t * vx, dy = wy - t * vy;
+      return dx * dx + dy * dy;
+    }
+
+    // Nearest ring within GIZ_GRAB px wins. Polyline sampling sidesteps the iterative
+    // point-to-ellipse distance problem; at 96 segments the polyline sits within ~0.07 px of
+    // the true ellipse, far below the tolerance it feeds. Nearest-wins also makes the rings'
+    // crossings resolve by proximity rather than by draw order.
+    function gizmoHit(x, y) {
+      let best = null, bestD = GIZ_GRAB * GIZ_GRAB;
+      for (const p of gizPaths) {
+        const n = p.pts.length;
+        let d = Infinity;
+        for (let i = 0; i < n; i++) {
+          const a = p.pts[i], b = p.pts[(i + 1) % n];
+          const dd = segDist2(x, y, a[0], a[1], b[0], b[1]);
+          if (dd < d) d = dd;
+        }
+        if (d < bestD) { bestD = d; best = p.id; }
+      }
+      return best;
+    }
 
     function gizmoCentre() {
       // Prefer the mount's own projected centroid so the gizmo sits on what it rotates;
@@ -361,20 +406,35 @@
       if (mode !== "pose") { GIZ.classList.remove("active"); return; }
       GIZ.classList.add("active");
       const [cx, cy] = gizCentre = gizmoCentre();
+      const R = gizmoRadius();
+      const geom = GIZ_AXES.map(a => ({ ...a, rx: a.fx * R, ry: a.fy * R }));
       GIZ.setAttribute("viewBox", `0 0 ${GIZ.clientWidth} ${GIZ.clientHeight}`);
+
+      // Cache each ring as a polyline for distance-based hit-testing.
+      gizPaths = geom.map(a => {
+        const pts = [];
+        for (let i = 0; i < GIZ_SAMPLES; i++) {
+          const t = (i / GIZ_SAMPLES) * Math.PI * 2;
+          pts.push([cx + a.rx * Math.cos(t), cy + a.ry * Math.sin(t)]);
+        }
+        return { id: a.id, pts };
+      });
+
+      const live = gizAxis || gizHot;
       GIZ.innerHTML =
-        GIZ_AXES.map(a =>
-          `<ellipse class="ring${gizAxis === a.id ? " hot" : ""}" data-axis="${a.id}" ` +
+        geom.filter(a => a.id === live).map(a =>
+          `<ellipse class="halo" cx="${cx}" cy="${cy}" rx="${a.rx}" ry="${a.ry}" ` +
+          `stroke="${a.color}" stroke-width="${GIZ_GRAB * 2}"></ellipse>`).join("") +
+        geom.map(a =>
+          `<ellipse class="ring${live === a.id ? " hot" : ""}" data-axis="${a.id}" ` +
           `cx="${cx}" cy="${cy}" rx="${a.rx}" ry="${a.ry}" stroke="${a.color}"></ellipse>`).join("") +
         `<circle class="hub" cx="${cx}" cy="${cy}" r="4"></circle>` +
-        GIZ_AXES.map(a => {
+        geom.map(a => {
           const lx = cx + (a.id === "y" ? 0 : a.rx + 12);
-          const ly = cy + (a.id === "y" ? -(a.ry + 10) : (a.id === "x" ? 4 : 4));
-          return `<text x="${lx}" y="${ly}" fill="${a.color}">${a.label}</text>`;
+          const ly = cy + (a.id === "y" ? -(a.ry + 10) : 4);
+          return `<text x="${lx}" y="${ly}" fill="${a.color}" ` +
+                 `opacity="${live && live !== a.id ? .4 : 1}">${a.label}</text>`;
         }).join("");
-      GIZ.querySelectorAll(".ring").forEach(el => {
-        el.addEventListener("mousedown", (e) => startGizmoDrag(e, el.dataset.axis));
-      });
     }
 
     function gizmoWorldAxis(id) {
@@ -390,7 +450,7 @@
 
     function startGizmoDrag(e, axis) {
       e.preventDefault(); e.stopPropagation();
-      gizAxis = axis; px = e.clientX; py = e.clientY;
+      gizAxis = axis; gizHot = axis; px = e.clientX; py = e.clientY;
       dragging = false;                                // gizmo drag, not free drag
       drawGizmo();
       hud(`rotating about <b>${axis.toUpperCase()}</b> — release to apply`, true);
@@ -417,7 +477,29 @@
     // ── live rotate (drag) ───────────────────────────────────────────────────────
     const ov = document.getElementById("overlay");
     let dragging = false, px = 0, py = 0;
-    ov.addEventListener("mousedown", (e) => { dragging = true; px = e.clientX; py = e.clientY; ov.style.cursor = "grabbing"; });
+    ov.addEventListener("mousedown", (e) => {
+      // A ring under (or within GIZ_GRAB of) the pointer takes precedence; anywhere else is
+      // still the coarse free drag, so the gizmo constrains without removing the old control.
+      const r = GIZ.getBoundingClientRect();
+      const hit = mode === "pose" ? gizmoHit(e.clientX - r.left, e.clientY - r.top) : null;
+      if (hit) { startGizmoDrag(e, hit); return; }
+      dragging = true; px = e.clientX; py = e.clientY; ov.style.cursor = "grabbing";
+    });
+    // Hover: highlight the ring the pointer would grab, so the tolerance is discoverable.
+    ov.addEventListener("mousemove", (e) => {
+      if (gizAxis || dragging || mode !== "pose") return;
+      const r = GIZ.getBoundingClientRect();
+      const hit = gizmoHit(e.clientX - r.left, e.clientY - r.top);
+      if (hit === gizHot) return;
+      gizHot = hit;
+      drawGizmo();
+      if (hit) hud(`<b>${hit.toUpperCase()}</b> axis — click and hold to rotate about it`, true);
+      else hud("<b>drag a ring</b> to rotate on one axis · <b>drag free</b> for coarse · <b>Esc</b> done", true);
+    });
+    ov.addEventListener("mouseleave", () => {
+      if (gizAxis || dragging || !gizHot) return;
+      gizHot = null; drawGizmo();
+    });
     window.addEventListener("mousemove", (e) => {
       if (gizAxis) {                                   // constrained: one axis only
         const ang = gizmoDelta(gizAxis, e, GIZ.getBoundingClientRect());
@@ -438,7 +520,7 @@
     });
     window.addEventListener("mouseup", () => {
       if (gizAxis) {
-        gizAxis = null; sendPose(); drawGizmo();
+        gizAxis = null; gizHot = null; sendPose(); drawGizmo();
         hud("<b>drag a ring</b> to rotate on one axis · <b>drag free</b> for coarse · <b>Esc</b> done", true);
         return;
       }
