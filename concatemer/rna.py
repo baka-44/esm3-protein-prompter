@@ -63,15 +63,26 @@ class TranscriptContext:
       utr5       transcription start site -> ATG (transcribed; the PROMOTER is not, and is not
                  needed here — it sets how much mRNA is made, not how it folds)
       signal_cds alpha-MF pre-pro NUCLEOTIDES as they appear in the vector, not the protein
+      utr3       stop codon -> poly-A site. Optional: it lies downstream of the stop codon so it
+                 cannot affect elongation, and 5'-3' pairing is usually beyond the fold cap. It
+                 is appended when supplied so the option can be tested rather than assumed away.
     """
 
     utr5: str
     signal_cds: str
+    utr3: str = ""
     name: str = ""
+
+    @classmethod
+    def from_vector(cls, vector) -> "TranscriptContext":
+        """Build from a spec.VectorContext, validating what folding actually requires."""
+        return cls(utr5=vector.utr5, signal_cds=vector.signal_cds, utr3=vector.utr3,
+                   name=vector.name)
 
     def __post_init__(self) -> None:
         self.utr5 = _rna(self.utr5)
         self.signal_cds = _rna(self.signal_cds)
+        self.utr3 = _rna(self.utr3)
         if not self.utr5 or not self.signal_cds:
             raise MissingContextError(
                 "Both utr5 and signal_cds are required, from the vector actually in use. "
@@ -145,10 +156,8 @@ def pair_map(dot_bracket: str) -> dict[int, int]:
 
 
 def assemble_transcript(ctx: TranscriptContext, cargo_cds: str) -> tuple[str, int]:
-    """Return (transcript, index of the A in the AUG). The 3'UTR is omitted deliberately —
-    it lies downstream of the stop codon and cannot affect start-codon accessibility."""
-    cargo = _rna(cargo_cds)
-    return ctx.utr5 + ctx.signal_cds + cargo, len(ctx.utr5)
+    """Return (transcript, index of the A in the AUG)."""
+    return ctx.utr5 + ctx.signal_cds + _rna(cargo_cds) + ctx.utr3, len(ctx.utr5)
 
 
 def accessibility(ctx: TranscriptContext, cargo_cds: str,
@@ -165,6 +174,7 @@ def accessibility(ctx: TranscriptContext, cargo_cds: str,
 
     transcript, atg = assemble_transcript(ctx, cargo_cds)
     cargo_start = len(ctx.utr5) + len(ctx.signal_cds)
+    cargo_end = cargo_start + len(_rna(cargo_cds))
     truncated = len(transcript) > max_fold_nt
     folded = transcript[:max_fold_nt]
 
@@ -183,7 +193,9 @@ def accessibility(ctx: TranscriptContext, cargo_cds: str,
         j = pairs[i]
         if lo <= j < hi:
             continue                          # the window paired with itself — local hairpin
-        (in_cargo if j >= cargo_start else elsewhere).append((i - atg, j))
+        # Only the CARGO is a design variable; pairing into the fixed 5'UTR, signal or 3'UTR is
+        # constant across candidates and cannot be fixed by re-encoding the cargo.
+        (in_cargo if cargo_start <= j < cargo_end else elsewhere).append((i - atg, j))
 
     rep = AccessibilityReport(
         dg=round(dg, 2), folded_nt=len(folded), atg_index=atg, window=window,

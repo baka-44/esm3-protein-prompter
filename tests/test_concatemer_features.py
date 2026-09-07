@@ -199,3 +199,62 @@ def test_a_candidate_optimal_everywhere_says_so_rather_than_inventing_a_weakness
     assert len(res.passed) == 1
     r = res.passed[0]
     assert r.worst_group == "" and r.reasons == ["at the best observed value on every feature"]
+
+
+# ── signal cleavage: the construct's own N-terminus ────────────────────────────
+
+from concatemer.features import signal_cleavage_flags  # noqa: E402
+from concatemer.spec import VectorContext, encoding_capacity  # noqa: E402
+
+
+def test_a_proline_led_cargo_cannot_be_cleaved_from_its_signal():
+    """
+    The alpha-MF pro region ends in KR, so the cargo's first residue is P1' of that cut. Proline
+    there abolishes Kex2 cleavage and the pro region stays attached — every other metric would be
+    describing a molecule that is never made.
+    """
+    out = signal_cleavage_flags("PAPGARGHK", VectorContext())
+    assert out and "proline" in out[0] and "pro region" in out[0]
+
+
+def test_an_acidic_led_cargo_is_flagged_as_impaired():
+    assert any("acidic P1'" in f for f in signal_cleavage_flags("EEMQRRGAR", VectorContext()))
+
+
+def test_ste13_trimming_is_flagged_only_when_the_vector_retains_eaea():
+    assert signal_cleavage_flags("GARGHKGAR", VectorContext()) == []
+    out = signal_cleavage_flags("GARGHKGAR", VectorContext(signal_ste13=True))
+    assert out and "Ste13" in out[0]
+
+
+def test_a_clean_n_terminus_passes():
+    assert signal_cleavage_flags("GHKGARGHK", VectorContext(signal_ste13=True)) == []
+
+
+def test_the_signal_check_reaches_the_gate():
+    spec = ConcatemerSpec(peptides=[Peptide("P1", "PAP", 1, 4)], spacers=[],
+                          rules=[TRYPSIN], length_min=3, length_max=60)
+    res = run(spec, max_candidates=20)
+    assert res.failed
+    assert all(any("proline" in f for f in r.failures) for r in res.failed)
+
+
+# ── encoding capacity ──────────────────────────────────────────────────────────
+
+def test_encoding_capacity_multiplies_codon_degeneracy():
+    assert encoding_capacity("GHK") == 16            # G(4) x H(2) x K(2)
+    assert encoding_capacity("MW") == 1              # the only single-codon residues
+    assert encoding_capacity("") == 1
+
+
+def test_capacity_below_the_copy_number_is_a_spec_error():
+    """Fewer encodings than copies means some copies MUST share DNA, so the direct repeat cannot
+    be removed by codon diversification — impossible in principle, not merely awkward."""
+    spec = ConcatemerSpec(peptides=[Peptide("MW", "MW", 0, 5)], rules=[TRYPSIN])
+    assert any("distinct codon" in e for e in spec.errors())
+
+
+def test_ample_capacity_raises_no_error():
+    spec = ConcatemerSpec(peptides=[Peptide("GHK", "GHK", 0, 6)], rules=[TRYPSIN],
+                          length_min=3, length_max=60)
+    assert not any("distinct codon" in e for e in spec.errors())

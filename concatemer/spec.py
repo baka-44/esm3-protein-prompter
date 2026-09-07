@@ -41,6 +41,61 @@ def _clean(seq: str) -> str:
     return "".join(seq.split()).upper()
 
 
+# Codons per amino acid in the standard genetic code. This is a property of the CODE, not of any
+# organism, so it needs no usage table — only Met and Trp are single-codon.
+CODON_COUNTS: dict[str, int] = {
+    "L": 6, "S": 6, "R": 6, "A": 4, "G": 4, "P": 4, "T": 4, "V": 4, "I": 3,
+    "N": 2, "D": 2, "C": 2, "Q": 2, "E": 2, "H": 2, "K": 2, "F": 2, "Y": 2,
+    "M": 1, "W": 1,
+}
+
+
+def encoding_capacity(seq: str) -> int:
+    """
+    How many distinct DNA sequences encode this peptide — the product of each residue's codon
+    degeneracy (GHK = 4x2x2 = 16).
+
+    It matters because a concatemer repeats peptides by design, and identical codons make long
+    DIRECT REPEATS at the DNA level: synthesis vendors reject or surcharge them, and repeats in
+    an integrated cassette can loop out by homologous recombination and delete copies. The fix is
+    to encode each copy differently, which needs at least as many distinct encodings as copies.
+
+    Capacity below the copy number is impossible in principle, not merely awkward. It multiplies,
+    so it rarely binds — but when it does it is absolute, and catching it here beats a confusing
+    failure inside a constraint solver later.
+    """
+    n = 1
+    for c in seq.upper():
+        n *= CODON_COUNTS.get(c, 1)
+        if n > 10 ** 12:
+            return 10 ** 12                      # saturate; the answer is "plenty"
+    return n
+
+
+@dataclass
+class VectorContext:
+    """
+    The fixed construct context around the cargo. Every field is vector- or strain-specific and
+    none is defaulted to a canonical sequence — see concatemer/rna.py for why substituting one
+    produces a confident wrong answer.
+
+    `signal_ste13` records whether the pre-pro retains the EA/EA spacer. Ste13 removes N-terminal
+    X-Ala dipeptides processively, so with EAEA present it can trim INTO a cargo whose second
+    residue is alanine. Many modern vectors delete EAEA precisely because that processing is
+    often incomplete and gives heterogeneous N-termini.
+    """
+
+    utr5: str = ""          # transcription start site -> ATG (the PROMOTER is not transcribed)
+    signal_cds: str = ""    # alpha-MF pre-pro NUCLEOTIDES, beginning at ATG
+    utr3: str = ""          # stop codon -> poly-A site
+    signal_ste13: bool = False
+    name: str = ""
+
+    @property
+    def complete_for_folding(self) -> bool:
+        return bool(self.utr5.strip() and self.signal_cds.strip())
+
+
 @dataclass
 class Peptide:
     """One bioactive peptide to be delivered by the hydrolysate."""
@@ -151,6 +206,7 @@ class ConcatemerSpec:
     length_min: int = 60
     length_max: int = 300
     max_units: int = 40           # bound on total peptide copies, keeps the search finite
+    vector: VectorContext = field(default_factory=VectorContext)
 
     def errors(self) -> list[str]:
         errs: list[str] = []
@@ -166,6 +222,14 @@ class ConcatemerSpec:
             errs.append("At least one cleavage rule is required — without one nothing is released.")
         if self.length_max < self.length_min:
             errs.append(f"Invalid length range {self.length_min}-{self.length_max}.")
+        for p in self.peptides:
+            cap = encoding_capacity(p.sequence)
+            if p.max_copies > cap:
+                errs.append(
+                    f"{p.name}: {p.max_copies} copies requested but only {cap} distinct codon "
+                    f"encodings exist, so some copies must share DNA and the repeat cannot be "
+                    f"removed. Lower max_copies to {cap} or fewer."
+                )
         # Reachability: the shortest possible chain that honours every min_copies must still fit.
         floor = sum(p.min_copies * len(p.sequence) for p in self.peptides)
         if floor > self.length_max:
@@ -175,7 +239,7 @@ class ConcatemerSpec:
 
     def to_dict(self) -> dict[str, Any]:
         return {"version": VERSION, "length_min": self.length_min, "length_max": self.length_max,
-                "max_units": self.max_units,
+                "max_units": self.max_units, "vector": asdict(self.vector),
                 "peptides": [asdict(p) for p in self.peptides],
                 "spacers": [asdict(s) for s in self.spacers],
                 "rules": [asdict(r) for r in self.rules]}
@@ -188,6 +252,7 @@ class ConcatemerSpec:
             rules=[CleavageRule(**r) for r in d.get("rules", [])],
             length_min=d.get("length_min", 60), length_max=d.get("length_max", 300),
             max_units=d.get("max_units", 40),
+            vector=VectorContext(**d.get("vector", {})),
         )
 
     def to_json(self) -> str:

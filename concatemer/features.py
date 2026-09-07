@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 from concatemer import screens
 from concatemer.digest import DigestReport
-from concatemer.spec import ConcatemerSpec
+from concatemer.spec import ConcatemerSpec, VectorContext
 
 LOWER, HIGHER = "lower", "higher"
 
@@ -95,6 +95,38 @@ def _max_run(seq: str, chars: str) -> int:
     return best
 
 
+def signal_cleavage_flags(seq: str, vector: VectorContext) -> list[str]:
+    """
+    Whether the cargo can be released from its own signal peptide.
+
+    The alpha-MF pre-pro ends in KR and Kex2 cleaves after it, so the cargo's FIRST residue sits
+    at P1' of that cut. The rule the engine already applies at every internal junction therefore
+    applies to the construct's own N-terminus, and nothing else in the pipeline was checking it:
+
+      * proline at P1' abolishes Kex2 cleavage. The protein is secreted with the entire pro
+        region still attached — the first peptide is unreleasable and every downstream metric is
+        describing a molecule that is never made.
+      * acidic P1' (D/E) slows it. This is the historical reason the EA/EA spacer exists: it
+        moves the cut away from an unfavourable P1' and lets Ste13 finish the job.
+
+    With EAEA retained, Ste13 removes N-terminal X-Ala dipeptides PROCESSIVELY, so a cargo whose
+    second residue is alanine gets trimmed into. Spacers like GAR make that a live risk when the
+    first unit is a spacer rather than a peptide.
+    """
+    out: list[str] = []
+    if not seq:
+        return out
+    if seq[0] == "P":
+        out.append("cargo begins with proline — Kex2 cannot cleave it from the signal pro region, "
+                   "so the pro region stays attached")
+    elif seq[0] in "DE":
+        out.append(f"cargo begins with {seq[0]} — acidic P1' slows Kex2 release from the signal")
+    if vector.signal_ste13 and len(seq) >= 2 and seq[1] == "A":
+        out.append(f"cargo begins {seq[:2]} and the vector retains EAEA — Ste13 trims N-terminal "
+                   f"X-Ala dipeptides processively and will eat into the cargo")
+    return out
+
+
 def failure_flags(seq: str, spec: ConcatemerSpec, report: DigestReport) -> list[str]:
     """
     Near-absolute, mechanistic disqualifiers.
@@ -136,6 +168,8 @@ def failure_flags(seq: str, spec: ConcatemerSpec, report: DigestReport) -> list[
     _, _, disordered = screens.uversky(seq)
     if not disordered:
         out.append("predicted globular — violates the disordered-by-design architecture")
+
+    out.extend(signal_cleavage_flags(seq, spec.vector))
     return out
 
 

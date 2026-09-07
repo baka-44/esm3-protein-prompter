@@ -24,7 +24,10 @@ from concatemer.pipeline import run, to_csv, to_fasta
 from concatemer.rna import (
     MissingContextError, TranscriptContext, back_translate, parse_codon_table, screen_shortlist,
 )
-from concatemer.spec import PRESET_RULES, CleavageRule, ConcatemerSpec, Peptide, Spacer
+from concatemer.spec import (
+    PRESET_RULES, CleavageRule, ConcatemerSpec, Peptide, Spacer, VectorContext,
+    encoding_capacity,
+)
 
 DEFAULT_PEPTIDES = pd.DataFrame([
     {"name": "GHK", "sequence": "GHK", "min_copies": 2, "max_copies": 6},
@@ -42,14 +45,47 @@ def _run_cached(spec_json: str, max_candidates: int):
     return run(ConcatemerSpec.from_dict(json.loads(spec_json)), max_candidates=max_candidates)
 
 
-def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units) -> ConcatemerSpec:
+def _vector_inputs() -> VectorContext:
+    """
+    One place for the construct context. It feeds two different stages: the signal-cleavage gate
+    (which needs only whether EAEA is retained) and the accessibility fold (which needs the
+    nucleotide sequences), so collecting it twice would let them disagree.
+    """
+    with st.expander("Construct context — 5′UTR, signal, 3′UTR"):
+        st.caption(
+            "Vector-specific, and never defaulted: mRNA structure is exquisitely sequence "
+            "dependent, so a canonical AOX1 5′UTR or a back-translated α-MF would fold "
+            "differently from the gene you actually order. The **promoter is not needed** — it "
+            "is not transcribed, and sets how much mRNA is made rather than how it folds."
+        )
+        ste13 = st.checkbox(
+            "Pre-pro retains the EA/EA spacer (Ste13 processing)", value=False, key="cc_ste13",
+            help="Ste13 removes N-terminal X-Ala dipeptides processively, so with EAEA present "
+                 "it trims into a cargo whose second residue is alanine. Many modern vectors "
+                 "delete EAEA because that processing is often incomplete.",
+        )
+        v1, v2, v3 = st.columns(3)
+        with v1:
+            utr5 = st.text_area("5′UTR (TSS → ATG)", height=110, key="cc_utr5")
+        with v2:
+            sig = st.text_area("α-MF pre-pro CDS (nt, from ATG)", height=110, key="cc_sig")
+        with v3:
+            utr3 = st.text_area("3′UTR (stop → poly-A)", height=110, key="cc_utr3",
+                                help="Optional. Downstream of the stop codon, so it cannot "
+                                     "affect elongation; appended to the fold when supplied.")
+    return VectorContext(utr5=utr5, signal_cds=sig, utr3=utr3, signal_ste13=ste13)
+
+
+def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
+                vector: VectorContext | None = None) -> ConcatemerSpec:
     peps = [Peptide(str(r["name"]).strip(), str(r["sequence"]).strip(),
                     int(r["min_copies"] or 0), int(r["max_copies"] or 1))
             for _, r in peptides_df.iterrows() if str(r.get("sequence", "")).strip()]
     spacers = [Spacer(str(r["name"]).strip(), str(r["sequence"]).strip())
                for _, r in spacers_df.iterrows() if str(r.get("sequence", "")).strip()]
     return ConcatemerSpec(peptides=peps, spacers=spacers, rules=rules,
-                          length_min=int(lo), length_max=int(hi), max_units=int(max_units))
+                          length_min=int(lo), length_max=int(hi), max_units=int(max_units),
+                          vector=vector or VectorContext())
 
 
 def render_concatemer(user_email: str | None = None) -> None:
@@ -98,10 +134,21 @@ def render_concatemer(user_email: str | None = None) -> None:
         spacers_df = st.data_editor(DEFAULT_SPACERS, num_rows="dynamic", hide_index=True,
                                     use_container_width=True, key="cc_spacers")
 
+    vector = _vector_inputs()
+
+    caps = [(str(r["name"]), str(r["sequence"]).strip(), int(r["max_copies"] or 1))
+            for _, r in peptides_df.iterrows() if str(r.get("sequence", "")).strip()]
+    tight = [(n, encoding_capacity(q), m) for n, q, m in caps if encoding_capacity(q) < m * 4]
+    if tight:
+        st.caption("⚠️ Codon head-room: "
+                   + "; ".join(f"**{n}** has {c} distinct encodings for up to {m} copies"
+                               for n, c, m in tight)
+                   + " — repeats may be hard to de-duplicate at the DNA level.")
+
     if not st.button("Assemble and screen", type="primary", use_container_width=True):
         return
 
-    spec = _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units)
+    spec = _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units, vector)
     errs = spec.errors()
     if errs:
         for e in errs:
@@ -167,7 +214,7 @@ def _render_results(res, spec: ConcatemerSpec) -> None:
                            file_name="concatemer_candidates.fasta", mime="text/plain",
                            use_container_width=True)
 
-    _render_accessibility(res)
+    _render_accessibility(res, spec.vector)
 
     st.markdown("#### Inspect a candidate")
     pick = st.selectbox("Candidate", [r.candidate_id for r in res.passed[:200]],
@@ -215,7 +262,7 @@ def _render_detail(res, spec: ConcatemerSpec, cid: str) -> None:
                 st.dataframe(pd.DataFrame(items), hide_index=True, use_container_width=True)
 
 
-def _render_accessibility(res) -> None:
+def _render_accessibility(res, vector: VectorContext) -> None:
     """
     Optional late-cascade stage: fold the assembled transcript and check the start codon stays
     open. Gated on inputs that cannot be guessed — mRNA structure is exquisitely sequence
@@ -229,30 +276,21 @@ def _render_accessibility(res) -> None:
             "it. Folding is O(n³), so this runs on a shortlist. A hit is a **re-encoding** "
             "instruction, not a reason to drop the design."
         )
-        c1, c2 = st.columns(2)
-        with c1:
-            utr5 = st.text_area("5′UTR (TSS → ATG)", height=90, key="cc_utr5",
-                                help="Vector-specific — pPICZα, pPIC9K and relatives differ by "
-                                     "cloning site. The PROMOTER is not transcribed and is not "
-                                     "needed.")
-            signal_cds = st.text_area("α-MF pre-pro CDS (nucleotides)", height=90, key="cc_sig",
-                                      help="From your vector, beginning at ATG. The protein "
-                                           "sequence is not enough — codon choice sets the fold.")
-        with c2:
-            table_txt = st.text_area("Codon table (one per residue, e.g. `A GCT`)", height=200,
-                                     key="cc_codons",
-                                     help="No default is shipped: usage is strain-specific and "
-                                          "accessibility is entirely an artefact of the encoding.")
+        table_txt = st.text_area("Codon table (one per residue, e.g. `A GCT`)", height=150,
+                                 key="cc_codons",
+                                 help="No default is shipped: usage is strain-specific and "
+                                      "accessibility is entirely an artefact of the encoding.")
         top_n = st.number_input("Screen the top N candidates", 1, 50, 5, step=1, key="cc_topn")
 
         if not st.button("Fold and check", key="cc_fold"):
             return
-        if not (utr5.strip() and signal_cds.strip() and table_txt.strip()):
-            st.warning("All three inputs are required. Without them the transcript cannot be "
-                       "assembled, and a substituted sequence would give a confident wrong answer.")
+        if not (vector.complete_for_folding and table_txt.strip()):
+            st.warning("Needs the 5′UTR and signal CDS from **Construct context** above, plus a "
+                       "codon table. Without them the transcript cannot be assembled, and a "
+                       "substituted sequence would give a confident wrong answer.")
             return
         try:
-            ctx = TranscriptContext(utr5=utr5, signal_cds=signal_cds)
+            ctx = TranscriptContext.from_vector(vector)
             table = parse_codon_table(table_txt)
             shortlist = [(r.candidate_id, res.candidates[r.candidate_id].sequence)
                          for r in res.passed[:int(top_n)]]
