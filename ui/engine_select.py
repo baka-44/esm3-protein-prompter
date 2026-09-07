@@ -13,9 +13,48 @@ from __future__ import annotations
 import streamlit as st
 
 
+# Streamlit stretches the COLUMN to the tallest sibling but leaves the bordered container at its
+# natural height, so cards with shorter copy float with their buttons at different baselines. This
+# makes each card fill its column and pins the button to the bottom, so the four line up whatever
+# the text length. Scoped to this page — it is a full-page view with nothing else on it.
+#
+# The `:has(style)` rule is not cosmetic: an injected <style> still gets its own
+# stElementContainer, which consumes height in the surrounding flex layout and pushes the page
+# down. That has bitten this app before.
+_CARD_CSS = """
+<style>
+  div[data-testid="stElementContainer"]:has(> div > style) { display: none !important; }
+
+  /* card fills its (already stretched) column */
+  div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"],
+  div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"] { height: 100%; }
+
+  /* card body becomes a column so the button can be pushed to the foot */
+  div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"]
+    > div[data-testid="stVerticalBlock"] {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+  }
+  div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"]
+    div[data-testid="stElementContainer"]:last-child { margin-top: auto; }
+
+  /* Reserve the height a WRAPPED title actually occupies (measured: 53px vs 38px for one
+     line), so one- and two-line names start their body copy level. This costs nothing in
+     total height — the tallest card already carries a two-line title. */
+  div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"] h5 {
+      min-height: 4em;
+      display: flex;
+      align-items: flex-start;
+  }
+</style>
+"""
+
+
 def render_engine_chooser() -> None:
     """Full-page, understated selection screen. Sets _engine and reruns on choice."""
-    st.markdown("<div style='height:4vh'></div>", unsafe_allow_html=True)
+    st.markdown(_CARD_CSS, unsafe_allow_html=True)
+    st.markdown("<div style='height:0.5vh'></div>", unsafe_allow_html=True)
     st.markdown(
         "<div style='text-align:center;margin-bottom:0.4rem'>"
         "<div style='font-size:1.35rem;font-weight:600;color:#141414;letter-spacing:-0.01em'>"
@@ -24,8 +63,6 @@ def render_engine_chooser() -> None:
         "Four ways to design proteins. You can switch anytime.</div></div>",
         unsafe_allow_html=True,
     )
-    st.markdown("<div style='height:2.5vh'></div>", unsafe_allow_html=True)
-
     left, mid, right = st.columns([1, 8, 1])
     with mid:
         c1, c2, c3, c4 = st.columns(4, gap="large")
@@ -77,7 +114,8 @@ def render_engine_chooser() -> None:
                 st.markdown(
                     "<span style='color:#666666;font-size:0.84rem'>"
                     "Peptide payloads. Assemble bioactive peptides into a secretable carrier, "
-                    "then screen which chains express and give the peptides back on digestion."
+                    "then screen which are likely to express and to give the peptides back on "
+                    "digestion."
                     "</span>",
                     unsafe_allow_html=True,
                 )

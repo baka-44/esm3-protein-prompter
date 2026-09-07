@@ -78,9 +78,10 @@ def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
 def render_concatemer(user_email: str | None = None) -> None:
     st.markdown("### 🧷 Concatemer composer")
     st.caption(
-        "Assemble bioactive peptides into a secretable carrier chain, then screen which ones "
-        "survive expression **and** give the peptides back on digestion. The product is the "
-        "hydrolysate, so the chain is designed not to fold — it is designed to be made and cut."
+        "Assemble bioactive peptides into a secretable carrier chain, then screen which ones are "
+        "**likely** to survive expression and give the peptides back on digestion. The product "
+        "is the hydrolysate, so the chain is designed not to fold — it is designed to be made "
+        "and cut."
     )
 
     with st.sidebar:
