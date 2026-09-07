@@ -21,14 +21,14 @@ def render_engine_chooser() -> None:
         "<div style='font-size:1.35rem;font-weight:600;color:#141414;letter-spacing:-0.01em'>"
         "Choose a design engine</div>"
         "<div style='font-size:0.85rem;color:#767676;margin-top:0.4rem'>"
-        "Two ways to design proteins. You can switch anytime.</div></div>",
+        "Four ways to design proteins. You can switch anytime.</div></div>",
         unsafe_allow_html=True,
     )
     st.markdown("<div style='height:2.5vh'></div>", unsafe_allow_html=True)
 
     left, mid, right = st.columns([1, 8, 1])
     with mid:
-        c1, c2, c3 = st.columns(3, gap="large")
+        c1, c2, c3, c4 = st.columns(4, gap="large")
         with c1:
             with st.container(border=True):
                 st.markdown("##### 💬 ESM3")
@@ -71,12 +71,27 @@ def render_engine_chooser() -> None:
                 if st.button("Compose a graft", key="pick_compose", use_container_width=True):
                     st.session_state["_engine"] = "compose"
                     st.rerun()
+        with c4:
+            with st.container(border=True):
+                st.markdown("##### 🧷 Concatemer")
+                st.markdown(
+                    "<span style='color:#666666;font-size:0.84rem'>"
+                    "Peptide payloads. Assemble bioactive peptides into a secretable carrier, "
+                    "then screen which chains express and give the peptides back on digestion."
+                    "</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+                if st.button("Compose a concatemer", key="pick_concat", use_container_width=True):
+                    st.session_state["_engine"] = "concatemer"
+                    st.rerun()
 
 
 def render_engine_switch() -> None:
     """Small control (place in the sidebar) to return to the engine chooser."""
     current = st.session_state.get("_engine")
-    label = {"esm3": "ESM3", "rfd": "RFdiffusion / MPNN", "compose": "Compose Graft"}.get(current, "—")
+    label = {"esm3": "ESM3", "rfd": "RFdiffusion / MPNN", "compose": "Compose Graft",
+             "concatemer": "Concatemer"}.get(current, "—")
     st.caption(f"Engine · **{label}**")
     if st.button("⇄ Switch engine", key="switch_engine", use_container_width=True):
         st.session_state.pop("_engine", None)

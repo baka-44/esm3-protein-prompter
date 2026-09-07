@@ -91,19 +91,33 @@ def rank(rows: list[FeatureRow]) -> list[RankedRow]:
         group_ranks = {g: _average_ranks(group_scores[g], higher_is_better=False)
                        for g in GROUPS}
 
+        # A feature on which EVERY candidate ties at the optimum carries no information, but
+        # average ranking still gives it a high shared rank — so a group where nothing is wrong
+        # gets reported as the weakest axis, listing three zeroes as "liabilities". Only features
+        # where this candidate is actually worse than the best observed value can be a reason.
+        best: dict[str, float] = {}
+        for f in FEATURES:
+            vals = [r.values.get(f.key, 0.0) for r in passed]
+            best[f.key] = max(vals) if f.direction == HIGHER else min(vals)
+
         for i, r in enumerate(passed):
             gr = {g: group_ranks[g][i] for g in GROUPS}
-            worst_g = max(gr, key=lambda g: gr[g])
-            keys = [f.key for f in FEATURES if f.group == worst_g]
+            off = {f.key for f in FEATURES if r.values.get(f.key, 0.0) != best[f.key]}
+            live = [g for g in GROUPS if any(f.key in off for f in FEATURES if f.group == g)]
+            worst_g = max(live, key=lambda g: gr[g]) if live else ""
+            keys = [f.key for f in FEATURES if f.group == worst_g and f.key in off]
             reasons = sorted(keys, key=lambda k: per_feature[k][i], reverse=True)[:3]
             out.append(RankedRow(
                 candidate_id=r.candidate_id, ranksum=round(sum(gr.values()), 2),
                 ranksum_mfg=round(sum(v for g, v in gr.items() if g != PRODUCT), 2),
                 product_rank=gr.get(PRODUCT, 0.0),
-                worst_rank=gr[worst_g], worst_group=worst_g,
+                # worst_rank stays the true maximum so sorting is unaffected; worst_group is
+                # blank when the candidate is at the optimum on every feature that varies.
+                worst_rank=max(gr.values()), worst_group=worst_g,
                 group_ranks={k: round(v, 2) for k, v in gr.items()},
                 values=dict(r.values),
-                reasons=[f"{k} ({r.values.get(k)})" for k in reasons],
+                reasons=([f"{k} ({r.values.get(k)})" for k in reasons]
+                         or ["at the best observed value on every feature"]),
             ))
         out.sort(key=lambda x: (x.product_rank, x.ranksum_mfg, x.worst_rank))
         for n, row in enumerate(out, start=1):

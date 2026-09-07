@@ -168,3 +168,34 @@ def test_fasta_headers_are_self_describing():
     head = fa.splitlines()[0]
     assert head.startswith(">") and "exact=" in head and "payload=" in head
     assert len(fa.splitlines()) == 4                       # 2 records, 2 lines each
+
+
+def test_a_feature_everyone_ties_on_is_never_a_reason():
+    """
+    Average ranking gives a shared high rank to a feature on which every candidate ties at the
+    optimum, so a group where nothing is wrong was being reported as the weakest axis — listing
+    three zeroes as liabilities. Only a value worse than the best observed can be a reason.
+    """
+    spec = ConcatemerSpec(
+        peptides=[Peptide("GHK", "GHK", 2, 6), Peptide("GQPR", "GQPR", 1, 5)],
+        spacers=[Spacer("GAR", "GAR"), Spacer("GGAR", "GGAR")],
+        rules=[TRYPSIN], length_min=60, length_max=160, max_units=20)
+    res = run(spec, max_candidates=3000)
+    assert res.passed
+
+    # These candidates are all sequon-free and S/T-free: glycosylation is uniformly optimal.
+    assert all(r.values["n_sequons"] == 0 and r.values["st_fraction"] == 0.0 for r in res.passed)
+    for r in res.passed:
+        assert r.worst_group != "glycosylation"
+        for reason in r.reasons:
+            assert not reason.startswith("n_sequons")
+            assert not reason.startswith("st_fraction")
+
+
+def test_a_candidate_optimal_everywhere_says_so_rather_than_inventing_a_weakness():
+    spec = ConcatemerSpec(peptides=[Peptide("GHK", "GHK", 3, 3)], spacers=[],
+                          rules=[TRYPSIN], length_min=9, length_max=9)
+    res = run(spec, max_candidates=10)
+    assert len(res.passed) == 1
+    r = res.passed[0]
+    assert r.worst_group == "" and r.reasons == ["at the best observed value on every feature"]
