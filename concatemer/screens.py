@@ -96,9 +96,18 @@ def ncpr(seq: str) -> float:
 
 
 def _sigma(seq: str) -> float:
-    pos = sum(1 for c in seq if c in POSITIVE)
-    neg = sum(1 for c in seq if c in NEGATIVE)
-    return ((pos - neg) ** 2 / (pos + neg)) if (pos + neg) else 0.0
+    """
+    Das-Pappu charge asymmetry, (f+ - f-)^2 / (f+ + f-) on FRACTIONS within the window.
+
+    Fractions, not counts: sigma is compared between a short blob and the whole chain, so a
+    count-based form is scale-dependent and reports large spurious patterning for any long
+    sequence. It also has to be dimensionless for kappa's normalisation to mean anything.
+    """
+    if not seq:
+        return 0.0
+    fp = sum(1 for c in seq if c in POSITIVE) / len(seq)
+    fn = sum(1 for c in seq if c in NEGATIVE) / len(seq)
+    return (((fp - fn) ** 2) / (fp + fn)) if (fp + fn) else 0.0
 
 
 def _delta(seq: str, window: int) -> float:
@@ -117,6 +126,10 @@ def kappa(seq: str) -> float:
     in the ER is a plausible secretion failure with no other warning sign, and kappa is the only
     cheap read on it. Normalised against the maximally segregated permutation of the same
     composition (positives, then neutrals, then negatives).
+
+    Only interpretable when BOTH charge classes are present. A single-signed chain has no
+    patterning to measure and correctly returns ~0; its real liability is net charge (strongly
+    cationic chains bind the Pichia cell wall), which the trafficking group carries separately.
     """
     if len(seq) < 6 or not any(c in POSITIVE + NEGATIVE for c in seq):
         return 0.0
