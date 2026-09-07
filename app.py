@@ -394,6 +394,16 @@ if _engine == "rfd":
     render_rfd_engine(_user_email)
     st.stop()
 
+# Concatemer composer — peptide payload chains. Sidebar carries the chemistry and size envelope.
+if _engine == "concatemer":
+    with st.sidebar:
+        render_engine_switch()
+    render_user_badge()
+    from ui.concatemer_panel import render_concatemer
+    _user_email = st.session_state.get("_auth_email") or "local@dev"
+    render_concatemer(_user_email)
+    st.stop()
+
 # Compose Graft — Borrowed Bodies composer (full-page cockpit; no sidebar → max canvas).
 if _engine == "compose":
     from ui.composer_panel import render_composer
