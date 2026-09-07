@@ -80,6 +80,8 @@ def find_sites(seq: str, rules) -> list[Site]:
     """
     found: dict[int, Site] = {}
     for rule in rules:
+        if getattr(rule, "is_exopeptidase", False):
+            continue          # no motif, no cut sites — it only trims fragment ends
         for m in re.finditer(f"(?=({rule.motif}))", seq):
             span = m.group(1)
             if not span:
@@ -89,7 +91,14 @@ def find_sites(seq: str, rules) -> list[Site]:
             if pos <= 0 or pos >= len(seq):
                 continue                       # a cut at either terminus is not a cut
             p1prime = seq[pos]
-            if p1prime in rule.blocked_by:
+            required = getattr(rule, "requires_p1prime", "")
+            if required and p1prime not in required:
+                # Enzymes like TEV and HRV-3C do not merely disfavour certain P1' residues, they
+                # require specific ones (G/S and G). "blocked_by" cannot express that — listing
+                # the other eighteen residues would be both unreadable and wrong as the model
+                # grows — so the requirement is stated positively.
+                status, why = BLOCKED, f"P1' is {p1prime}, needs {'/'.join(required)}"
+            elif p1prime in rule.blocked_by:
                 status, why = BLOCKED, f"P1' is {p1prime}"
             elif p1prime in rule.impaired_by:
                 status, why = IMPAIRED, f"P1' is {p1prime}"

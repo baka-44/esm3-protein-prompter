@@ -170,3 +170,142 @@ def test_spec_rejects_mandatory_copies_that_cannot_fit():
 
 def test_spec_rejects_non_standard_residues():
     assert any("non-standard" in e for e in Peptide("bad", "GHX").errors())
+
+
+# ── enzymes that REQUIRE a specific P1' ────────────────────────────────────────
+
+def test_tev_only_cleaves_before_g_or_s():
+    """
+    TEV does not merely disfavour some P1' residues, it requires G or S. `blocked_by` cannot
+    express that — listing the other eighteen residues would be unreadable and wrong as the
+    model grows — so the requirement is stated positively.
+    """
+    tev = PRESET_RULES["tev"]
+    assert [s.status for s in find_sites("AAENLYFQGKAA", [tev])] == [CLEAN]
+    assert [s.status for s in find_sites("AAENLYFQSKAA", [tev])] == [CLEAN]
+    blocked = find_sites("AAENLYFQAKAA", [tev])
+    assert [s.status for s in blocked] == [BLOCKED]
+    assert "needs G/S" in blocked[0].reason
+
+
+def test_hrv_3c_requires_glycine():
+    r = PRESET_RULES["hrv_3c"]
+    assert [s.status for s in find_sites("AALEVLFQGPAA", [r])] == [CLEAN]
+    assert [s.status for s in find_sites("AALEVLFQSPAA", [r])] == [BLOCKED]
+
+
+def test_a_multi_residue_c_side_site_strands_itself_on_the_upstream_peptide():
+    """
+    The reason the fusion proteases are a poor fit for a tandem concatemer, and it is not the
+    payload cost.
+
+    TEV cuts AFTER its own site, so the site stays on the fragment upstream of the cut. These
+    enzymes were designed for a SINGLE carrier->product junction, where that site lands on the
+    carrier and is thrown away. Chain the geometry and every copy but the last inherits the next
+    site at its C-terminus.
+    """
+    ghk = Peptide("GHK", "GHK")
+    spec = _spec([ghk], [PRESET_RULES["tev"]], [Spacer("tev_site", "ENLYFQ")])
+    rep = digest("ENLYFQ" + "GHK" + "ENLYFQ" + "GHK", spec)
+    assert [f.seq for f in rep.fragments] == ["ENLYFQ", "GHKENLYFQ", "GHK"]
+    assert rep.released_exact["GHK"] == 1          # only the terminal copy is clean
+    assert rep.n_unintended == 1                   # the middle copy carries the next site
+
+
+def test_a_one_residue_recogniser_avoids_that_entirely():
+    """Contrast: when the peptide's own C-terminus IS the cut site, nothing is stranded."""
+    ghk = Peptide("GHK", "GHK")
+    rep = digest("GHK" * 3, _spec([ghk], [PRESET_RULES["lys_c"]]))
+    assert rep.released_exact["GHK"] == 3 and rep.n_unintended == 0
+
+
+def test_lys_c_spares_arginine_where_trypsin_would_cut():
+    """The reason to reach for Lys-C: a peptide carrying R survives it but not trypsin."""
+    pep = Peptide("GQPR", "GQPR")
+    seq = "GQPR" * 3
+    assert digest(seq, _spec([pep], [PRESET_RULES["lys_c"]])).n_clean == 0    # untouched
+    assert digest(seq, _spec([pep], [TRYPSIN])).n_clean == 2                  # cut at every R
+
+
+def test_recognition_site_length_is_the_payload_tax():
+    assert PRESET_RULES["trypsin"].site_length == 1
+    assert PRESET_RULES["kex2"].site_length == 2
+    assert PRESET_RULES["enterokinase"].site_length == 5
+    assert PRESET_RULES["tev"].site_length == 6
+    # a character class is one residue, not its literal width
+    assert CleavageRule("x", r"[KR]", "C").site_length == 1
+
+
+def test_a_rule_cannot_both_require_and_block_the_same_p1_prime():
+    bad = CleavageRule("bad", "ENLYFQ", "C", blocked_by="G", requires_p1prime="GS")
+    assert any("both required and blocking" in e for e in bad.errors())
+
+
+def test_every_preset_is_self_consistent():
+    for name, rule in PRESET_RULES.items():
+        assert rule.errors() == [], f"{name}: {rule.errors()}"
+        assert rule.consensus, f"{name} has no consensus string for the UI"
+        assert rule.note, f"{name} has no explanatory note"
+
+
+# ── the requested industrial set ───────────────────────────────────────────────
+
+def test_thrombin_and_factor_xa_cut_at_their_canonical_sites():
+    assert [s.status for s in find_sites("AALVPRGSAA", [PRESET_RULES["thrombin"]])] == [CLEAN]
+    xa = PRESET_RULES["factor_xa"]
+    assert [s.status for s in find_sites("AAIEGRAAAA", [xa])] == [CLEAN]
+    assert [s.status for s in find_sites("AAIDGRAAAA", [xa])] == [CLEAN]   # I(E/D)GR
+
+
+def test_factor_xa_is_blocked_by_proline_or_arginine_at_p1_prime():
+    xa = PRESET_RULES["factor_xa"]
+    assert [s.status for s in find_sites("AAIEGRPAAA", [xa])] == [BLOCKED]
+    assert [s.status for s in find_sites("AAIEGRRAAA", [xa])] == [BLOCKED]
+
+
+def test_anpep_cuts_after_proline_which_blocks_everything_else():
+    """
+    The complement of the rest of the set. Proline at P1' blocks nearly every protease here, so a
+    prolyl endopeptidase reaches junctions the others cannot — directly relevant to
+    collagen-derived peptides, which are proline-rich.
+    """
+    anpep = PRESET_RULES["anpep"]
+    assert [s.status for s in find_sites("AAPGAA", [anpep])] == [CLEAN]
+    assert [s.status for s in find_sites("AAPGAA", [TRYPSIN])] == []       # trypsin sees nothing
+    # ...but it will not cut Pro-Pro
+    assert find_sites("AAPPAA", [anpep])[0].status == BLOCKED
+
+
+def test_cpb_is_an_exopeptidase_and_creates_no_cut_sites():
+    """
+    Carboxypeptidase B is not a site-specific cutter — it chews C-terminal Arg/Lys off whatever
+    it is given. Modelling it with a motif would invent cut sites that do not exist.
+    """
+    cpb = PRESET_RULES["cpb"]
+    assert cpb.is_exopeptidase and cpb.site_length == 0
+    assert find_sites("GHKRGHKR", [cpb]) == []
+
+
+def test_cpb_paired_with_an_endopeptidase_removes_the_c_terminal_scar():
+    """
+    This is what CPB is for here. C-side cleavage leaves the basic residue on the upstream
+    fragment, so trypsin alone returns GQPR when GQP was wanted. CPB trims it off.
+    """
+    pep = Peptide("GQP", "GQP")
+    seq = "GQPR" * 3
+    assert digest(seq, _spec([pep], [TRYPSIN])).released_exact["GQP"] == 0
+    both = digest(seq, _spec([pep], [TRYPSIN, PRESET_RULES["cpb"]]))
+    assert [f.seq for f in both.fragments] == ["GQP"] * 3
+    assert both.released_exact["GQP"] == 3
+
+
+def test_cpb_carries_the_same_processivity_trap_as_kex1():
+    """A peptide whose own C-terminus is basic gets eaten past it."""
+    ghk = Peptide("GHK", "GHK")
+    rep = digest("GHKR" * 2, _spec([ghk], [TRYPSIN, PRESET_RULES["cpb"]]))
+    assert [f.seq for f in rep.fragments] == ["GH", "GH"]
+    assert rep.released_exact["GHK"] == 0
+
+
+def test_a_rule_with_neither_motif_nor_trimming_does_nothing_and_says_so():
+    assert any("would do nothing" in e for e in CleavageRule("dud", "", "C").errors())
