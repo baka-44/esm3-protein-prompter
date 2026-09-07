@@ -1,0 +1,78 @@
+# CI for the Protein Foundry app.
+#
+# Until now nothing built a PR: the only gate was `gcloud run deploy --source .` AFTER merge,
+# which does build the image but reports failure once main is already broken. These two jobs move
+# the cheap half of that check in front of the merge.
+#
+# Python 3.11 throughout, matching the `python:3.11-slim` base in Dockerfile.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Deliberately NOT `-r requirements.txt`. The test suite reaches torch, transformers and
+      # the google-cloud libraries only through lazy imports inside functions it never calls, so
+      # installing them costs minutes of CI time and a ~200 MB torch wheel to change nothing.
+      # Verified empirically: all 262 tests pass on exactly this set.
+      - name: Install test dependencies
+        run: pip install pytest numpy biopython seqfold streamlit
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+  dependencies:
+    name: requirements resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Resolution only — no install. Catches a pin that cannot be satisfied, and the specific
+      # trap that prompted this workflow: a dependency with no wheel for the image's platform.
+      # seqfold turned out to be a Rust extension, and had it lacked a manylinux wheel pip would
+      # have fallen back to the sdist and tried to compile it in `python:3.11-slim`, which has no
+      # Rust toolchain. Nothing local would have shown that.
+      #
+      # This is NOT a faithful replay of the image build. Dockerfile installs CPU torch from the
+      # PyTorch index BEFORE requirements.txt, to avoid dragging in the ~2.5 GB CUDA wheel; this
+      # job resolves torch from PyPI instead. It therefore verifies that the pin set is
+      # satisfiable and wheel-backed, not that the image layers resolve identically. Only a
+      # staging deploy proves that.
+      - name: Resolve requirements
+        run: |
+          pip install --dry-run --ignore-installed \
+            --report /tmp/report.json -r requirements.txt
+
+      - name: Fail if any dependency would be built from source
+        run: |
+          python - <<'PY'
+          import json, sys
+          report = json.load(open("/tmp/report.json"))
+          sdists = [
+              p["metadata"]["name"]
+              for p in report.get("install", [])
+              if p.get("download_info", {}).get("url", "").endswith((".tar.gz", ".zip"))
+          ]
+          if sdists:
+              print("No wheel for the target platform, so the image build would compile from "
+                    "source. python:3.11-slim has gcc/g++ but no Rust or Fortran toolchain:")
+              for name in sorted(set(sdists)):
+                  print(f"  - {name}")
+              sys.exit(1)
+          print(f"All {len(report.get('install', []))} resolved distributions are wheels.")
+          PY

@@ -38,6 +38,9 @@ google-cloud-run==0.16.1
 google-api-core==2.34.0
 protobuf==7.34.1
 
-# Start-codon accessibility on the assembled transcript (concatemer/rna.py). MIT and pure
-# Python — chosen over ViennaRNA, which is academic-licensed.
+# Start-codon accessibility on the assembled transcript (concatemer/rna.py). MIT, chosen over
+# ViennaRNA which is academic-licensed. NOT pure Python — it is a Rust extension built with
+# maturin, so it needs a wheel for the target platform. 0.10.2 publishes cp38-abi3 wheels for
+# manylinux2014_x86_64, which python:3.11-slim resolves without a Rust toolchain; verify that
+# still holds before bumping the pin, or the image build will try to compile from sdist and fail.
 seqfold==0.10.2
