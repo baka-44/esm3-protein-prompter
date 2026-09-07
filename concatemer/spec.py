@@ -171,10 +171,40 @@ class CleavageRule:
     side: str = "C"               # "C" = cut after the match, "N" = cut before it
     blocked_by: str = "P"         # residues at P1' that abolish cleavage
     impaired_by: str = "DE"       # residues at P1' that reduce it
+    requires_p1prime: str = ""    # when set, P1' MUST be one of these or the site is dead
     trim_c_basic: bool = False    # Kex1-style processive C-terminal K/R removal
+    consensus: str = ""           # human-readable, e.g. "ENLYFQ / G"
+    note: str = ""                # what a user needs to know before choosing it
+
+    @property
+    def is_exopeptidase(self) -> bool:
+        """
+        No motif means no endopeptidase activity — the rule only post-processes fragment ends.
+
+        Carboxypeptidase B is the case that forces this: it is not a site-specific cutter at all,
+        it chews C-terminal Arg/Lys off whatever it is given. Modelling it with a motif would
+        invent cut sites that do not exist.
+        """
+        return not self.motif.strip()
+
+    @property
+    def site_length(self) -> int:
+        """
+        Residues of recognition site, approximated from the motif's literal characters.
+
+        This is the payload tax. In a concatemer every junction carries one site, so a 7-residue
+        recogniser across ten junctions is 70 residues that are not product — the difference
+        between TEV and Lys-C is tens of percent of payload fraction, not a detail.
+        """
+        return 0 if self.is_exopeptidase else len(re.sub(r"\[[^\]]*\]", "X", self.motif))
 
     def errors(self) -> list[str]:
         errs = []
+        if self.requires_p1prime and set(self.requires_p1prime) & set(self.blocked_by):
+            errs.append(f"{self.name}: P1' cannot be both required and blocking "
+                        f"({sorted(set(self.requires_p1prime) & set(self.blocked_by))})")
+        if self.is_exopeptidase and not self.trim_c_basic:
+            errs.append(f"{self.name}: no motif and no trimming — the rule would do nothing")
         if self.side not in ("C", "N"):
             errs.append(f"{self.name}: side must be 'C' or 'N', got {self.side!r}")
         try:
@@ -187,12 +217,97 @@ class CleavageRule:
 # Chemistries worth having as defaults. Kex2 is the one Pichia already runs in the Golgi, so a
 # construct containing KR is processed during secretion whether or not that was the intent.
 PRESET_RULES: dict[str, CleavageRule] = {
-    "trypsin": CleavageRule("trypsin", r"[KR]", "C", blocked_by="P"),
-    "kex2": CleavageRule("kex2", r"KR", "C", blocked_by="P", impaired_by="DE"),
-    "kex2_kex1": CleavageRule("kex2_kex1", r"KR", "C", blocked_by="P", impaired_by="DE",
-                              trim_c_basic=True),
-    "asp_n": CleavageRule("asp_n", r"D", "N", blocked_by=""),
-    "glu_c": CleavageRule("glu_c", r"E", "C", blocked_by="P"),
+    # ── broad specificity: no payload tax, but they cut anywhere the residue appears ──
+    "trypsin": CleavageRule(
+        "trypsin", r"[KR]", "C", blocked_by="P", consensus="K or R / X",
+        note="Cuts after every K and R. No site to add, so no payload cost — but any peptide "
+             "with an internal K or R is destroyed. Blocked by proline at P1'."),
+    "lys_c": CleavageRule(
+        "lys_c", r"K", "C", blocked_by="P", consensus="K / X",
+        note="Cuts after K only, so more selective than trypsin and it spares peptides "
+             "containing R. Industrially proven at scale in insulin manufacture."),
+    "glu_c": CleavageRule(
+        "glu_c", r"E", "C", blocked_by="P", consensus="E / X",
+        note="Cuts after E (also after D in phosphate buffer). Useful when peptides carry K/R "
+             "that must survive."),
+    "asp_n": CleavageRule(
+        "asp_n", r"D", "N", blocked_by="", consensus="X / D",
+        note="Cuts BEFORE D, so the D belongs to the downstream fragment — the only preset here "
+             "that leaves an N-terminal rather than C-terminal scar."),
+
+    # ── the host's own machinery ──
+    "kex2": CleavageRule(
+        "kex2", r"KR", "C", blocked_by="P", impaired_by="DE", consensus="KR / X",
+        note="What Pichia already runs in the Golgi, so a construct containing KR is processed "
+             "during secretion whether or not that was the intent. Acidic P1' slows it."),
+    "kex2_kex1": CleavageRule(
+        "kex2_kex1", r"KR", "C", blocked_by="P", impaired_by="DE", trim_c_basic=True,
+        consensus="KR / X, then C-terminal K/R trimmed",
+        note="Kex2 followed by Kex1, the in vivo pairing. Kex1 removes C-terminal K/R "
+             "PROCESSIVELY, so a peptide that itself ends in K or R is eaten past its own "
+             "terminus (GHK becomes GH). Check the digest before choosing this."),
+
+    # ── High-selectivity fusion proteases. Precise, but read `note` before choosing one: they
+    # were designed for a SINGLE carrier->product junction, where the recognition site stays on
+    # the carrier that then gets discarded. A tandem concatemer is the opposite geometry, and the
+    # site ends up attached to the upstream peptide instead. ──
+    "tev": CleavageRule(
+        "tev", r"ENLYFQ", "C", blocked_by="", requires_p1prime="GS",
+        consensus="ENLYFQ / G or S",
+        note="The workhorse of single-junction fusion cleavage — a 6-residue site means it will "
+             "not cut anywhere else, and P1' must be G or S. But it cuts AFTER its own site, so "
+             "in a tandem layout that site stays on the UPSTREAM peptide: every copy but the "
+             "last comes back carrying ENLYFQ on its C-terminus. Usable only if the payload "
+             "tolerates that extension, or paired with a trimming step."),
+    "enterokinase": CleavageRule(
+        "enterokinase", r"DDDDK", "C", blocked_by="P", consensus="DDDDK / X",
+        note="Enteropeptidase. Highly specific, and P1' is unconstrained, so the peptide "
+             "DOWNSTREAM of a site gets a native N-terminus. Same tandem caveat as TEV: the "
+             "DDDDK stays on the peptide upstream of it."),
+    "thrombin": CleavageRule(
+        "thrombin", r"LVPR", "C", blocked_by="P", consensus="LVPR / G-S",
+        note="Canonical site LVPR/GS. Well established and cheap at scale, but less stringent "
+             "than TEV or 3C — thrombin has documented secondary cleavage at related basic "
+             "sites, so check the digest for unintended fragments. Same tandem caveat: the "
+             "LVPR stays on the upstream peptide."),
+    "factor_xa": CleavageRule(
+        "factor_xa", r"I[ED]GR", "C", blocked_by="PR", consensus="IEGR or IDGR / X",
+        note="Leaves no residue on the downstream peptide, so the released N-terminus is native "
+             "— its main advantage over TEV and 3C, which both constrain P1'. Blocked by proline "
+             "or arginine at P1'. Secondary cleavage is reported; check the digest."),
+    "hrv_3c": CleavageRule(
+        "hrv_3c", r"LEVLFQ", "C", blocked_by="", requires_p1prime="G",
+        consensus="LEVLFQ / G",
+        note="PreScission-type, active at 4 C, which helps when the payload is protease-labile. "
+             "P1' must be G. Same tandem caveat as TEV — the site stays on the upstream "
+             "peptide."),
+    # ── proline-directed: the complement of everything above ──
+    "anpep": CleavageRule(
+        "anpep", r"P", "C", blocked_by="P", consensus="P / X",
+        note="Aspergillus niger prolyl endopeptidase, used industrially to degrade gluten. Cuts "
+             "AFTER proline — the residue that blocks nearly every other protease here — so it "
+             "reaches junctions the others cannot. Directly relevant to collagen-derived "
+             "peptides, which are proline-rich; equally, it will shred them if the proline sits "
+             "inside a peptide you meant to keep. Does not cut Pro-Pro."),
+
+    # ── exopeptidase: trims ends, creates no cut sites of its own ──
+    "cpb": CleavageRule(
+        "cpb", "", "C", blocked_by="", trim_c_basic=True,
+        consensus="removes C-terminal K/R (no site)",
+        note="Carboxypeptidase B. Not a site-specific cutter — it chews C-terminal Arg and Lys "
+             "off whatever it is given, PROCESSIVELY, exactly as Kex1 does. Proven at scale in "
+             "insulin manufacture. Pair it with an endopeptidase to tidy basic C-termini, but "
+             "note the same trap as Kex1: a peptide that itself ends in K or R is eaten past its "
+             "own terminus (GHK becomes GH)."),
+}
+
+# Grouping for the UI, so a user sees the trade-off rather than an undifferentiated list.
+RULE_GROUPS: dict[str, list[str]] = {
+    "Broad specificity — no payload cost": ["trypsin", "lys_c", "glu_c", "asp_n", "anpep"],
+    "Host machinery (Pichia)": ["kex2", "kex2_kex1"],
+    "High selectivity — costs payload per junction":
+        ["tev", "hrv_3c", "enterokinase", "thrombin", "factor_xa"],
+    "Exopeptidase — trims ends, adds no sites": ["cpb"],
 }
 
 

@@ -22,7 +22,7 @@ from concatemer.digest import digest
 from concatemer.features import FEATURES
 from concatemer.pipeline import run, to_csv, to_fasta
 from concatemer.spec import (
-    PRESET_RULES, CleavageRule, ConcatemerSpec, Peptide, Spacer, VectorContext,
+    PRESET_RULES, RULE_GROUPS, CleavageRule, ConcatemerSpec, Peptide, Spacer, VectorContext,
     encoding_capacity,
 )
 
@@ -78,29 +78,14 @@ def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
 def render_concatemer(user_email: str | None = None) -> None:
     st.markdown("### 🧷 Concatemer composer")
     st.caption(
-        "Assemble bioactive peptides into a secretable carrier chain, then screen which ones "
-        "survive expression **and** give the peptides back on digestion. The product is the "
-        "hydrolysate, so the chain is designed not to fold — it is designed to be made and cut."
+        "Assemble bioactive peptides into a secretable carrier chain, then screen which ones are "
+        "**likely** to survive expression and give the peptides back on digestion. The product "
+        "is the hydrolysate, so the chain is designed not to fold — it is designed to be made "
+        "and cut."
     )
 
     with st.sidebar:
-        st.markdown("#### Cleavage chemistry")
-        preset_names = st.multiselect(
-            "Enzymes", list(PRESET_RULES), default=["trypsin"],
-            help="Kex2 is what Pichia already runs in the Golgi — a construct containing KR is "
-                 "processed during secretion whether or not that was the intent.",
-        )
-        rules = [PRESET_RULES[n] for n in preset_names]
-
-        with st.expander("Custom rule"):
-            cm = st.text_input("Motif (regex)", value="", key="cc_motif",
-                               placeholder="e.g. KR  or  [KR]")
-            cs = st.radio("Cut side", ["C", "N"], horizontal=True, key="cc_side",
-                          help="C = after the motif (trypsin, Kex2). N = before it (Asp-N).")
-            cb = st.text_input("Blocked by at P1'", value="P", key="cc_blocked",
-                               help="Proline abolishes both trypsin and Kex2.")
-            if cm.strip():
-                rules = rules + [CleavageRule("custom", cm.strip(), cs, blocked_by=cb)]
+        rules = _cleavage_inputs()
 
         st.markdown("#### Size envelope")
         lo, hi = st.slider("Chain length (aa)", 20, 600, (60, 160), step=10)
@@ -245,3 +230,129 @@ def _render_detail(res, spec: ConcatemerSpec, cid: str) -> None:
             with st.expander(f"{g}  ·  group rank {row.group_ranks.get(g, '—')}",
                              expanded=(g == row.worst_group)):
                 st.dataframe(pd.DataFrame(items), hide_index=True, use_container_width=True)
+
+
+def _rule_detail(r: CleavageRule) -> None:
+    """Everything needed to choose an enzyme: what it recognises, where it cuts, what it costs."""
+    where = "after" if r.side == "C" else "before"
+    bits = [f"Cuts **{where}** `{r.motif}` — consensus **{r.consensus or r.motif}**"]
+    if r.requires_p1prime:
+        bits.append(f"P1′ **must be** {' or '.join(r.requires_p1prime)}")
+    if r.blocked_by:
+        bits.append(f"blocked by **{'/'.join(r.blocked_by)}** at P1′")
+    if r.impaired_by:
+        bits.append(f"slowed by **{'/'.join(r.impaired_by)}** at P1′")
+    if r.trim_c_basic:
+        bits.append("followed by **Kex1** carboxypeptidase trimming")
+    bits.append(f"recognition site **{r.site_length} residue(s)** per junction")
+    st.markdown("\n".join(f"- {b}" for b in bits))
+    if r.note:
+        st.caption(r.note)
+
+
+def _cleavage_inputs() -> list[CleavageRule]:
+    """
+    Enzyme picker plus an accumulating list of custom rules.
+
+    Presets are grouped by the trade-off that actually decides the choice: broad-specificity
+    enzymes add no recognition site and so cost no payload, but cut wherever their residue
+    appears; high-selectivity fusion proteases never cut in the wrong place but spend 5-6
+    residues at every junction on sequence you do not sell.
+    """
+    st.markdown("#### Cleavage chemistry")
+    ordered = [n for names in RULE_GROUPS.values() for n in names]
+    group_of = {n: g for g, names in RULE_GROUPS.items() for n in names}
+
+    picked = st.multiselect(
+        "Enzymes", ordered, default=["trypsin"], key="cc_enzymes",
+        format_func=lambda n: f"{n} · {PRESET_RULES[n].consensus}",
+        help="Mix freely — the digest simulator applies every selected rule and reports the "
+             "worst status where two land on the same bond.",
+    )
+    rules = [PRESET_RULES[n] for n in picked]
+
+    for n in picked:
+        r = PRESET_RULES[n]
+        with st.expander(f"{r.name} · {r.consensus}"):
+            st.caption(group_of.get(n, ""))
+            _rule_detail(r)
+
+    # A multi-residue C-side recogniser cuts after its OWN site, so in a tandem layout the site
+    # stays attached to the peptide upstream of it. These enzymes were built for a single
+    # carrier->product junction, where that site lands on the carrier and is thrown away.
+    stranded = [n for n in picked
+                if PRESET_RULES[n].side == "C" and PRESET_RULES[n].site_length >= 3
+                and not PRESET_RULES[n].trim_c_basic]
+    if stranded:
+        one = len(stranded) == 1
+        st.warning(
+            f"**{', '.join(stranded)}** {'cuts' if one else 'cut'} after "
+            f"{'its' if one else 'their'} own recognition site, so in a tandem concatemer that "
+            f"site stays on the **upstream** peptide — every copy but the last comes back "
+            f"extended. Check the digest products before committing. A one-residue recogniser "
+            f"(trypsin, Lys-C) avoids this entirely when the peptide's own terminus is the cut "
+            f"site, and CPB can trim a basic residue off afterwards."
+        )
+    if picked:
+        tax = sum(PRESET_RULES[n].site_length for n in picked)
+        if tax > 3:
+            st.caption(f"Recognition sites total **{tax} residues per junction** — across ten "
+                       f"junctions, {tax * 10} residues of chain that is not product.")
+
+    # ── custom rules: accumulate, so a mixed digest can be described ──
+    st.session_state.setdefault("cc_custom", [])
+    with st.expander(f"Custom rules ({len(st.session_state['cc_custom'])})"):
+        with st.form("cc_custom_form", clear_on_submit=True):
+            name = st.text_input("Name", placeholder="my_protease")
+            motif = st.text_input("Motif (regex)", placeholder="KR   [KR]   ENLYFQ")
+            side = st.radio("Cut side", ["C", "N"], horizontal=True,
+                            help="C = after the motif (trypsin, Kex2, TEV). "
+                                 "N = before it (Asp-N).")
+            c1, c2 = st.columns(2)
+            with c1:
+                blocked = st.text_input("Blocked at P1′", value="P",
+                                        help="Residues that abolish cleavage. Proline blocks "
+                                             "trypsin and Kex2.")
+            with c2:
+                requires = st.text_input("Required at P1′", value="",
+                                         help="Leave empty unless the enzyme demands specific "
+                                              "residues, as TEV demands G or S.")
+            if st.form_submit_button("Add rule", use_container_width=True):
+                _add_custom_rule(name, motif, side, blocked, requires)
+
+        for i, d in enumerate(list(st.session_state["cc_custom"])):
+            row, drop = st.columns([5, 1])
+            with row:
+                st.markdown(f"**{d['name']}** — `{d['motif']}` cut {d['side']}-side"
+                            + (f", P1′ must be {d['requires_p1prime']}" if d["requires_p1prime"] else "")
+                            + (f", blocked by {d['blocked_by']}" if d["blocked_by"] else ""))
+            with drop:
+                if st.button("✕", key=f"cc_rm_{i}", help="Remove this rule"):
+                    st.session_state["cc_custom"].pop(i)
+                    st.rerun()
+
+    return rules + [CleavageRule(**d) for d in st.session_state["cc_custom"]]
+
+
+def _add_custom_rule(name: str, motif: str, side: str, blocked: str, requires: str) -> None:
+    """Validate and append. A bad regex here would otherwise surface as an opaque failure
+    much later, inside find_sites, on every candidate at once."""
+    name, motif = name.strip() or "custom", motif.strip()
+    if not motif:
+        st.warning("A motif is required.")
+        return
+    candidate = CleavageRule(name=name, motif=motif, side=side,
+                             blocked_by=blocked.strip().upper(),
+                             requires_p1prime=requires.strip().upper())
+    errs = candidate.errors()
+    if errs:
+        for e in errs:
+            st.error(e)
+        return
+    if any(d["name"] == name for d in st.session_state["cc_custom"]):
+        st.warning(f"A rule named {name!r} is already added.")
+        return
+    st.session_state["cc_custom"].append({
+        "name": name, "motif": motif, "side": side,
+        "blocked_by": candidate.blocked_by, "requires_p1prime": candidate.requires_p1prime,
+    })
