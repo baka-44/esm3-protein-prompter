@@ -22,8 +22,15 @@ A liability found here is fixable by re-encoding — codon degeneracy gives ampl
 a pairing without touching the protein — so the result belongs in the back-translator's constraint
 set, not in the candidate ranker.
 
-Cost: folding is O(n^3). A ~1.2 kb transcript takes seconds, so this runs on a SHORTLIST, late in
-the cascade, never on the full candidate set.
+Cost: folding is O(n^3), and measured on a realistic transcript (100 nt 5'UTR + 267 nt alpha-MF
+pre-pro + cargo) it runs 0.6 s at a 60 aa cargo, 4.4 s at 200 aa and 12.5 s at 300 aa. A 50-strong
+shortlist at 300 aa is ~625 s, past the Cloud Run request timeout.
+
+NOT CURRENTLY WIRED TO THE UI. It was withdrawn from the composer page for exactly that reason:
+the cost cannot be absorbed inline on a shared single-instance service, and no candidate-set-wide
+run is defensible. The module is complete and tested, and returns as its own entry point where a
+user reviews the exported CSV, picks a shortlist, and folds only those. That page collects the
+vector sequences; the composer keeps only the EA/EA flag, which the signal-cleavage gate needs.
 """
 
 from __future__ import annotations

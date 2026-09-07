@@ -21,9 +21,6 @@ import streamlit as st
 from concatemer.digest import digest
 from concatemer.features import FEATURES
 from concatemer.pipeline import run, to_csv, to_fasta
-from concatemer.rna import (
-    MissingContextError, TranscriptContext, back_translate, parse_codon_table, screen_shortlist,
-)
 from concatemer.spec import (
     PRESET_RULES, CleavageRule, ConcatemerSpec, Peptide, Spacer, VectorContext,
     encoding_capacity,
@@ -47,33 +44,23 @@ def _run_cached(spec_json: str, max_candidates: int):
 
 def _vector_inputs() -> VectorContext:
     """
-    One place for the construct context. It feeds two different stages: the signal-cleavage gate
-    (which needs only whether EAEA is retained) and the accessibility fold (which needs the
-    nucleotide sequences), so collecting it twice would let them disagree.
+    Construct context. Only the EA/EA flag is consumed today — it drives the signal-cleavage gate.
+
+    The 5'UTR / signal CDS / 3'UTR sequences were collected here for start-codon accessibility,
+    which has been withdrawn from this page: folding is O(n^3) and costs ~4.4s per candidate at a
+    200 aa cargo, so running it over a candidate set is untenable and a large shortlist breaches
+    the Cloud Run request timeout. `concatemer/rna.py` is intact and tested; it returns as its own
+    entry point where a user picks a shortlist out of the exported CSV, and that page collects the
+    sequences it needs. Leaving dead inputs here would only invite someone to fill them in and
+    wonder what happened.
     """
-    with st.expander("Construct context — 5′UTR, signal, 3′UTR"):
-        st.caption(
-            "Vector-specific, and never defaulted: mRNA structure is exquisitely sequence "
-            "dependent, so a canonical AOX1 5′UTR or a back-translated α-MF would fold "
-            "differently from the gene you actually order. The **promoter is not needed** — it "
-            "is not transcribed, and sets how much mRNA is made rather than how it folds."
-        )
-        ste13 = st.checkbox(
-            "Pre-pro retains the EA/EA spacer (Ste13 processing)", value=False, key="cc_ste13",
-            help="Ste13 removes N-terminal X-Ala dipeptides processively, so with EAEA present "
-                 "it trims into a cargo whose second residue is alanine. Many modern vectors "
-                 "delete EAEA because that processing is often incomplete.",
-        )
-        v1, v2, v3 = st.columns(3)
-        with v1:
-            utr5 = st.text_area("5′UTR (TSS → ATG)", height=110, key="cc_utr5")
-        with v2:
-            sig = st.text_area("α-MF pre-pro CDS (nt, from ATG)", height=110, key="cc_sig")
-        with v3:
-            utr3 = st.text_area("3′UTR (stop → poly-A)", height=110, key="cc_utr3",
-                                help="Optional. Downstream of the stop codon, so it cannot "
-                                     "affect elongation; appended to the fold when supplied.")
-    return VectorContext(utr5=utr5, signal_cds=sig, utr3=utr3, signal_ste13=ste13)
+    ste13 = st.checkbox(
+        "Vector pre-pro retains the EA/EA spacer (Ste13 processing)", value=False, key="cc_ste13",
+        help="Ste13 removes N-terminal X-Ala dipeptides processively, so with EAEA present it "
+             "trims into a cargo whose second residue is alanine — a live risk with GAR-style "
+             "spacers. Many modern vectors delete EAEA because the processing is often incomplete.",
+    )
+    return VectorContext(signal_ste13=ste13)
 
 
 def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
@@ -214,8 +201,6 @@ def _render_results(res, spec: ConcatemerSpec) -> None:
                            file_name="concatemer_candidates.fasta", mime="text/plain",
                            use_container_width=True)
 
-    _render_accessibility(res, spec.vector)
-
     st.markdown("#### Inspect a candidate")
     pick = st.selectbox("Candidate", [r.candidate_id for r in res.passed[:200]],
                         format_func=lambda cid: f"#{res.candidates[cid].candidate_id} — "
@@ -260,60 +245,3 @@ def _render_detail(res, spec: ConcatemerSpec, cid: str) -> None:
             with st.expander(f"{g}  ·  group rank {row.group_ranks.get(g, '—')}",
                              expanded=(g == row.worst_group)):
                 st.dataframe(pd.DataFrame(items), hide_index=True, use_container_width=True)
-
-
-def _render_accessibility(res, vector: VectorContext) -> None:
-    """
-    Optional late-cascade stage: fold the assembled transcript and check the start codon stays
-    open. Gated on inputs that cannot be guessed — mRNA structure is exquisitely sequence
-    dependent, so a canonical 5'UTR or an invented codon table would fold differently from the
-    gene actually ordered, which is the one failure this check exists to catch.
-    """
-    with st.expander("Start-codon accessibility (optional — needs your vector context)"):
-        st.caption(
-            "A repetitive cargo can base-pair back into the initiation window from hundreds of "
-            "nucleotides away and sequester the start codon. Only the assembled transcript shows "
-            "it. Folding is O(n³), so this runs on a shortlist. A hit is a **re-encoding** "
-            "instruction, not a reason to drop the design."
-        )
-        table_txt = st.text_area("Codon table (one per residue, e.g. `A GCT`)", height=150,
-                                 key="cc_codons",
-                                 help="No default is shipped: usage is strain-specific and "
-                                      "accessibility is entirely an artefact of the encoding.")
-        top_n = st.number_input("Screen the top N candidates", 1, 50, 5, step=1, key="cc_topn")
-
-        if not st.button("Fold and check", key="cc_fold"):
-            return
-        if not (vector.complete_for_folding and table_txt.strip()):
-            st.warning("Needs the 5′UTR and signal CDS from **Construct context** above, plus a "
-                       "codon table. Without them the transcript cannot be assembled, and a "
-                       "substituted sequence would give a confident wrong answer.")
-            return
-        try:
-            ctx = TranscriptContext.from_vector(vector)
-            table = parse_codon_table(table_txt)
-            shortlist = [(r.candidate_id, res.candidates[r.candidate_id].sequence)
-                         for r in res.passed[:int(top_n)]]
-            for cid, protein in shortlist:
-                back_translate(protein, table)          # fail fast on a missing residue
-        except MissingContextError as exc:
-            st.error(str(exc))
-            return
-
-        with st.spinner(f"Folding {len(shortlist)} transcripts…"):
-            reports = screen_shortlist(shortlist, ctx, table)
-
-        rows = []
-        for cid, rep_, fl in reports:
-            rows.append({"Candidate": cid, "Accessible": "yes" if rep_.accessible else "no",
-                         "AUG paired": rep_.start_codon_paired,
-                         "Window paired": f"{rep_.frac_paired:.0%}",
-                         "Longest cargo helix (bp)": rep_.longest_cargo_helix,
-                         "ΔG": rep_.dg, "Folded nt": rep_.folded_nt,
-                         "Action": fl[0] if fl else "—"})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        bad = [c for c, r_, f_ in reports if not r_.accessible]
-        if bad:
-            st.warning(f"{len(bad)} of {len(reports)} need re-encoding: {', '.join(bad)}")
-        else:
-            st.success("Start codon accessible in every candidate screened.")
