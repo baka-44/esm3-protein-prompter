@@ -21,6 +21,9 @@ import streamlit as st
 from concatemer.digest import digest
 from concatemer.features import FEATURES
 from concatemer.pipeline import run, to_csv, to_fasta
+from concatemer.rna import (
+    MissingContextError, TranscriptContext, back_translate, parse_codon_table, screen_shortlist,
+)
 from concatemer.spec import PRESET_RULES, CleavageRule, ConcatemerSpec, Peptide, Spacer
 
 DEFAULT_PEPTIDES = pd.DataFrame([
@@ -164,6 +167,8 @@ def _render_results(res, spec: ConcatemerSpec) -> None:
                            file_name="concatemer_candidates.fasta", mime="text/plain",
                            use_container_width=True)
 
+    _render_accessibility(res)
+
     st.markdown("#### Inspect a candidate")
     pick = st.selectbox("Candidate", [r.candidate_id for r in res.passed[:200]],
                         format_func=lambda cid: f"#{res.candidates[cid].candidate_id} — "
@@ -208,3 +213,69 @@ def _render_detail(res, spec: ConcatemerSpec, cid: str) -> None:
             with st.expander(f"{g}  ·  group rank {row.group_ranks.get(g, '—')}",
                              expanded=(g == row.worst_group)):
                 st.dataframe(pd.DataFrame(items), hide_index=True, use_container_width=True)
+
+
+def _render_accessibility(res) -> None:
+    """
+    Optional late-cascade stage: fold the assembled transcript and check the start codon stays
+    open. Gated on inputs that cannot be guessed — mRNA structure is exquisitely sequence
+    dependent, so a canonical 5'UTR or an invented codon table would fold differently from the
+    gene actually ordered, which is the one failure this check exists to catch.
+    """
+    with st.expander("Start-codon accessibility (optional — needs your vector context)"):
+        st.caption(
+            "A repetitive cargo can base-pair back into the initiation window from hundreds of "
+            "nucleotides away and sequester the start codon. Only the assembled transcript shows "
+            "it. Folding is O(n³), so this runs on a shortlist. A hit is a **re-encoding** "
+            "instruction, not a reason to drop the design."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            utr5 = st.text_area("5′UTR (TSS → ATG)", height=90, key="cc_utr5",
+                                help="Vector-specific — pPICZα, pPIC9K and relatives differ by "
+                                     "cloning site. The PROMOTER is not transcribed and is not "
+                                     "needed.")
+            signal_cds = st.text_area("α-MF pre-pro CDS (nucleotides)", height=90, key="cc_sig",
+                                      help="From your vector, beginning at ATG. The protein "
+                                           "sequence is not enough — codon choice sets the fold.")
+        with c2:
+            table_txt = st.text_area("Codon table (one per residue, e.g. `A GCT`)", height=200,
+                                     key="cc_codons",
+                                     help="No default is shipped: usage is strain-specific and "
+                                          "accessibility is entirely an artefact of the encoding.")
+        top_n = st.number_input("Screen the top N candidates", 1, 50, 5, step=1, key="cc_topn")
+
+        if not st.button("Fold and check", key="cc_fold"):
+            return
+        if not (utr5.strip() and signal_cds.strip() and table_txt.strip()):
+            st.warning("All three inputs are required. Without them the transcript cannot be "
+                       "assembled, and a substituted sequence would give a confident wrong answer.")
+            return
+        try:
+            ctx = TranscriptContext(utr5=utr5, signal_cds=signal_cds)
+            table = parse_codon_table(table_txt)
+            shortlist = [(r.candidate_id, res.candidates[r.candidate_id].sequence)
+                         for r in res.passed[:int(top_n)]]
+            for cid, protein in shortlist:
+                back_translate(protein, table)          # fail fast on a missing residue
+        except MissingContextError as exc:
+            st.error(str(exc))
+            return
+
+        with st.spinner(f"Folding {len(shortlist)} transcripts…"):
+            reports = screen_shortlist(shortlist, ctx, table)
+
+        rows = []
+        for cid, rep_, fl in reports:
+            rows.append({"Candidate": cid, "Accessible": "yes" if rep_.accessible else "no",
+                         "AUG paired": rep_.start_codon_paired,
+                         "Window paired": f"{rep_.frac_paired:.0%}",
+                         "Longest cargo helix (bp)": rep_.longest_cargo_helix,
+                         "ΔG": rep_.dg, "Folded nt": rep_.folded_nt,
+                         "Action": fl[0] if fl else "—"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        bad = [c for c, r_, f_ in reports if not r_.accessible]
+        if bad:
+            st.warning(f"{len(bad)} of {len(reports)} need re-encoding: {', '.join(bad)}")
+        else:
+            st.success("Start codon accessible in every candidate screened.")

@@ -37,3 +37,7 @@ google-cloud-run==0.16.1
 # projects/phyx44-proteinredesign-v1/databases/(default).
 google-api-core==2.34.0
 protobuf==7.34.1
+
+# Start-codon accessibility on the assembled transcript (concatemer/rna.py). MIT and pure
+# Python — chosen over ViennaRNA, which is academic-licensed.
+seqfold==0.10.2
