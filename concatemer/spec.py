@@ -337,6 +337,12 @@ class ConcatemerSpec:
             errs.append("At least one cleavage rule is required — without one nothing is released.")
         if self.length_max < self.length_min:
             errs.append(f"Invalid length range {self.length_min}-{self.length_max}.")
+        names = [p.name for p in self.peptides]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            # Copy counts and released tallies are keyed by name, so duplicates would silently
+            # merge into one entry and misreport the delivered blend.
+            errs.append(f"Duplicate peptide name(s): {', '.join(dupes)}. Names must be unique.")
         for p in self.peptides:
             cap = encoding_capacity(p.sequence)
             if p.max_copies > cap:

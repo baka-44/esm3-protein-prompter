@@ -26,6 +26,14 @@ from concatemer.spec import (
     encoding_capacity,
 )
 
+# st.data_editor CAN delete rows, but nothing on screen says so: the row checkbox only appears on
+# hover, and the actual delete is a bare keypress with no button anywhere. Selecting a row
+# therefore looks like an operation with no way to complete it. data_editor does not expose its
+# selection to Python — there is no on_select — so a "Remove selected" button cannot be built
+# against it, and spelling out the gesture is the honest remedy.
+_TABLE_HELP = ("**Add** a row on the blank line at the bottom. **Delete** — hover the row, tick "
+               "the checkbox at its left edge, then press **⌫ Delete**.")
+
 DEFAULT_PEPTIDES = pd.DataFrame([
     {"name": "GHK", "sequence": "GHK", "min_copies": 2, "max_copies": 6},
     {"name": "GQPR", "sequence": "GQPR", "min_copies": 1, "max_copies": 5},
@@ -63,13 +71,54 @@ def _vector_inputs() -> VectorContext:
     return VectorContext(signal_ste13=ste13)
 
 
+def _cell_text(value, default: str = "") -> str:
+    """
+    A data_editor cell as text.
+
+    An empty cell arrives as float('nan'), and str(nan) is the string "nan" — so a blank name
+    silently became a peptide called "nan" rather than an obvious error.
+    """
+    if value is None:
+        return default
+    text = str(value).strip()
+    return default if text.lower() in ("", "nan", "none", "<na>") else text
+
+
+def _cell_int(value, default: int) -> int:
+    """
+    A data_editor cell as an int, tolerating blanks.
+
+    `int(value or default)` looks safe and is not: an empty numeric cell is float('nan'), NaN is
+    TRUTHY, so `nan or 0` evaluates to nan and int(nan) raises. That crashed the whole panel for
+    anyone who added a peptide row and left a copy-number blank, which is the normal way a
+    dynamic data_editor row starts out.
+    """
+    try:
+        if value is None:
+            return default
+        number = float(value)
+        if number != number:                      # NaN
+            return default
+        return int(number)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
                 vector: VectorContext | None = None) -> ConcatemerSpec:
-    peps = [Peptide(str(r["name"]).strip(), str(r["sequence"]).strip(),
-                    int(r["min_copies"] or 0), int(r["max_copies"] or 1))
-            for _, r in peptides_df.iterrows() if str(r.get("sequence", "")).strip()]
-    spacers = [Spacer(str(r["name"]).strip(), str(r["sequence"]).strip())
-               for _, r in spacers_df.iterrows() if str(r.get("sequence", "")).strip()]
+    peps = []
+    for _, r in peptides_df.iterrows():
+        seq = _cell_text(r.get("sequence"))
+        if not seq:
+            continue                              # blank row from the dynamic editor
+        peps.append(Peptide(_cell_text(r.get("name"), seq.upper()), seq,
+                            _cell_int(r.get("min_copies"), 0),
+                            _cell_int(r.get("max_copies"), 1)))
+    spacers = []
+    for _, r in spacers_df.iterrows():
+        seq = _cell_text(r.get("sequence"))
+        if seq:
+            spacers.append(Spacer(_cell_text(r.get("name"), seq.upper()), seq))
     return ConcatemerSpec(peptides=peps, spacers=spacers, rules=rules,
                           length_min=int(lo), length_max=int(hi), max_units=int(max_units),
                           vector=vector or VectorContext())
@@ -99,12 +148,14 @@ def render_concatemer(user_email: str | None = None) -> None:
                     "delivered blend ratio.")
         peptides_df = st.data_editor(DEFAULT_PEPTIDES, num_rows="dynamic", hide_index=True,
                                      use_container_width=True, key="cc_peptides")
+        st.caption(_TABLE_HELP)
     with c2:
         st.markdown("**Spacers** — prefer sequences free of S and T.")
         st.caption("S/T is the +2 of every N-glycosylation sequon *and* the O-mannosylation "
                    "target, so excluding it removes both. This rules out (GGGGS)ₙ.")
         spacers_df = st.data_editor(DEFAULT_SPACERS, num_rows="dynamic", hide_index=True,
                                     use_container_width=True, key="cc_spacers")
+        st.caption(_TABLE_HELP)
 
     vector = _vector_inputs()
 
