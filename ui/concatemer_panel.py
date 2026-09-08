@@ -26,13 +26,17 @@ from concatemer.spec import (
     encoding_capacity,
 )
 
-# st.data_editor CAN delete rows, but nothing on screen says so: the row checkbox only appears on
-# hover, and the actual delete is a bare keypress with no button anywhere. Selecting a row
-# therefore looks like an operation with no way to complete it. data_editor does not expose its
-# selection to Python — there is no on_select — so a "Remove selected" button cannot be built
-# against it, and spelling out the gesture is the honest remedy.
-_TABLE_HELP = ("**Add** a row on the blank line at the bottom. **Delete** — hover the row, tick "
-               "the checkbox at its left edge, then press **⌫ Delete**.")
+# st.data_editor's built-in row deletion is effectively unavailable to a Mac user. The row
+# checkbox only appears on hover, there is no delete button anywhere, and the gesture responds
+# ONLY to the true Delete keycode — verified in a browser: Delete removes the row, Backspace does
+# nothing. The key labelled "delete" on a Mac keyboard sends Backspace, so the documented gesture
+# silently fails and needs fn+Delete instead.
+#
+# Describing it more accurately was the first attempt and was not good enough. data_editor does
+# not expose its selection to Python (no on_select, unlike st.dataframe), so the table's own
+# selection cannot drive a button — hence an explicit picker over rows we own in session_state.
+_TABLE_HELP = ("**Add** a row on the blank line at the bottom. To **remove** one, use the control "
+               "below — the grid's own row-delete needs fn+Delete on a Mac and is easy to miss.")
 
 DEFAULT_PEPTIDES = pd.DataFrame([
     {"name": "GHK", "sequence": "GHK", "min_copies": 2, "max_copies": 6},
@@ -146,16 +150,12 @@ def render_concatemer(user_email: str | None = None) -> None:
     with c1:
         st.markdown("**Peptides** — `min_copies` ≥ 1 makes one mandatory; copy number sets the "
                     "delivered blend ratio.")
-        peptides_df = st.data_editor(DEFAULT_PEPTIDES, num_rows="dynamic", hide_index=True,
-                                     use_container_width=True, key="cc_peptides")
-        st.caption(_TABLE_HELP)
+        peptides_df = _editable_table("cc_peptides", DEFAULT_PEPTIDES, "peptide")
     with c2:
         st.markdown("**Spacers** — prefer sequences free of S and T.")
         st.caption("S/T is the +2 of every N-glycosylation sequon *and* the O-mannosylation "
                    "target, so excluding it removes both. This rules out (GGGGS)ₙ.")
-        spacers_df = st.data_editor(DEFAULT_SPACERS, num_rows="dynamic", hide_index=True,
-                                    use_container_width=True, key="cc_spacers")
-        st.caption(_TABLE_HELP)
+        spacers_df = _editable_table("cc_spacers", DEFAULT_SPACERS, "spacer")
 
     vector = _vector_inputs()
 
@@ -407,3 +407,50 @@ def _add_custom_rule(name: str, motif: str, side: str, blocked: str, requires: s
         "name": name, "motif": motif, "side": side,
         "blocked_by": candidate.blocked_by, "requires_p1prime": candidate.requires_p1prime,
     })
+
+
+def _editable_table(key: str, default_df: pd.DataFrame, noun: str) -> pd.DataFrame:
+    """
+    A data_editor plus a row-removal control that works without a keyboard gesture.
+
+    The grid owns editing; we own the data. Removing a row mutates our copy and bumps a version
+    counter that is baked into the widget key — data_editor keeps its own edit state against its
+    key, so passing shorter data under the SAME key leaves the removed row on screen. A new key
+    forces a fresh widget over the reduced frame.
+    """
+    data_key, ver_key = f"{key}_data", f"{key}_ver"
+    st.session_state.setdefault(data_key, default_df.copy())
+    st.session_state.setdefault(ver_key, 0)
+
+    edited = st.data_editor(
+        st.session_state[data_key], num_rows="dynamic", hide_index=True,
+        use_container_width=True, key=f"{key}_v{st.session_state[ver_key]}",
+    )
+    st.session_state[data_key] = edited
+    st.caption(_TABLE_HELP)
+
+    rows = [(i, _cell_text(r.get("name")) or _cell_text(r.get("sequence")),
+             _cell_text(r.get("sequence")))
+            for i, (_, r) in enumerate(edited.iterrows())]
+    rows = [(i, nm, sq) for i, nm, sq in rows if sq]
+    if not rows:
+        return edited
+
+    # Stacked rather than side by side: in the narrow spacers column a button beside the picker
+    # wraps its label to "Re / mov / e".
+    labels = {f"{i + 1}. {nm} ({sq})": i for i, nm, sq in rows}
+    version = st.session_state[ver_key]
+    chosen = st.multiselect(
+        f"Remove {noun}(s)", list(labels),
+        # Versioned like the grid. Popping the key after a removal was not enough — the widget
+        # came back holding a chip for the row that had just been deleted.
+        key=f"{key}_rm_v{version}", label_visibility="collapsed",
+        placeholder=f"Select {noun}(s) to remove",
+    )
+    if st.button(f"Remove selected {noun}(s)", key=f"{key}_rmbtn_v{version}",
+                 use_container_width=True, disabled=not chosen):
+        drop = [labels[c] for c in chosen]
+        st.session_state[data_key] = edited.drop(edited.index[drop]).reset_index(drop=True)
+        st.session_state[ver_key] += 1              # new widget keys -> fresh grid and picker
+        st.rerun()
+    return edited
