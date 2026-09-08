@@ -63,13 +63,54 @@ def _vector_inputs() -> VectorContext:
     return VectorContext(signal_ste13=ste13)
 
 
+def _cell_text(value, default: str = "") -> str:
+    """
+    A data_editor cell as text.
+
+    An empty cell arrives as float('nan'), and str(nan) is the string "nan" — so a blank name
+    silently became a peptide called "nan" rather than an obvious error.
+    """
+    if value is None:
+        return default
+    text = str(value).strip()
+    return default if text.lower() in ("", "nan", "none", "<na>") else text
+
+
+def _cell_int(value, default: int) -> int:
+    """
+    A data_editor cell as an int, tolerating blanks.
+
+    `int(value or default)` looks safe and is not: an empty numeric cell is float('nan'), NaN is
+    TRUTHY, so `nan or 0` evaluates to nan and int(nan) raises. That crashed the whole panel for
+    anyone who added a peptide row and left a copy-number blank, which is the normal way a
+    dynamic data_editor row starts out.
+    """
+    try:
+        if value is None:
+            return default
+        number = float(value)
+        if number != number:                      # NaN
+            return default
+        return int(number)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
                 vector: VectorContext | None = None) -> ConcatemerSpec:
-    peps = [Peptide(str(r["name"]).strip(), str(r["sequence"]).strip(),
-                    int(r["min_copies"] or 0), int(r["max_copies"] or 1))
-            for _, r in peptides_df.iterrows() if str(r.get("sequence", "")).strip()]
-    spacers = [Spacer(str(r["name"]).strip(), str(r["sequence"]).strip())
-               for _, r in spacers_df.iterrows() if str(r.get("sequence", "")).strip()]
+    peps = []
+    for _, r in peptides_df.iterrows():
+        seq = _cell_text(r.get("sequence"))
+        if not seq:
+            continue                              # blank row from the dynamic editor
+        peps.append(Peptide(_cell_text(r.get("name"), seq.upper()), seq,
+                            _cell_int(r.get("min_copies"), 0),
+                            _cell_int(r.get("max_copies"), 1)))
+    spacers = []
+    for _, r in spacers_df.iterrows():
+        seq = _cell_text(r.get("sequence"))
+        if seq:
+            spacers.append(Spacer(_cell_text(r.get("name"), seq.upper()), seq))
     return ConcatemerSpec(peptides=peps, spacers=spacers, rules=rules,
                           length_min=int(lo), length_max=int(hi), max_units=int(max_units),
                           vector=vector or VectorContext())
