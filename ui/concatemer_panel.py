@@ -35,8 +35,38 @@ from concatemer.spec import (
 # Describing it more accurately was the first attempt and was not good enough. data_editor does
 # not expose its selection to Python (no on_select, unlike st.dataframe), so the table's own
 # selection cannot drive a button — hence an explicit picker over rows we own in session_state.
-_TABLE_HELP = ("**Add** a row on the blank line at the bottom. To **remove** one, use the control "
-               "below — the grid's own row-delete needs fn+Delete on a Mac and is easy to miss.")
+_TABLE_HELP = ("**Add** a row on the blank line at the bottom — copy numbers are prefilled, so "
+               "only the sequence is required, and a blank name is auto-assigned. To **remove** a "
+               "row use the control below; the grid's own row-delete needs fn+Delete on a Mac.")
+
+# Standard amino acids only. Streamlit flags a non-matching cell inline, in the grid, which is
+# where a syntax error belongs — a message under the table is disconnected from the cell that
+# caused it. Empty is allowed so a freshly added row is not red before anything is typed.
+_AA_RE = "^[ACDEFGHIKLMNPQRSTVWYacdefghiklmnpqrstvwy]*$"
+
+# `default` prefills NEWLY ADDED rows, so adding a peptide means typing only the sequence.
+_PEPTIDE_COLS = {
+    "name": st.column_config.TextColumn(
+        "Name", default="", width="small",
+        help="Optional — blank rows are auto-named P1, P2, … in order."),
+    "sequence": st.column_config.TextColumn(
+        "Sequence", validate=_AA_RE, required=True,
+        help="Standard one-letter amino acids. Anything else is flagged in the cell."),
+    "min_copies": st.column_config.NumberColumn(
+        "Min copies", default=0, min_value=0, max_value=100, step=1,
+        help="≥ 1 makes this peptide mandatory in every candidate."),
+    "max_copies": st.column_config.NumberColumn(
+        "Max copies", default=4, min_value=1, max_value=100, step=1,
+        help="Copy number sets the delivered blend ratio."),
+}
+_SPACER_COLS = {
+    "name": st.column_config.TextColumn(
+        "Name", default="", width="small",
+        help="Optional — blank rows are auto-named S1, S2, … in order."),
+    "sequence": st.column_config.TextColumn(
+        "Sequence", validate=_AA_RE, required=True,
+        help="Standard one-letter amino acids. Prefer sequences free of S and T."),
+}
 
 DEFAULT_PEPTIDES = pd.DataFrame([
     {"name": "GHK", "sequence": "GHK", "min_copies": 2, "max_copies": 6},
@@ -110,19 +140,22 @@ def _cell_int(value, default: int) -> int:
 
 def _build_spec(peptides_df, spacers_df, rules, lo, hi, max_units,
                 vector: VectorContext | None = None) -> ConcatemerSpec:
+    # Blank names are filled positionally (P1, P2, …) rather than from the sequence: two copies
+    # of one sequence would otherwise collide on the duplicate-name check, and a positional id is
+    # what a user reading the results CSV can match back to a row.
     peps = []
     for _, r in peptides_df.iterrows():
         seq = _cell_text(r.get("sequence"))
         if not seq:
             continue                              # blank row from the dynamic editor
-        peps.append(Peptide(_cell_text(r.get("name"), seq.upper()), seq,
+        peps.append(Peptide(_cell_text(r.get("name"), f"P{len(peps) + 1}"), seq,
                             _cell_int(r.get("min_copies"), 0),
                             _cell_int(r.get("max_copies"), 1)))
     spacers = []
     for _, r in spacers_df.iterrows():
         seq = _cell_text(r.get("sequence"))
         if seq:
-            spacers.append(Spacer(_cell_text(r.get("name"), seq.upper()), seq))
+            spacers.append(Spacer(_cell_text(r.get("name"), f"S{len(spacers) + 1}"), seq))
     return ConcatemerSpec(peptides=peps, spacers=spacers, rules=rules,
                           length_min=int(lo), length_max=int(hi), max_units=int(max_units),
                           vector=vector or VectorContext())
@@ -150,17 +183,21 @@ def render_concatemer(user_email: str | None = None) -> None:
     with c1:
         st.markdown("**Peptides** — `min_copies` ≥ 1 makes one mandatory; copy number sets the "
                     "delivered blend ratio.")
-        peptides_df = _editable_table("cc_peptides", DEFAULT_PEPTIDES, "peptide")
+        peptides_df = _editable_table("cc_peptides", DEFAULT_PEPTIDES, "peptide", _PEPTIDE_COLS)
     with c2:
         st.markdown("**Spacers** — prefer sequences free of S and T.")
         st.caption("S/T is the +2 of every N-glycosylation sequon *and* the O-mannosylation "
                    "target, so excluding it removes both. This rules out (GGGGS)ₙ.")
-        spacers_df = _editable_table("cc_spacers", DEFAULT_SPACERS, "spacer")
+        spacers_df = _editable_table("cc_spacers", DEFAULT_SPACERS, "spacer", _SPACER_COLS)
 
     vector = _vector_inputs()
 
-    caps = [(str(r["name"]), str(r["sequence"]).strip(), int(r["max_copies"] or 1))
-            for _, r in peptides_df.iterrows() if str(r.get("sequence", "")).strip()]
+    # Same NaN trap as _build_spec had: `int(nan or 1)` raises, and this runs on EVERY rerun,
+    # before the button is pressed — so a row with a sequence and a blank max_copies took the
+    # panel down while the user was still filling the table in.
+    caps = [(_cell_text(r.get("name")) or _cell_text(r.get("sequence")),
+             _cell_text(r.get("sequence")), _cell_int(r.get("max_copies"), 1))
+            for _, r in peptides_df.iterrows() if _cell_text(r.get("sequence"))]
     tight = [(n, encoding_capacity(q), m) for n, q, m in caps if encoding_capacity(q) < m * 4]
     if tight:
         st.caption("⚠️ Codon head-room: "
@@ -409,7 +446,8 @@ def _add_custom_rule(name: str, motif: str, side: str, blocked: str, requires: s
     })
 
 
-def _editable_table(key: str, default_df: pd.DataFrame, noun: str) -> pd.DataFrame:
+def _editable_table(key: str, default_df: pd.DataFrame, noun: str,
+                    column_config: dict | None = None) -> pd.DataFrame:
     """
     A data_editor plus a row-removal control that works without a keyboard gesture.
 
@@ -422,17 +460,28 @@ def _editable_table(key: str, default_df: pd.DataFrame, noun: str) -> pd.DataFra
     st.session_state.setdefault(data_key, default_df.copy())
     st.session_state.setdefault(ver_key, 0)
 
+    # The BASE frame must stay stable between reruns. data_editor does not store the table — it
+    # stores the user's edits as a DIFF (added_rows / edited_rows) against whatever base it was
+    # given, keyed by widget key. Assigning the return value back into the base fed the
+    # already-applied edits in as the new base, so the same diff was re-applied on top of itself:
+    # row indices shifted, entries disappeared, and the same value had to be typed two or three
+    # times before it stuck. The return value is for downstream use only; the base changes solely
+    # on a deliberate mutation (a removal), which also bumps the version to reset the diff.
     edited = st.data_editor(
         st.session_state[data_key], num_rows="dynamic", hide_index=True,
-        use_container_width=True, key=f"{key}_v{st.session_state[ver_key]}",
+        use_container_width=True, column_config=column_config,
+        key=f"{key}_v{st.session_state[ver_key]}",
     )
-    st.session_state[data_key] = edited
     st.caption(_TABLE_HELP)
 
-    rows = [(i, _cell_text(r.get("name")) or _cell_text(r.get("sequence")),
-             _cell_text(r.get("sequence")))
-            for i, (_, r) in enumerate(edited.iterrows())]
-    rows = [(i, nm, sq) for i, nm, sq in rows if sq]
+    prefix = "P" if noun == "peptide" else "S"
+    rows, seen = [], 0
+    for i, (_, r) in enumerate(edited.iterrows()):
+        sq = _cell_text(r.get("sequence"))
+        if not sq:
+            continue
+        seen += 1
+        rows.append((i, _cell_text(r.get("name")) or f"{prefix}{seen}", sq))
     if not rows:
         return edited
 
